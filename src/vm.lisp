@@ -89,7 +89,16 @@
         ((string= op "&") (float (logand (to-int32 a) (to-int32 b)) 1d0))
         ((string= op "|") (float (logior (to-int32 a) (to-int32 b)) 1d0))
         ((string= op "^") (float (logxor (to-int32 a) (to-int32 b)) 1d0))
+        ((string= op "instanceof") (js-bool (js-instanceof a b)))
+        ((string= op "in") (js-bool (and (js-object-p b) (js-has b (prop-key a)))))
         (t (js-throw (format nil "operator ~a not supported" op)))))
+
+(defun js-instanceof (a b)
+  (unless (js-callable-p b) (js-throw "Right-hand side of 'instanceof' is not callable"))
+  (let ((proto (js-get b "prototype")))
+    (and (js-object-p a)
+         (loop for p = (js-object-proto a) then (js-object-proto p)
+               while (js-object-p p) thereis (eq p proto)))))
 
 (defun js-unop (op v)
   (cond ((string= op "!") (js-bool (not (js-truthy v))))
@@ -102,15 +111,20 @@
 ;;; ---- the VM ----
 (defun run (code env this)
   (let ((instrs (code-instrs code)) (pc 0)
-        (stack (make-array 64 :adjustable t :fill-pointer 0)) (completion *undefined*))
+        (stack (make-array 64 :adjustable t :fill-pointer 0)) (completion *undefined*)
+        (handlers '()))                      ; ((catch-pc . saved-sp) ...) for try/catch
     (macrolet ((push! (v) `(vector-push-extend ,v stack))
                (pop! () `(vector-pop stack))
                (peek! () `(aref stack (1- (fill-pointer stack)))))
       (loop
-        (when (>= pc (length instrs)) (return completion))
+       (handler-case
+        (loop
+        (when (>= pc (length instrs)) (return-from run completion))
         (let* ((in (aref instrs pc)) (op (car in)) (a (cdr in)))
           (incf pc)
           (case op
+            (:push-handler (push (cons (first a) (fill-pointer stack)) handlers))
+            (:pop-handler (pop handlers))
             (:const (push! (first a)))
             (:get-var (push! (env-get env (first a))))
             (:set-var (env-set env (first a) (peek!)))
@@ -139,6 +153,12 @@
             (:jmp-if-true (when (js-truthy (pop!)) (setf pc (first a))))
             (:and-jmp (if (js-truthy (peek!)) (pop!) (setf pc (first a))))
             (:or-jmp (if (js-truthy (peek!)) (setf pc (first a)) (pop!)))
-            (:ret (return (pop!)))
+            (:ret (return-from run (pop!)))
             (:throw-op (js-throw (pop!)))
-            (t (error "shuttle vm: bad op ~a" op))))))))
+            (t (error "shuttle vm: bad op ~a" op)))))
+        (shuttle-error (e)
+          (if handlers
+              (destructuring-bind (catch-pc . saved-sp) (pop handlers)
+                (setf (fill-pointer stack) saved-sp pc catch-pc)
+                (vector-push-extend (shuttle-error-value e) stack))   ; thrown value -> catch param
+              (error e))))))))

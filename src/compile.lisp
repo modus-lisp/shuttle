@@ -6,6 +6,7 @@
 
 (defstruct code name params instrs)
 (defvar *out*)
+(defvar *break-target* nil) (defvar *continue-target* nil)
 (defun em (op &rest args) (push (cons op args) *out*))
 (defun lbl () (gensym "L"))
 
@@ -14,7 +15,7 @@
     (dolist (in instrs) (if (eq (car in) :label) (setf (gethash (cadr in) pos) idx) (incf idx)))
     (dolist (in instrs)
       (unless (eq (car in) :label)
-        (push (if (member (car in) '(:jmp :jmp-if-false :jmp-if-true :and-jmp :or-jmp))
+        (push (if (member (car in) '(:jmp :jmp-if-false :jmp-if-true :and-jmp :or-jmp :push-handler))
                   (list (car in) (gethash (cadr in) pos)) in) out)))
     (coerce (nreverse out) 'vector)))
 
@@ -46,7 +47,38 @@
            (em :label l2)))
     (:while (let ((top (lbl)) (end (lbl)))
               (em :label top) (compile-expr (second node)) (em :jmp-if-false end)
-              (compile-stmt (third node)) (em :jmp top) (em :label end)))))
+              (let ((*break-target* end) (*continue-target* top)) (compile-stmt (third node)))
+              (em :jmp top) (em :label end)))
+    (:for (destructuring-bind (init test update body) (cdr node)
+            (let ((top (lbl)) (cont (lbl)) (end (lbl)))
+              (when init (compile-stmt (if (eq (car init) :var) init (list :expr (second init)))))
+              (em :label top)
+              (when test (compile-expr test) (em :jmp-if-false end))
+              (let ((*break-target* end) (*continue-target* cont)) (compile-stmt body))
+              (em :label cont)
+              (when update (compile-expr update) (em :pop))
+              (em :jmp top) (em :label end))))
+    (:break (if *break-target* (em :jmp *break-target*) (js-throw "illegal break")))
+    (:continue (if *continue-target* (em :jmp *continue-target*) (js-throw "illegal continue")))
+    (:switch (destructuring-bind (disc cases default) (cdr node)
+               (let ((dv (string (gensym "SW"))) (end (lbl)) (deflabel (lbl))
+                     (clabels (mapcar (lambda (c) (cons c (lbl))) cases)))
+                 (compile-expr disc) (em :declare-var dv)
+                 (dolist (cl clabels)
+                   (em :get-var dv) (compile-expr (car (car cl))) (em :bin "===") (em :jmp-if-true (cdr cl)))
+                 (em :jmp deflabel)
+                 (let ((*break-target* end))
+                   (dolist (cl clabels) (em :label (cdr cl)) (mapc #'compile-stmt (cdr (car cl))))
+                   (em :label deflabel) (when default (mapc #'compile-stmt default)))
+                 (em :label end))))
+    (:try (destructuring-bind (blk param catch fin) (cdr node)
+            (if catch
+                (let ((lc (lbl)) (after (lbl)))
+                  (em :push-handler lc) (compile-stmt blk) (em :pop-handler) (em :jmp after)
+                  (em :label lc) (if param (em :declare-var param) (em :pop))   ; bind/discard thrown value
+                  (compile-stmt catch) (em :label after))
+                (compile-stmt blk))
+            (when fin (compile-stmt fin))))))   ; v0: finally runs on the normal/caught path
 
 ;;; ---- expressions (each leaves exactly one value on the stack) ----
 (defun compile-expr (node)
