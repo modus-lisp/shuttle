@@ -231,6 +231,14 @@
       (when (and th (sb-thread:thread-alive-p th))
         (ignore-errors (sb-thread:join-thread th :timeout 1))))))
 
+(defun terminate-all-generators ()
+  "Force every live (suspended) generator's worker thread to unwind and exit.
+   Called by the test harness between tests so abandoned generators — each
+   holding a realm + a 2MB thread stack — can't accumulate into heap exhaustion."
+  (when *live-generators*
+    (dolist (gs *live-generators*) (ignore-errors (terminate-generator gs)))
+    (setf *live-generators* '())))
+
 (defun reap-generators ()
   "Drop finished generators from the registry; if still over the cap, forcibly
    terminate the oldest suspended workers (assumed abandoned by a prior test)."

@@ -56,5 +56,8 @@
                 (shuttle-timeout () :timeout)
                 (error () :limit)
                 (storage-condition () :limit))))
+        ;; reclaim any generator worker threads this test left suspended — else
+        ;; they accumulate (realm + 2MB stack each) and eventually exhaust the heap.
+        (ignore-errors (terminate-all-generators))
         (if neg (if (eq outcome :threw) :pass :fail)
             (if (eq outcome :ok) :pass :fail))))))

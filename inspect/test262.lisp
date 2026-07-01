@@ -16,7 +16,7 @@
   (dolist (path (directory (merge-pathnames "test/**/*.js" *root*)))
     (let ((n (namestring path)))
       (unless (search "_FIXTURE" n)
-        (incf i) (when (zerop (mod i 2000)) (format *error-output* "~&  ...~d~%" i))
+        (incf i) (when (zerop (mod i 2000)) (format *error-output* "~&  ...~d~%" i) (sb-ext:gc :full t))
         (ignore-errors (with-open-file (c "/tmp/cur262" :direction :output :if-exists :supersede
                                           :if-does-not-exist :create) (write-string n c)))
         (let* ((rel (subseq n rootlen))
