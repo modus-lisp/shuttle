@@ -29,15 +29,37 @@
             ;; string
             ((or (char= c #\") (char= c #\'))
              (let ((q c) (out (make-string-output-stream))) (incf i)
-               (loop until (or (>= i n) (char= (char src i) q)) do
-                 (let ((ch (char src i)))
-                   (if (char= ch #\\)
-                       (progn (incf i)
-                              (let ((e (char src i)))
-                                (write-char (case e (#\n #\Newline) (#\t #\Tab) (#\r #\Return)
-                                              (#\b #\Backspace) (#\0 #\Nul) (t e)) out)))
-                       (write-char ch out))
-                   (incf i)))
+               (flet ((hexn (count)  ; read COUNT hex digits starting at i+1; leave i on the last
+                        (let ((v 0))
+                          (dotimes (_ count)
+                            (let ((d (and (< (1+ i) n) (digit-char-p (char src (1+ i)) 16))))
+                              (unless d (return-from hexn nil))
+                              (setf v (+ (* v 16) d)) (incf i)))
+                          v)))
+                 (loop until (or (>= i n) (char= (char src i) q)) do
+                   (let ((ch (char src i)))
+                     (if (char= ch #\\)
+                         (let ((e (char src (1+ i))))
+                           (incf i)   ; i now on the escape char
+                           (case e
+                             (#\n (write-char #\Newline out)) (#\t (write-char #\Tab out))
+                             (#\r (write-char #\Return out))  (#\b (write-char #\Backspace out))
+                             (#\f (write-char #\Page out))    (#\v (write-char (code-char 11) out))
+                             (#\0 (if (and (< (1+ i) n) (digit-char-p (char src (1+ i))))
+                                      (write-char #\0 out) (write-char #\Nul out)))
+                             (#\x (let ((v (hexn 2))) (write-char (code-char (or v (char-code #\x))) out)))
+                             (#\u (if (and (< (1+ i) n) (char= (char src (1+ i)) #\{))
+                                      (let ((v 0)) (incf i)   ; skip {
+                                        (loop for d = (and (< (1+ i) n) (digit-char-p (char src (1+ i)) 16))
+                                              while d do (setf v (+ (* v 16) d)) (incf i))
+                                        (when (and (< (1+ i) n) (char= (char src (1+ i)) #\})) (incf i))
+                                        (write-char (code-char (min v #x10FFFF)) out))
+                                      (let ((v (hexn 4))) (write-char (code-char (or v (char-code #\u))) out))))
+                             ((#\Newline) nil)   ; line continuation: emit nothing
+                             (#\Return (when (and (< (1+ i) n) (char= (char src (1+ i)) #\Newline)) (incf i)))
+                             (t (write-char e out))))
+                         (write-char ch out))
+                     (incf i))))
                (incf i) (emit :str (get-output-stream-string out))))
             ;; number (decimal / float / exponent; hex 0x)
             ((or (digit-char-p c) (and (char= c #\.) (digit-char-p (peek 1))))
