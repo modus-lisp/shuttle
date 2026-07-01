@@ -463,10 +463,13 @@
 ;; quantifiers, catastrophic backtracking) would otherwise recurse the CL
 ;; control stack to a FATAL, uncatchable exhaustion. On exceed we THROW
 ;; 'regex-overflow, caught in regex-exec -> treat as no match.
-;; Kept below the CL control-stack depth the CPS matcher can reach (each
-;; quantifier repetition nests a frame); a deep/pathological match throws
-;; 'regex-overflow well before a fatal stack exhaustion.
-(defparameter *regex-max-steps* 40000)
+;; Set together with the runner's --control-stack-size (inspect/run262.sh): the
+;; matcher nests one frame per quantifier repetition, so the budget must fit in
+;; the stack. At 200000 with a ~256MB stack, real long-input matches (e.g. /f.*/
+;; on 80k chars) succeed while exponential blowups still bail before a FATAL,
+;; uncatchable stack exhaustion. (True fix = iterative fast-path for single-char
+;; quantifiers; TODO.)
+(defparameter *regex-max-steps* 200000)
 (declaim (inline regex-step))
 (defun regex-step (mc)
   (when (> (the fixnum (incf (the fixnum (mctx-steps mc)))) (the fixnum *regex-max-steps*))

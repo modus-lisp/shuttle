@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 : "${SHUTTLE_TEST262:=$PWD/test262-full}"; export SHUTTLE_TEST262
 SLICE="${1:-1000}"
 OUT="/tmp/slice-results.$$"; : > "$OUT"; export SHUTTLE_SLICE_OUT="$OUT"
-SBCL=(sbcl --control-stack-size 8 --dynamic-space-size 4096 --script inspect/test262-slice.lisp)
+SBCL=(sbcl --control-stack-size 256 --dynamic-space-size 4096 --script inspect/test262-slice.lisp)
 
 # total runnable file count (fixtures excluded)
 TOTAL=$(find "$SHUTTLE_TEST262/test" -name '*.js' ! -name '*_FIXTURE*' | wc -l)
