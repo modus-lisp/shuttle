@@ -9,4 +9,7 @@ host-binding seam a consumer like weft hangs DOM objects + reflow on). Oracle: t
   :components ((:module "src" :serial t
                 :components ((:file "packages") (:file "value") (:file "lex")
                              (:file "parse") (:file "compile") (:file "vm")
-                             (:file "realm")))))
+                             (:file "realm")
+                             ;; built-in method groups (one file per group)
+                             (:module "builtins" :serial t
+                              :components ((:file "array-iteration")))))))

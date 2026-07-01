@@ -94,6 +94,16 @@
   (put-accessor target name :get (native-function realm (concatenate 'string "get " name) getter 0)
                 :enumerable nil :configurable configurable))
 
+;;; ---- installer registry ---------------------------------------------------
+;;; Each src/builtins/*.lisp file owns one method group and ends with
+;;;   (register-builtin-installer 'install-<group>)
+;;; where install-<group> is (realm) -> installs its methods (pulling protos via
+;;; realm accessors). install-intrinsics runs them all AFTER the kernel. Workers
+;;; edit only their own file + add it to the .asd — install-intrinsics is never
+;;; touched, so files stay independent.
+(defvar *builtin-installers* '())
+(defun register-builtin-installer (sym) (pushnew sym *builtin-installers*))
+
 (declaim (inline arg js-truthy*))
 (defun arg (n args) (let ((c (nthcdr n args))) (if c (car c) *undefined*)))
 (defun js-truthy* (v)
@@ -128,6 +138,8 @@
     (install-global-values realm)
     ;; ---- console + eval ----
     (install-console-eval realm)
+    ;; ---- built-in method groups (src/builtins/*) ----
+    (dolist (sym (reverse *builtin-installers*)) (funcall sym realm))
     realm))
 
 ;;; ---------------------------------------------------------------------------
