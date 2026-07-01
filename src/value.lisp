@@ -287,13 +287,13 @@
 (defun js-callable-p (f) (and (js-object-p f) (js-object-call f)))
 (defparameter *max-depth* 900) (defvar *depth* 0)   ; bound JS recursion before the CL stack overflows
 (defun js-call (f this args)
-  (unless (js-callable-p f) (js-throw (format nil "~a is not a function" (to-string f))))
+  (unless (js-callable-p f) (js-throw (make-native-error "TypeError" (format nil "~a is not a function" (to-string f)))))
   (let ((*depth* (1+ *depth*)))
-    (when (> *depth* *max-depth*) (js-throw "Maximum call stack size exceeded"))  ; RangeError, per spec
+    (when (> *depth* *max-depth*) (js-throw (make-native-error "RangeError" "Maximum call stack size exceeded")))
     (funcall (js-object-call f) this args)))
 (defun js-construct (f args &optional (new-target f))
   (unless (and (js-object-p f) (js-object-construct f))
-    (js-throw (format nil "~a is not a constructor" (to-string f))))
+    (js-throw (make-native-error "TypeError" (format nil "~a is not a constructor" (to-string f)))))
   (funcall (js-object-construct f) args new-target))
 
 ;;; ===========================================================================
