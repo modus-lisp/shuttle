@@ -36,6 +36,7 @@
     ((punct? "{") (parse-block))
     ((or (kw? "var") (kw? "let") (kw? "const")) (parse-var))
     ((kw? "function") (parse-function nil))
+    ((async-function-follows-p) (adv) (parse-function nil t))   ; async function decl
     ((kw? "class") (parse-class nil))
     ((kw? "return") (adv) (let ((e (if (or (punct? ";") (punct? "}") (eq (cur-type) :eof)) *undefined-ast*
                                        (parse-expr 1)))) (opt ";") (list :return e)))
@@ -66,7 +67,15 @@
 (defun parse-var () (prog1 (parse-var-decl) (opt ";")))
 
 (defun parse-for ()
-  (adv) (eat "(")
+  (adv)
+  (let ((await (when (kw? "await") (adv) t)))   ; for await (... of ...)
+    (when (and await (not *in-async*))
+      (js-throw (make-native-error "SyntaxError" "for await is only valid in async functions")))
+    (return-from parse-for (parse-for-tail await)))
+  (parse-for-tail nil))
+
+(defun parse-for-tail (await)
+  (eat "(")
   ;; detect for-in / for-of: parse the head, then look for `in`/`of`
   (let ((decl-kind nil) (init nil))
     (cond ((punct? ";") (setf init nil))
@@ -76,8 +85,8 @@
              (cond ((or (kw? "in") (kw? "of"))
                     (let ((kind (cur-val))) (adv)
                       (let ((obj (parse-expr 1))) (eat ")")
-                        (return-from parse-for
-                          (list (if (string= kind "in") :for-in :for-of)
+                        (return-from parse-for-tail
+                          (list (cond ((string= kind "in") :for-in) (await :for-await-of) (t :for-of))
                                 (list :var decl-kind (list (cons name nil))) obj (parse-stmt))))))
                    (t (let ((decls (list (cons name (when (opt "=") (parse-expr 2))))))
                         (loop while (opt ",")
@@ -88,8 +97,9 @@
                (cond ((or (kw? "in") (kw? "of"))
                       (let ((kind (cur-val))) (adv)
                         (let ((obj (parse-expr 1))) (eat ")")
-                          (return-from parse-for
-                            (list (if (string= kind "in") :for-in :for-of) e obj (parse-stmt))))))
+                          (return-from parse-for-tail
+                            (list (cond ((string= kind "in") :for-in) (await :for-await-of) (t :for-of))
+                                  e obj (parse-stmt))))))
                      (t (setf init (list :expr e)))))))
     (eat ";")
     (let ((test (unless (punct? ";") (parse-expr 1)))) (eat ";")
@@ -211,6 +221,8 @@
              (when (and (kw? "static") (not (member-name-terminator-p)))
                (adv) (setf static t))
              (cond
+               ((and (kw? "async") (async-method-follows-p))   ; async / async* method
+                (adv) (if (punct? "*") (progn (adv) (setf gen :async-gen)) (setf gen :async)))
                ((punct? "*") (adv) (setf gen t))
                ((and (kw? "get") (not (member-name-terminator-p))) (adv) (setf kind :get))
                ((and (kw? "set") (not (member-name-terminator-p))) (adv) (setf kind :set)))
@@ -252,17 +264,31 @@
   (parse-member (parse-primary)))
 
 (defvar *in-generator* nil)   ; is `yield` a keyword in the current parse context?
+(defvar *in-async* nil)       ; is `await` a keyword in the current parse context?
 
-(defun parse-function (exprp)
+(defun async-function-follows-p ()
+  "At an `async` identifier token: does a FunctionDeclaration/Expression follow on
+   the same line (no LineTerminator between `async` and `function`)? We don't track
+   newlines in the token stream, so approximate: the next token is `function`."
+  (and (kw? "async")
+       (let ((nxt (aref *toks* (1+ *pos*))))
+         (and (eq (car nxt) :ident) (string= (cdr nxt) "function")))))
+
+(defun parse-function (exprp &optional async)
   (adv)                                       ; 'function'
   (let ((gen (opt "*")))                      ; function* -> generator
     (let ((name (when (eq (cur-type) :ident) (prog1 (cur-val) (adv)))))
       (eat "(")
-      (let ((params (parse-param-list)))
+      (let* ((*in-generator* gen) (*in-async* async)
+             (params (parse-param-list)))
         (eat ")")
-        (let* ((*in-generator* gen) (body (parse-block)))
+        (let ((body (parse-block)))
           (declare (ignore exprp))
-          (if gen (list :genfunc name params body) (list :func name params body)))))))
+          (cond
+            ((and gen async) (list :asyncgenfunc name params body))
+            (gen (list :genfunc name params body))
+            (async (list :asyncfunc name params body))
+            (t (list :func name params body))))))))
 
 ;;; ---- expressions (Pratt) ----
 (defun assignable-target-p (node op)
@@ -327,6 +353,7 @@
   (let ((tt (cur-type)) (tv (cur-val)))
     (cond
       ((and (eq tt :punct) (member tv '("!" "-" "+" "~") :test #'string=)) (adv) (list :unary tv (parse-unary)))
+      ((and *in-async* (kw? "await")) (adv) (list :await (parse-unary)))
       ((kw? "typeof") (adv) (list :unary "typeof" (parse-unary)))
       ((kw? "void") (adv) (list :unary "void" (parse-unary)))
       ((kw? "delete") (adv) (list :delete (parse-unary)))
@@ -396,15 +423,58 @@
          ((punct? "[") (adv) (let ((k (parse-expr 1))) (eat "]") (list :super-member k t)))
          (t (js-throw (make-native-error "SyntaxError" "Unexpected 'super'")))))
       ((kw? "function") (parse-function t))
+      ((async-function-follows-p) (adv) (parse-function t t))   ; async function expression
+      ((and (kw? "async") (async-arrow-follows-p)) (parse-async-arrow))
       ((kw? "class") (parse-class t))
       ((punct? "(") (parse-paren-or-arrow))
       ((punct? "[") (parse-array-literal))
       ((punct? "{") (parse-object-literal))
       ((eq tt :ident)
+       ;; `await` is a reserved word (not a usable identifier) in async context.
+       (when (and *in-async* (string= tv "await"))
+         (js-throw (make-native-error "SyntaxError" "await is reserved in async functions")))
        (adv) (if (punct? "=>")                  ; id => body  (arrow)
                  (progn (adv) (list :arrow (list tv) (parse-arrow-body)))
                  (list :ident tv)))
       (t (js-throw (format nil "Unexpected token ~a ~s" tt tv))))))
+
+(defun async-arrow-follows-p ()
+  "At `async`: is this an async arrow head — `async IDENT =>` or `async (`
+   (with a `=>` after the parens)? Approximate by peeking one token."
+  (and (kw? "async")
+       (let ((nxt (aref *toks* (1+ *pos*))))
+         (or (and (eq (car nxt) :ident)                 ; async x => ...
+                  (not (string= (cdr nxt) "function")))
+             (and (eq (car nxt) :punct) (string= (cdr nxt) "("))))))  ; async ( ... ) =>
+
+(defun parse-async-arrow ()
+  "Parse an async arrow: `async ident => body` or `async (params) => body`.
+   On a bare `async ( ... )` that is NOT an arrow, backtrack to a call expression."
+  (let ((start *pos*))
+    (adv)                                        ; 'async'
+    (cond
+      ;; async ident => body
+      ((and (eq (cur-type) :ident) (not (punct? "(")))
+       (let ((param (cur-val)))
+         (adv)
+         (if (punct? "=>")
+             (progn (adv) (let ((*in-async* t)) (list :async-arrow (list param) (parse-arrow-body))))
+             (progn (setf *pos* start) (parse-async-as-ident)))))
+      ;; async ( params ) => body   (speculative; backtrack to a call if no =>)
+      ((punct? "(")
+       (or (ignore-errors
+             (let ((*in-async* t))
+               (eat "(")
+               (let ((params (parse-param-list)))
+                 (eat ")")
+                 (when (punct? "=>")
+                   (adv) (list :async-arrow params (parse-arrow-body))))))
+           (progn (setf *pos* start) (parse-async-as-ident))))
+      (t (setf *pos* start) (parse-async-as-ident)))))
+
+(defun parse-async-as-ident ()
+  "`async` used as a plain identifier (or the callee of `async(...)`)."
+  (adv) (list :ident "async"))
 
 (defun sub-parse-expr (toks)
   "Parse a full expression from a pre-tokenized vector (template substitution)."
@@ -463,15 +533,28 @@
     ((eq (cur-type) :ident) (list :lit (prog1 (cur-val) (adv))))
     (t (js-throw (make-native-error "SyntaxError" "Unexpected token in object literal")))))
 
+(defun async-method-follows-p ()
+  "At `async` in a method context: is it the async-method modifier (followed by a
+   key or `*`) rather than a member named `async` (followed by `(` `:` `,` `}` `=`)?"
+  (let ((nxt (aref *toks* (1+ *pos*))))
+    (not (and (eq (car nxt) :punct)
+              (member (cdr nxt) '("(" ":" "," "}" "=" ";") :test #'string=)))))
+
 (defun parse-method-tail (name-string &optional gen)
   "Parse `(params){body}` as a function expression AST for a method/accessor.
-   When GEN, the body is a generator body (yield is a keyword)."
+   GEN: nil=plain, t=generator, :async=async method, :async-gen=async generator."
   (eat "(")
-  (let ((params (parse-param-list)))
+  (let* ((generatorp (member gen '(t :async-gen)))
+         (asyncp (member gen '(:async :async-gen)))
+         (*in-generator* generatorp) (*in-async* asyncp)
+         (params (parse-param-list)))
     (eat ")")
-    (let* ((*in-generator* gen) (body (parse-block)))
-      (if gen (list :genfunc name-string params body)
-          (list :func name-string params body)))))
+    (let ((body (parse-block)))
+      (cond
+        ((eq gen :async-gen) (list :asyncgenfunc name-string params body))
+        ((eq gen :async) (list :asyncfunc name-string params body))
+        (generatorp (list :genfunc name-string params body))
+        (t (list :func name-string params body))))))
 
 (defun parse-object-literal ()
   (eat "{")
@@ -488,6 +571,12 @@
         ((and (kw? "set") (accessor-follows-p))
          (adv) (let ((key (parse-property-key)))
                  (push (list :set key (parse-method-tail (key-name key))) props)))
+        ;; async method / async generator method: `async key(){}` / `async *key(){}`
+        ((and (kw? "async") (async-method-follows-p))
+         (adv)
+         (let ((agen (opt "*")))
+           (let ((key (parse-property-key)))
+             (push (list :init key (parse-method-tail (key-name key) (if agen :async-gen :async))) props))))
         ;; generator method: *key(...){...}
         ((punct? "*")
          (adv) (let ((key (parse-property-key)))

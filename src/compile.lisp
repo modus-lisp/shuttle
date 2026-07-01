@@ -4,7 +4,7 @@
 ;;;; (indexed locals + scope analysis = a later optimization).
 (in-package #:shuttle)
 
-(defstruct code name params instrs)
+(defstruct code name params instrs inst-instrs)   ; inst-instrs: split instantiation code (generators/async)
 (defvar *out*)
 (defvar *break-target* nil) (defvar *continue-target* nil)
 (defvar *scope-depth* 0)                 ; current lexical block-env nesting within the fn
@@ -73,6 +73,28 @@
       (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s))))
     (unless toplevel (em :const *undefined*) (em :ret))   ; functions default-return undefined
     (make-code :name name :params params :instrs (assemble *out*))))
+
+(defun compile-fn-split (name params body)
+  "Compile a generator/async/async-generator: split FunctionDeclarationInstantiation
+   (param binding + var/lexical/fn hoisting — run synchronously at the call) from the
+   deferred body. Returns a CODE whose INST-INSTRS is the instantiation stream and
+   INSTRS is the body; both run against the SAME function environment."
+  (let ((pnames (param-names params)) (inst nil))
+    (let ((*out* '()))
+      (compile-params params)
+      (dolist (v (collect-var-names body))
+        (unless (member v pnames :test #'string=)
+          (em :const *undefined*) (em :declare-var v)))
+      (let ((stmts (if (eq (car body) :block) (second body) (list body))))
+        (dolist (n (block-lexical-names stmts)) (em :tdz-declare n))
+        (dolist (fn (block-lexical-fns stmts)) (compile-expr fn) (em :init-let (second fn))))
+      (em :const *undefined*) (em :ret)              ; instantiation stream returns undefined
+      (setf inst (assemble *out*)))
+    (let ((*out* '()))
+      (let ((stmts (if (eq (car body) :block) (second body) (list body))))
+        (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s))))
+      (em :const *undefined*) (em :ret)
+      (make-code :name name :params params :instrs (assemble *out*) :inst-instrs inst))))
 
 (defun compile-array-destructure (pat)
   "Value on stack is the iterable. Destructure per (:apat ELEMS)."
@@ -203,12 +225,13 @@
   "Collect `var`-declared names in NODE, NOT descending into nested functions."
   (when (consp node)
     (case (car node)
-      ((:func :arrow :genfunc :class) acc)  ; nested function/class scope: stop
+      ((:func :arrow :genfunc :class :asyncfunc :asyncgenfunc :async-arrow) acc)  ; nested function/class scope: stop
       (:var (if (string= (second node) "var")   ; only `var` hoists to function scope
                 (progn (dolist (d (third node)) (setf acc (target-names (car d) acc))) acc)
                 acc))
       (:for-in (setf acc (collect-var-names (fourth node) (collect-var-names (second node) acc))))
       (:for-of (setf acc (collect-var-names (fourth node) (collect-var-names (second node) acc))))
+      (:for-await-of (setf acc (collect-var-names (fourth node) (collect-var-names (second node) acc))))
       (t (dolist (x (cdr node))
            (cond ((and (consp x) (keywordp (car x))) (setf acc (collect-var-names x acc)))
                  ((and (consp x) (consp (car x)))   ; a list of statements/cases
@@ -254,7 +277,7 @@
 (defun block-lexical-fns (stmts)
   "Function declarations directly in STMTS (hoisted at block scope)."
   (remove-if-not #'block-hoisted-fn-p stmts))
-(defun block-hoisted-fn-p (s) (and (consp s) (member (car s) '(:func :genfunc)) (second s)))
+(defun block-hoisted-fn-p (s) (and (consp s) (member (car s) '(:func :genfunc :asyncfunc :asyncgenfunc)) (second s)))
 
 ;;; ---- statements ----
 (defun compile-stmt (node)
@@ -271,6 +294,8 @@
                        (t (if (stringp tgt) (em :declare-var tgt) (bind-target tgt)))))))
     (:func (compile-expr node) (em :declare-var (second node)))
     (:genfunc (compile-expr node) (em :declare-var (second node)))
+    (:asyncfunc (compile-expr node) (em :declare-var (second node)))
+    (:asyncgenfunc (compile-expr node) (em :declare-var (second node)))
     (:class (compile-expr node) (em :init-let (second node)))   ; class decl: lexical binding
     (:return (compile-expr (second node)) (em :ret))
     (:throw (compile-expr (second node)) (em :throw-op))
@@ -288,6 +313,7 @@
     (:for (compile-for node))
     (:for-in (compile-scoped-loop node #'compile-for-in))
     (:for-of (compile-scoped-loop node #'compile-for-of))
+    (:for-await-of (compile-scoped-loop node #'compile-for-await-of))
     (:break (if *break-target* (progn (pop-envs (- *scope-depth* *break-depth*)) (em :jmp *break-target*))
                 (js-throw "illegal break")))
     (:continue (if *continue-target* (progn (pop-envs (- *scope-depth* *continue-depth*)) (em :jmp *continue-target*))
@@ -389,6 +415,21 @@
       (let ((*break-target* end) (*continue-target* cont)) (compile-stmt body))
       (em :label cont) (em :jmp top) (em :label end))))
 
+(defun compile-for-await-of (node)
+  "for await (x of asyncIterable): drive the async iterator, awaiting each step's
+   result and its value. Only valid inside an async function."
+  (destructuring-bind (head obj body) (cdr node)
+    (let ((it (string (gensym "IT"))) (res (string (gensym "R")))
+          (top (lbl)) (cont (lbl)) (end (lbl)))
+      (compile-expr obj) (em :get-async-iterator) (em :declare-var it)
+      (em :label top)
+      (em :get-var it) (em :iter-next) (em :await) (em :declare-var res)  ; await the {value,done}
+      (em :get-var res) (em :get-prop-c "done") (em :jmp-if-true end)
+      (em :get-var res) (em :get-prop-c "value") (em :await)              ; await the value
+      (for-head-assign head)
+      (let ((*break-target* end) (*continue-target* cont)) (compile-stmt body))
+      (em :label cont) (em :jmp top) (em :label end))))
+
 ;;; ---- expressions (each leaves exactly one value on the stack) ----
 (defun compile-expr (node)
   (ecase (car node)
@@ -433,8 +474,12 @@
     (:array (compile-array-literal (second node)))
     (:object (compile-object-literal (second node)))
     (:func (em :closure (compile-fn (second node) (third node) (fourth node))))
-    (:genfunc (em :genclosure (compile-fn (second node) (third node) (fourth node))))
+    (:genfunc (em :genclosure (compile-fn-split (second node) (third node) (fourth node))))
+    (:asyncfunc (em :asyncclosure (compile-fn-split (second node) (third node) (fourth node))))
+    (:asyncgenfunc (em :asyncgenclosure (compile-fn-split (second node) (third node) (fourth node))))
     (:arrow (em :closure (compile-fn nil (second node) (third node))))
+    (:async-arrow (em :asyncclosure (compile-fn-split nil (second node) (third node))))
+    (:await (compile-expr (second node)) (em :await))
     (:class (compile-class node))
     (:yield (if (second node) (compile-expr (second node)) (em :const *undefined*))
             (em :yield))
