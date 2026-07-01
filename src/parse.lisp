@@ -19,8 +19,11 @@
     ("==" . 8) ("!=" . 8) ("===" . 8) ("!==" . 8)
     ("<" . 9) (">" . 9) ("<=" . 9) (">=" . 9)
     ("<<" . 10) (">>" . 10) (">>>" . 10)
-    ("+" . 11) ("-" . 11) ("*" . 12) ("/" . 12) ("%" . 12)))
-(defparameter *assignops* '("=" "+=" "-=" "*=" "/=" "%="))
+    ("+" . 11) ("-" . 11) ("*" . 12) ("/" . 12) ("%" . 12)
+    ("**" . 14)))                       ; ** right-assoc, handled specially below
+(defparameter *assignops* '("=" "+=" "-=" "*=" "/=" "%=" "**="
+                            "<<=" ">>=" ">>>=" "&=" "|=" "^=" "&&=" "||=" "??="))
+(defparameter *nullish-op* "??")        ; parsed with logical precedence
 
 (defun parse-program (src)
   (let ((*toks* (tokenize src)) (*pos* 0) (stmts '()))
@@ -55,8 +58,8 @@
 (defun parse-var-decl ()                 ; no trailing semicolon (for use in `for`)
   (let ((kind (cur-val))) (adv)
     (let ((decls '()))
-      (loop (let ((name (cur-val))) (adv)
-              (push (cons name (when (opt "=") (parse-expr 2))) decls))
+      (loop (let ((tgt (parse-binding-target)))    ; name string OR (:apat ..)/(:opat ..)
+              (push (cons tgt (when (opt "=") (parse-expr 2))) decls))
             (unless (opt ",") (return)))
       (list :var kind (nreverse decls)))))
 (defun parse-var () (prog1 (parse-var-decl) (opt ";")))
@@ -68,7 +71,7 @@
     (cond ((punct? ";") (setf init nil))
           ((or (kw? "var") (kw? "let") (kw? "const"))
            (setf decl-kind (cur-val)) (adv)
-           (let ((name (cur-val))) (adv)
+           (let ((name (parse-binding-target)))
              (cond ((or (kw? "in") (kw? "of"))
                     (let ((kind (cur-val))) (adv)
                       (let ((obj (parse-expr 1))) (eat ")")
@@ -77,7 +80,7 @@
                                 (list :var decl-kind (list (cons name nil))) obj (parse-stmt))))))
                    (t (let ((decls (list (cons name (when (opt "=") (parse-expr 2))))))
                         (loop while (opt ",")
-                              do (let ((n2 (cur-val))) (adv)
+                              do (let ((n2 (parse-binding-target)))
                                    (push (cons n2 (when (opt "=") (parse-expr 2))) decls)))
                         (setf init (list :var decl-kind (nreverse decls))))))))
           (t (let ((e (parse-expr 1)))
@@ -111,17 +114,100 @@
             (setf catch (parse-block)))
           (when (kw? "finally") (adv) (setf fin (parse-block)))
           (list :try blk param catch fin)))
+(defun parse-param-list ()
+  "Parse `( ... )` param list. Consumes the opening `(` must already be eaten
+   by caller? No — here we DON'T eat `(`; caller does. Returns a list of params,
+   each: NAME-STRING | (:default NAME EXPR) | (:rest NAME) | (:pat PATTERN [DEFAULT])."
+  (let ((params '()))
+    (loop until (punct? ")") do
+      (cond
+        ((punct? "...")
+         (adv)
+         (let ((tgt (parse-binding-target)))
+           (push (list :rest tgt) params))
+         (return))                         ; rest must be last
+        (t (let ((tgt (parse-binding-target)))
+             (if (punct? "=")
+                 (progn (adv) (push (list :default tgt (parse-expr 2)) params))
+                 (push tgt params)))))
+      (unless (punct? ")") (eat ",")))
+    (nreverse params)))
+
+(defun parse-binding-target ()
+  "A binding target: a plain name, or an array/object destructuring pattern."
+  (cond
+    ((punct? "[") (parse-array-pattern))
+    ((punct? "{") (parse-object-pattern))
+    ((eq (cur-type) :ident) (prog1 (cur-val) (adv)))
+    (t (js-throw (make-native-error "SyntaxError" "Invalid binding target")))))
+
+;;; ---- destructuring patterns ----
+;;; Pattern AST: (:apat ELEMS) / (:opat PROPS).
+;;;   array elem: nil (hole) | TARGET | (:default TARGET EXPR) | (:rest TARGET)
+;;;   object prop: (KEYFORM TARGET) | (KEYFORM TARGET DEFAULT) | (:rest NAME)
+;;;   TARGET is itself a binding target (name or nested pattern).
+(defun parse-array-pattern ()
+  (eat "[")
+  (let ((elems '()))
+    (loop until (punct? "]") do
+      (cond
+        ((punct? ",") (push nil elems) (adv))   ; hole; consume comma, continue
+        ((punct? "...")
+         (adv) (push (list :rest (parse-binding-target)) elems)
+         (return))
+        (t (let ((tgt (parse-binding-target)))
+             (if (punct? "=")
+                 (progn (adv) (push (list :default tgt (parse-expr 2)) elems))
+                 (push tgt elems)))
+           (unless (punct? "]") (eat ",")))))
+    (eat "]")
+    (list :apat (nreverse elems))))
+
+(defun parse-object-pattern ()
+  (eat "{")
+  (let ((props '()))
+    (loop until (punct? "}") do
+      (cond
+        ((punct? "...")
+         (adv) (push (list :rest (ident-or-keyword-name)) props)
+         (return))
+        (t (let ((key (parse-property-key)))
+             (cond
+               ((punct? ":")
+                (adv) (let ((tgt (parse-binding-target)))
+                        (if (punct? "=")
+                            (progn (adv) (push (list key tgt (parse-expr 2)) props))
+                            (push (list key tgt) props))))
+               ((eq (car key) :lit)         ; shorthand {x} or {x = d}
+                (if (punct? "=")
+                    (progn (adv) (push (list key (second key) (parse-expr 2)) props))
+                    (push (list key (second key)) props)))
+               (t (js-throw (make-native-error "SyntaxError" "Invalid object pattern")))))))
+      (unless (punct? "}") (eat ",")))
+    (eat "}")
+    (list :opat (nreverse props))))
+
 (defun parse-function (exprp)
   (adv)                                       ; 'function'
   (let ((name (when (eq (cur-type) :ident) (prog1 (cur-val) (adv)))))
-    (eat "(") (let ((params '()))
-                (loop until (punct? ")") do (push (cur-val) params) (adv) (unless (punct? ")") (eat ",")))
-                (eat ")")
-                (let ((body (parse-block)))
-                  (declare (ignore exprp))
-                  (list :func name (nreverse params) body)))))
+    (eat "(")
+    (let ((params (parse-param-list)))
+      (eat ")")
+      (let ((body (parse-block)))
+        (declare (ignore exprp))
+        (list :func name params body)))))
 
 ;;; ---- expressions (Pratt) ----
+(defun assignable-target-p (node op)
+  "Is NODE a valid AssignmentTarget for assignment operator OP?
+   Simple (=): identifiers, member accesses, and (for plain =) destructuring
+   patterns. Compound ops require a simple reference."
+  (case (car node)
+    (:ident t)
+    (:member t)
+    ((:array :object) (string= op "="))     ; destructuring only for plain assignment
+    (t nil)))
+
 (defun parse-expr (min-bp)
   (let ((left (parse-unary)))
     (loop
@@ -129,6 +215,8 @@
         (cond
           ;; assignment (right-assoc), lowest
           ((and (eq tt :punct) (member tv *assignops* :test #'string=) (>= 1 (1- min-bp)))
+           (unless (assignable-target-p left tv)
+             (js-throw (make-native-error "SyntaxError" "Invalid left-hand side in assignment")))
            (adv) (setf left (list :assign tv left (parse-expr 1))))
           ;; conditional ?:
           ((and (punct? "?") (>= 2 min-bp))
@@ -137,6 +225,12 @@
           ;; instanceof / in (keyword operators, relational precedence)
           ((and (eq tt :ident) (member tv '("instanceof" "in") :test #'string=) (>= 9 min-bp))
            (adv) (setf left (list :bin tv left (parse-expr 10))))
+          ;; nullish coalescing ?? (logical, short-circuits on null/undefined)
+          ((and (eq tt :punct) (string= tv "??") (>= 5 min-bp))
+           (adv) (setf left (list :logical "??" left (parse-expr 6))))
+          ;; ** right-associative (recurse at same bp, not bp+1)
+          ((and (eq tt :punct) (string= tv "**") (>= 14 min-bp))
+           (adv) (setf left (list :bin "**" left (parse-expr 14))))
           ;; binary / logical
           ((and (eq tt :punct) (assoc tv *binops* :test #'string=))
            (let ((bp (cdr (assoc tv *binops* :test #'string=))))
@@ -163,31 +257,56 @@
   (let ((e (parse-member (parse-primary))))
     (if (or (punct? "++") (punct? "--")) (prog1 (list :update (cur-val) nil e) (adv)) e)))
 
-(defun parse-member (e &optional (allow-call t))   ; . [] () chains
+(defun parse-member (e &optional (allow-call t))   ; . [] () ?. chains + tagged templates
   (loop
     (cond ((punct? ".") (adv) (setf e (list :member e (list :str (cur-val)) nil)) (adv))
+          ((punct? "?.")
+           (adv)
+           (cond ((punct? "(") (setf e (list :ocall e (parse-args))))    ; ?.( args )
+                 ((punct? "[") (adv) (let ((k (parse-expr 1))) (eat "]")
+                                       (setf e (list :omember e k t))))  ; ?.[ expr ]
+                 (t (setf e (list :omember e (list :str (cur-val)) nil)) (adv)))) ; ?.ident
           ((punct? "[") (adv) (let ((k (parse-expr 1))) (eat "]") (setf e (list :member e k t))))
           ((and allow-call (punct? "(")) (setf e (list :call e (parse-args))))
+          ((eq (cur-type) :template)                                     ; tagged template
+           (setf e (list :tagged-template e (parse-template-node))))
           (t (return e)))))
 
 (defun parse-args ()
   (eat "(") (let ((args '()))
-              (loop until (punct? ")") do (push (parse-expr 2) args) (unless (punct? ")") (eat ",")))
+              (loop until (punct? ")") do
+                (if (punct? "...")
+                    (progn (adv) (push (list :spread (parse-expr 2)) args))
+                    (push (parse-expr 2) args))
+                (unless (punct? ")") (eat ",")))
               (eat ")") (nreverse args)))
+
+(defun parse-array-literal ()
+  "Array literal with holes ([1,,3] -> nil element) and spread ([...a])."
+  (eat "[")
+  (let ((elems '()))
+    (loop until (punct? "]") do
+      (cond
+        ((punct? ",") (push nil elems) (adv))         ; elision
+        ((punct? "...") (adv) (push (list :spread (parse-expr 2)) elems)
+                        (unless (punct? "]") (eat ",")))
+        (t (push (parse-expr 2) elems)
+           (unless (punct? "]") (eat ",")))))
+    (eat "]")
+    (list :array (nreverse elems))))
 
 (defun parse-primary ()
   (let ((tt (cur-type)) (tv (cur-val)))
     (cond
       ((eq tt :num) (adv) (list :num tv))
       ((eq tt :str) (adv) (list :str tv))
+      ((eq tt :template) (parse-template-node))
       ((kw? "true") (adv) '(:bool t)) ((kw? "false") (adv) '(:bool nil))
       ((kw? "null") (adv) '(:null)) ((kw? "undefined") (adv) '(:undefined))
       ((kw? "this") (adv) '(:this))
       ((kw? "function") (parse-function t))
       ((punct? "(") (parse-paren-or-arrow))
-      ((punct? "[") (adv) (let ((elems '()))
-                            (loop until (punct? "]") do (push (parse-expr 2) elems) (unless (punct? "]") (eat ",")))
-                            (eat "]") (list :array (nreverse elems))))
+      ((punct? "[") (parse-array-literal))
       ((punct? "{") (parse-object-literal))
       ((eq tt :ident)
        (adv) (if (punct? "=>")                  ; id => body  (arrow)
@@ -195,26 +314,116 @@
                  (list :ident tv)))
       (t (js-throw (format nil "Unexpected token ~a ~s" tt tv))))))
 
+(defun sub-parse-expr (toks)
+  "Parse a full expression from a pre-tokenized vector (template substitution)."
+  (let ((*toks* toks) (*pos* 0))
+    (prog1 (parse-expr 1)
+      (unless (eq (cur-type) :eof)
+        (js-throw (make-native-error "SyntaxError" "Unexpected token in template expression"))))))
+
+(defun template-parts->node (parts)
+  "PARTS is the lexer's list of (:str cooked raw) and (:expr toks). Build
+   (:template (COOKED...) (RAW...) (EXPR-AST...))."
+  (let ((cooked '()) (raw '()) (exprs '()))
+    (dolist (p parts)
+      (ecase (car p)
+        (:str (push (second p) cooked) (push (third p) raw))
+        (:expr (push (sub-parse-expr (second p)) exprs))))
+    (list :template (nreverse cooked) (nreverse raw) (nreverse exprs))))
+
+(defun parse-template-node ()
+  (let ((parts (cur-val))) (adv) (template-parts->node parts)))
+
 (defun parse-arrow-body ()
   (if (punct? "{") (parse-block) (list :block (list (list :return (parse-expr 2))))))
 
 (defun parse-paren-or-arrow ()
-  ;; parse ( ... ); if followed by =>, it's an arrow whose contents are params.
+  ;; ( ... ); if followed by =>, its contents are arrow params (which may include
+  ;; defaults, rest, and destructuring patterns). Speculatively parse as a param
+  ;; list; on failure, backtrack and parse as a parenthesized expression.
+  (let ((start *pos*))
+    (or (ignore-errors
+          (eat "(")
+          (let ((params (parse-param-list)))
+            (eat ")")
+            (when (punct? "=>")
+              (adv) (list :arrow params (parse-arrow-body)))))
+        (progn
+          (setf *pos* start)
+          (eat "(")
+          (let ((items '()))
+            (loop until (punct? ")") do (push (parse-expr 2) items) (unless (punct? ")") (eat ",")))
+            (eat ")")
+            (setf items (nreverse items))
+            (or (car (last items)) (js-throw (make-native-error "SyntaxError" "empty ()"))))))))
+
+(defun ident-or-keyword-name ()
+  "Consume an identifier/keyword token as a plain name string (property key context)."
+  (if (eq (cur-type) :ident) (prog1 (cur-val) (adv))
+      (js-throw (make-native-error "SyntaxError" "Expected property name"))))
+
+(defun parse-property-key ()
+  "Parse a property key. Returns (:lit STRING) or (:computed EXPR)."
+  (cond
+    ((punct? "[") (adv) (let ((e (parse-expr 2))) (eat "]") (list :computed e)))
+    ((eq (cur-type) :str) (list :lit (prog1 (cur-val) (adv))))
+    ((eq (cur-type) :num) (list :lit (number-to-string (prog1 (cur-val) (adv)))))
+    ((eq (cur-type) :ident) (list :lit (prog1 (cur-val) (adv))))
+    (t (js-throw (make-native-error "SyntaxError" "Unexpected token in object literal")))))
+
+(defun parse-method-tail (name-string)
+  "Parse `(params){body}` as a function expression AST for a method/accessor."
   (eat "(")
-  (let ((items '()))
-    (loop until (punct? ")") do (push (parse-expr 2) items) (unless (punct? ")") (eat ",")))
+  (let ((params (parse-param-list)))
     (eat ")")
-    (setf items (nreverse items))
-    (if (punct? "=>")
-        (progn (adv) (list :arrow (mapcar (lambda (e) (if (eq (car e) :ident) (second e)
-                                                          (js-throw "bad arrow param"))) items)
-                           (parse-arrow-body)))
-        (or (car (last items)) (js-throw "empty ()")))))
+    (let ((body (parse-block)))
+      (list :func name-string params body))))
 
 (defun parse-object-literal ()
-  (eat "{") (let ((props '()))
-              (loop until (punct? "}") do
-                (let ((key (cur-val))) (adv) (eat ":")
-                  (push (cons key (parse-expr 2)) props))
-                (unless (punct? "}") (eat ",")))
-              (eat "}") (list :object (nreverse props))))
+  (eat "{")
+  (let ((props '()))
+    (loop until (punct? "}") do
+      (cond
+        ;; spread: ...expr
+        ((punct? "...")
+         (adv) (push (list :spread (parse-expr 2)) props))
+        ;; get/set accessor: `get key(){}` — but only if `get`/`set` is followed by a key
+        ((and (kw? "get") (accessor-follows-p))
+         (adv) (let ((key (parse-property-key)))
+                 (push (list :get key (parse-method-tail (key-name key))) props)))
+        ((and (kw? "set") (accessor-follows-p))
+         (adv) (let ((key (parse-property-key)))
+                 (push (list :set key (parse-method-tail (key-name key))) props)))
+        (t
+         (let ((key (parse-property-key)))
+           (cond
+             ;; method: key(...){...}
+             ((punct? "(")
+              (push (list :init key (parse-method-tail (key-name key))) props))
+             ;; key: value  (literal __proto__: v sets the prototype, per B.3.1)
+             ((punct? ":")
+              (adv)
+              (if (and (eq (car key) :lit) (string= (second key) "__proto__"))
+                  (push (list :proto (parse-expr 2)) props)
+                  (push (list :init key (parse-expr 2)) props)))
+             ;; shorthand {x} or {x = default} (the latter only valid in patterns; store init)
+             ((eq (car key) :lit)
+              (if (punct? "=")
+                  (progn (adv)   ; shorthand with default (destructuring pattern context)
+                         (push (list :init key (list :ident (second key)) (parse-expr 2)) props))
+                  (push (list :init key (list :ident (second key))) props)))
+             (t (js-throw (make-native-error "SyntaxError" "Invalid shorthand property")))))))
+      (unless (punct? "}") (eat ",")))
+    (eat "}")
+    (list :object (nreverse props))))
+
+(defun accessor-follows-p ()
+  "After a `get`/`set` token, is there a real accessor key (not `:` `,` `(` `}`)?
+   Peek the next token."
+  (let ((nxt (aref *toks* (1+ *pos*))))
+    (not (and (eq (car nxt) :punct)
+              (member (cdr nxt) '(":" "," "(" "}" "=") :test #'string=)))))
+
+(defun key-name (key)
+  "A string name for a literal key, or a placeholder for a computed one."
+  (if (eq (car key) :lit) (second key) ""))
