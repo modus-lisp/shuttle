@@ -1,9 +1,747 @@
+;;;; builtins/typedarray.lisp — %TypedArray% abstract superclass + the concrete
+;;;; integer/float constructors, plus integer-indexed exotic get/set and the
+;;;; prototype method family. Backing store is the ArrayBuffer's byte vector
 ;;;; See array-iteration.lisp for the convention + available helpers.
 (in-package #:shuttle)
 
+;;; ===========================================================================
+;;; Element-type descriptors
+;;; ===========================================================================
+(defstruct (ta-type (:constructor make-ta-type))
+  name size signed float clamped
+  ;; encode: (double) -> unsigned integer of SIZE bytes ; decode: (uint) -> double
+  encode decode)
+
+(defun clamp-to-uint8 (x)
+  "ToUint8Clamp: round-half-to-even, clamp to [0,255]. X is a double."
+  (cond ((js-nan-p x) 0)
+        ((<= x 0d0) 0)
+        ((>= x 255d0) 255)
+        (t (let* ((f (ffloor x)) (frac (- x f)))
+             (cond ((< frac 0.5d0) (truncate f))
+                   ((> frac 0.5d0) (truncate (+ f 1)))
+                   ;; exactly .5 → round to even
+                   (t (let ((fi (truncate f))) (if (evenp fi) fi (1+ fi)))))))))
+
+(defun int-modular (x bits)
+  "ToIntN/ToUintN modular reduction; returns the unsigned bit pattern (uint)."
+  (if (or (js-nan-p x) (= (abs x) *inf*)) 0
+      (mod (truncate x) (ash 1 bits))))
+
+(defun float32-bits (d)
+  "IEEE-754 single-precision bit pattern (unsigned 32-bit) of double D."
+  (with-js-floats
+    (sb-kernel:single-float-bits (coerce d 'single-float))))
+(defun bits-float32 (u)
+  (let ((s (sb-kernel:make-single-float (if (>= u #x80000000) (- u #x100000000) u))))
+    (float s 1d0)))
+(defun float64-bits (d)
+  (with-js-floats
+    (let ((hi (sb-kernel:double-float-high-bits d))
+          (lo (sb-kernel:double-float-low-bits d)))
+      (logior (ash (logand hi #xFFFFFFFF) 32) (logand lo #xFFFFFFFF)))))
+(defun bits-float64 (u)
+  (let* ((hi (ldb (byte 32 32) u)) (lo (ldb (byte 32 0) u)))
+    (sb-kernel:make-double-float (if (>= hi #x80000000) (- hi #x100000000) hi) lo)))
+
+(defparameter *ta-types* nil) ; alist name -> ta-type
+
+(defun build-ta-types ()
+  (list
+   (make-ta-type :name "Int8Array" :size 1 :signed t
+     :encode (lambda (x) (int-modular x 8))
+     :decode (lambda (u) (float (if (>= u #x80) (- u #x100) u) 1d0)))
+   (make-ta-type :name "Uint8Array" :size 1
+     :encode (lambda (x) (int-modular x 8))
+     :decode (lambda (u) (float u 1d0)))
+   (make-ta-type :name "Uint8ClampedArray" :size 1 :clamped t
+     :encode (lambda (x) (clamp-to-uint8 x))
+     :decode (lambda (u) (float u 1d0)))
+   (make-ta-type :name "Int16Array" :size 2 :signed t
+     :encode (lambda (x) (int-modular x 16))
+     :decode (lambda (u) (float (if (>= u #x8000) (- u #x10000) u) 1d0)))
+   (make-ta-type :name "Uint16Array" :size 2
+     :encode (lambda (x) (int-modular x 16))
+     :decode (lambda (u) (float u 1d0)))
+   (make-ta-type :name "Int32Array" :size 4 :signed t
+     :encode (lambda (x) (int-modular x 32))
+     :decode (lambda (u) (float (if (>= u #x80000000) (- u #x100000000) u) 1d0)))
+   (make-ta-type :name "Uint32Array" :size 4
+     :encode (lambda (x) (int-modular x 32))
+     :decode (lambda (u) (float u 1d0)))
+   (make-ta-type :name "Float32Array" :size 4 :float t
+     :encode (lambda (x) (float32-bits x))
+     :decode (lambda (u) (bits-float32 u)))
+   (make-ta-type :name "Float64Array" :size 8 :float t
+     :encode (lambda (x) (float64-bits x))
+     :decode (lambda (u) (bits-float64 u)))))
+
+;;; ===========================================================================
+;;; TypedArray instance internals (stored in the :internal plist)
+;;;   :typed-array T  :ta-type <ta-type>  :ta-buffer <ArrayBuffer>
+;;;   :ta-offset <byte offset>  :ta-length <element count>
+;;; ===========================================================================
+(defun typed-array-p (o)
+  (and (js-object-p o) (getf (js-object-internal o) :typed-array)))
+(defun ta-type-of (o) (getf (js-object-internal o) :ta-type))
+(defun ta-buffer (o) (getf (js-object-internal o) :ta-buffer))
+(defun ta-byte-offset (o) (getf (js-object-internal o) :ta-offset))
+(defun ta-elt-length (o) (getf (js-object-internal o) :ta-length))
+(defun ta-detached-p (o) (ab-detached-p (ta-buffer o)))
+
+(defun ta-bytes (o) (ab-bytes (ta-buffer o)))
+
+(defun ta-read (o i)
+  "Read element I of typed array O as a JS double."
+  (let* ((ty (ta-type-of o)) (size (ta-type-size ty))
+         (base (+ (ta-byte-offset o) (* i size)))
+         (bytes (ta-bytes o)) (u 0))
+    (dotimes (b size)                    ; little-endian
+      (setf u (logior u (ash (aref bytes (+ base b)) (* 8 b)))))
+    (funcall (ta-type-decode ty) u)))
+
+(defun ta-write (o i val)
+  "Write JS double VAL into element I of typed array O (already coerced number)."
+  (let* ((ty (ta-type-of o)) (size (ta-type-size ty))
+         (base (+ (ta-byte-offset o) (* i size)))
+         (bytes (ta-bytes o))
+         (u (funcall (ta-type-encode ty) val)))
+    (dotimes (b size)
+      (setf (aref bytes (+ base b)) (logand (ash u (* -8 b)) #xFF)))
+    val))
+
+;;; ---- canonical numeric index detection ----
+(defun canonical-numeric-index (key)
+  "If KEY is a canonical numeric index, return its numeric value (double), else NIL.
+   Accepts a CL double key directly (VM passes numeric indices as doubles) and a
+   canonical numeric-index string (ToString(ToNumber(key)) === key)."
+  (cond
+    ((floatp key) key)                   ; VM member access with a numeric key
+    ((stringp key)
+     (cond ((string= key "-0") -0d0)
+           (t (let ((n (ignore-errors (string-to-number-strict key))))
+                (and n (string= (number-to-string n) key) n)))))
+    (t nil)))
+
+(defun string-to-number-strict (s)
+  "ToNumber for a would-be numeric key. Returns double or NIL for non-numeric."
+  (cond ((string= s "Infinity") *inf*)
+        ((string= s "-Infinity") *-inf*)
+        ((string= s "NaN") *nan*)
+        (t (let ((v (string-to-number s)))
+             ;; string-to-number returns 0d0 for "" and non-numerics; guard those
+             (if (and (zerop v) (not (member s '("0" "0.0" "-0" "+0") :test #'string=))
+                      (not (every (lambda (c) (member c '(#\0 #\. #\Space))) s)))
+                 (if (string= (number-to-string v) s) v nil)
+                 v)))))
+
+(defun ta-valid-index-p (o n)
+  "IsValidIntegerIndex: N (a double) is an in-bounds integer index of O."
+  (and (floatp n) (not (js-nan-p n)) (not (ta-detached-p o))
+       (not (js-negative-zero-p n))
+       (= n (ftruncate n))
+       (<= 0 n) (< n (ta-elt-length o))))
+
+;;; ===========================================================================
+;;; Integer-indexed exotic internal methods (installed via :internal plist)
+;;; ===========================================================================
+(defun ta-internal-get (o key receiver)
+  (let ((idx (canonical-numeric-index key)))
+    (if idx
+        (if (ta-valid-index-p o idx) (ta-read o (truncate idx)) *undefined*)
+        (ordinary-get o key (or receiver o)))))
+
+(defun ta-internal-set (o key v receiver)
+  (let ((idx (canonical-numeric-index key)))
+    (if (and idx (or (null receiver) (eq o receiver)))
+        (progn
+          ;; ToNumber runs even for out-of-bounds (observable side effects)
+          (let ((num (to-number v)))
+            (when (ta-valid-index-p o idx) (ta-write o (truncate idx) num)))
+          *true*)
+        (ordinary-set o key v (or receiver o)))))
+
+(defun ta-internal-has (o key)
+  (let ((idx (canonical-numeric-index key)))
+    (if idx
+        (js-bool (ta-valid-index-p o idx))
+        ;; OrdinaryHasProperty: own prop or (robustly) walk the prototype chain.
+        (let ((k (prop-key key)))
+          (js-bool (or (nth-value 1 (gethash k (js-object-props o)))
+                       (let ((p (js-object-proto o)))
+                         (and (js-object-p p) (js-truthy* (js-has p k))))))))))
+
+(defun ta-internal-delete (o key)
+  (let ((idx (canonical-numeric-index key)))
+    (if idx (js-bool (not (ta-valid-index-p o idx))) (ordinary-delete o key))))
+
+(defun ta-internal-get-own (o key)
+  (let ((idx (canonical-numeric-index key)))
+    (if idx
+        (when (ta-valid-index-p o idx)
+          (make-prop :value (ta-read o (truncate idx))
+                     :writable t :enumerable t :configurable t))
+        (gethash (prop-key key) (js-object-props o)))))
+
+(defun ta-internal-define-own (o key desc)
+  (let ((idx (canonical-numeric-index key)))
+    (if idx
+        (cond ((not (ta-valid-index-p o idx)) nil)
+              ((and (present-p desc :configurable) (not (getf desc :configurable))) nil)
+              ((and (present-p desc :enumerable) (not (getf desc :enumerable))) nil)
+              ((getf desc :accessor) nil)
+              ((and (present-p desc :writable) (not (getf desc :writable))) nil)
+              (t (when (present-p desc :value)
+                   (ta-write o (truncate idx) (to-number (getf desc :value))))
+                 t))
+        (js-define-own-property-ordinary o (prop-key key) desc))))
+
+(defun js-define-own-property-ordinary (o k desc)
+  "Ordinary [[DefineOwnProperty]] bypassing the internal trap (for the else branch)."
+  (let ((saved (js-object-internal o)))
+    (unwind-protect
+         (progn (setf (js-object-internal o) nil)
+                (js-define-own-property o k desc))
+      (setf (js-object-internal o) saved))))
+
+(defun ta-internal-own-keys (o)
+  "Integer indices [0,len) ascending as strings, then ordinary string/symbol keys."
+  (let ((out '()))
+    (unless (ta-detached-p o)
+      (dotimes (i (ta-elt-length o)) (push (princ-to-string i) out)))
+    (setf out (nreverse out))
+    (let ((strs '()) (syms '()))
+      (dolist (k (%own-keys-in-order o))
+        (cond ((js-symbol-p k) (push k syms))
+              ((not (canonical-numeric-index k)) (push k strs))))
+      (nconc out (nreverse strs) (nreverse syms)))))
+
+(defun ta-install-traps (o)
+  (setf (getf (js-object-internal o) :get) #'ta-internal-get
+        (getf (js-object-internal o) :set) #'ta-internal-set
+        (getf (js-object-internal o) :has) #'ta-internal-has
+        (getf (js-object-internal o) :delete) #'ta-internal-delete
+        (getf (js-object-internal o) :get-own-property) #'ta-internal-get-own
+        (getf (js-object-internal o) :define-own-property) #'ta-internal-define-own
+        (getf (js-object-internal o) :own-keys) #'ta-internal-own-keys)
+  o)
+
+;;; ===========================================================================
+;;; Construction
+;;; ===========================================================================
+(defvar *typedarray-proto* nil)
+(defvar *ta-proto-by-name* nil)  ; hash name -> concrete prototype
+
+(defun make-typed-array (ty buffer offset length proto)
+  (let ((o (make-object :proto proto :class (ta-type-name ty))))
+    (setf (getf (js-object-internal o) :typed-array) t
+          (getf (js-object-internal o) :ta-type) ty
+          (getf (js-object-internal o) :ta-buffer) buffer
+          (getf (js-object-internal o) :ta-offset) offset
+          (getf (js-object-internal o) :ta-length) length)
+    (ta-install-traps o)
+    o))
+
+(defun ta-from-length (ty len proto)
+  (let* ((size (ta-type-size ty))
+         (bytes (guard-alloc (* len size)))
+         (buf (make-array-buffer (make-byte-vector bytes))))
+    (make-typed-array ty buf 0 len proto)))
+
+(defun ta-from-buffer (ty buffer byte-offset length-arg proto)
+  (unless (array-buffer-p buffer)
+    (js-throw (make-native-error "TypeError" "First argument must be an ArrayBuffer")))
+  (let* ((size (ta-type-size ty))
+         (offset (to-index byte-offset)))
+    (unless (zerop (mod offset size))
+      (js-throw (make-native-error "RangeError" "byteOffset not aligned")))
+    (when (ab-detached-p buffer)
+      (js-throw (make-native-error "TypeError" "buffer is detached")))
+    (let ((buflen (length (ab-bytes buffer))))
+      (if (js-undefined-p length-arg)
+          (progn
+            (unless (zerop (mod buflen size))
+              (js-throw (make-native-error "RangeError" "buffer length not a multiple of element size")))
+            (when (> offset buflen)
+              (js-throw (make-native-error "RangeError" "byteOffset out of range")))
+            (make-typed-array ty buffer offset (truncate (- buflen offset) size) proto))
+          (let* ((newlen (to-index length-arg))
+                 (bytes-needed (* newlen size)))
+            (when (> (+ offset bytes-needed) buflen)
+              (js-throw (make-native-error "RangeError" "length out of range")))
+            (make-typed-array ty buffer offset newlen proto))))))
+
+(defun ta-from-typedarray (ty src proto)
+  (when (ta-detached-p src)
+    (js-throw (make-native-error "TypeError" "source is detached")))
+  (let* ((len (ta-elt-length src))
+         (o (ta-from-length ty len proto)))
+    (dotimes (i len) (ta-write o i (ta-read src i)))
+    o))
+
+(defun ta-from-arraylike (ty src proto)
+  (let* ((len (to-int-index (js-get src "length")))
+         (o (ta-from-length ty len proto)))
+    (dotimes (i len)
+      (ta-write o i (to-number (js-get src (princ-to-string i)))))
+    o))
+
+(defun ta-from-iterable (ty src proto)
+  "Construct from an iterable via its @@iterator, else fall back to array-like."
+  (if (and *symbol-iterator* (js-object-p src)
+           (js-callable-p (js-get src *symbol-iterator*)))
+      (let ((vals '()) (it (get-iterator src)))
+        (loop (let ((r (iterator-step it)))
+                (when (js-truthy (js-get r "done")) (return))
+                (push (js-get r "value") vals)))
+        (let* ((lst (nreverse vals)) (len (length lst))
+               (o (ta-from-length ty len proto)) (i 0))
+          (dolist (v lst) (ta-write o i (to-number v)) (incf i))
+          o))
+      (ta-from-arraylike ty src proto)))
+
+;;; ===========================================================================
+;;; Installer
+;;; ===========================================================================
 (defun install-typedarray (realm)
-  (declare (ignorable realm))
-  ;; TODO: build the global(s) and (define-global realm "Name" obj)
-  )
+  (setf *ta-types* (build-ta-types)
+        *ta-proto-by-name* (make-hash-table :test 'equal))
+  (let* ((op (realm-object-proto realm))
+         (fp (realm-function-proto realm))
+         ;; %TypedArray% abstract constructor + its prototype
+         (ta-proto (make-object :proto op :class "TypedArray"))
+         (ta-ctor (native-function realm "TypedArray"
+                    (lambda (this args) (declare (ignore this args))
+                      (js-throw (make-native-error "TypeError"
+                                 "Abstract class TypedArray not directly constructable")))
+                    0)))
+    (setf *typedarray-proto* ta-proto)
+    (setf (js-object-construct ta-ctor)
+          (lambda (args nt) (declare (ignore args nt))
+            (js-throw (make-native-error "TypeError"
+                       "Abstract class TypedArray not directly constructable"))))
+    (def-value ta-ctor "prototype" ta-proto :writable nil :configurable nil)
+    (def-value ta-proto "constructor" ta-ctor)
+    (install-ta-proto-methods realm ta-proto)
+    (install-ta-statics realm ta-ctor)
+    ;; @@toStringTag getter on %TypedArray%.prototype
+    (put-accessor ta-proto (symbol-tostringtag realm)
+                  :get (native-function realm "get [Symbol.toStringTag]"
+                         (lambda (this args) (declare (ignore args))
+                           (if (typed-array-p this)
+                               (ta-type-name (ta-type-of this)) *undefined*)) 0)
+                  :enumerable nil :configurable t)
+    (define-global realm "TypedArray" ta-ctor) ; not spec-global, but harmless; overwritten below? no.
+    ;; Actually %TypedArray% is NOT a global — remove it.
+    (js-delete (realm-global realm) "TypedArray")
+    (env-remove-binding realm "TypedArray")
+    ;; ---- concrete constructors ----
+    (dolist (ty *ta-types*)
+      (let* ((name (ta-type-name ty)) (size (ta-type-size ty))
+             (proto (make-object :proto ta-proto :class name))
+             (ctor (native-function realm name
+                     (lambda (this args) (declare (ignore this args))
+                       (js-throw (make-native-error "TypeError"
+                                  (format nil "Constructor ~a requires 'new'" name))))
+                     3)))
+        (setf (gethash name *ta-proto-by-name*) proto)
+        (setf (js-object-proto ctor) ta-ctor) ; Int8Array.__proto__ === %TypedArray%
+        (setf (js-object-construct ctor)
+              (let ((ty ty) (proto proto))
+                (lambda (args nt)
+                  (let ((rproto (proto-from-newtarget nt proto))
+                        (a0 (arg 0 args)))
+                    (cond
+                      ((not (js-object-p a0))    ; length or undefined
+                       (ta-from-length ty (if (js-undefined-p a0) 0 (to-index a0)) rproto))
+                      ((array-buffer-p a0)
+                       (ta-from-buffer ty a0 (arg 1 args) (arg 2 args) rproto))
+                      ((typed-array-p a0)
+                       (ta-from-typedarray ty a0 rproto))
+                      (t (ta-from-iterable ty a0 rproto)))))))
+        (def-value ctor "prototype" proto :writable nil :configurable nil)
+        (def-value proto "constructor" ctor)
+        (def-value ctor "BYTES_PER_ELEMENT" (float size 1d0) :writable nil :configurable nil)
+        (def-value proto "BYTES_PER_ELEMENT" (float size 1d0) :writable nil :configurable nil)
+        (define-global realm name ctor)))))
+
+(defun env-remove-binding (realm name)
+  (remhash name (env-vars (realm-global-env realm))))
+
+;;; ---------------------------------------------------------------------------
+;;; %TypedArray%.prototype getters + methods
+;;; ---------------------------------------------------------------------------
+(defmacro with-ta ((var this) &body body)
+  `(let ((,var ,this))
+     (unless (typed-array-p ,var)
+       (js-throw (make-native-error "TypeError" "not a TypedArray")))
+     ,@body))
+
+(defmacro with-ta-v ((var this) &body body)
+  "Like WITH-TA but also runs ValidateTypedArray (throws on detached buffer)."
+  `(let ((,var ,this))
+     (unless (typed-array-p ,var)
+       (js-throw (make-native-error "TypeError" "not a TypedArray")))
+     (when (ta-detached-p ,var)
+       (js-throw (make-native-error "TypeError" "TypedArray is backed by a detached ArrayBuffer")))
+     ,@body))
+
+(defun ta-length-checked (o)
+  (if (ta-detached-p o) 0 (ta-elt-length o)))
+
+(defun ta-species-proto (o name)
+  "Prototype for a new same-type array created by slice/subarray/map/filter."
+  (declare (ignore name))
+  (gethash (ta-type-name (ta-type-of o)) *ta-proto-by-name*))
+
+(defun install-ta-proto-methods (realm tp)
+  ;; ---- accessor getters ----
+  (def-getter realm tp "length"
+    (lambda (this args) (declare (ignore args))
+      (with-ta (o this) (float (ta-length-checked o) 1d0))))
+  (def-getter realm tp "byteLength"
+    (lambda (this args) (declare (ignore args))
+      (with-ta (o this)
+        (if (ta-detached-p o) 0d0
+            (float (* (ta-elt-length o) (ta-type-size (ta-type-of o))) 1d0)))))
+  (def-getter realm tp "byteOffset"
+    (lambda (this args) (declare (ignore args))
+      (with-ta (o this) (if (ta-detached-p o) 0d0 (float (ta-byte-offset o) 1d0)))))
+  (def-getter realm tp "buffer"
+    (lambda (this args) (declare (ignore args))
+      (with-ta (o this) (ta-buffer o))))
+  ;; ---- element access helpers reused below ----
+  (flet ((len (o) (ta-length-checked o)))
+    (declare (ignorable #'len))
+    ;; at(index)
+    (def-method realm tp "at" 1 (this args)
+      (with-ta-v (o this)
+        (let* ((l (len o)) (rel (to-integer-or-infinity (arg 0 args)))
+               (k (if (>= rel 0) (truncate rel) (+ l (truncate rel)))))
+          (if (and (>= k 0) (< k l)) (ta-read o k) *undefined*))))
+    ;; fill(value, start, end)
+    (def-method realm tp "fill" 1 (this args)
+      (with-ta-v (o this)
+        (let* ((l (len o))
+               (v (to-number (arg 0 args)))
+               (start (clamp-idx (arg 1 args) l 0))
+               (end (if (js-undefined-p (arg 2 args)) l (clamp-idx (arg 2 args) l l))))
+          (when (ta-detached-p o) (js-throw (make-native-error "TypeError" "detached")))
+          (loop for i from start below end do (ta-write o i v))
+          o)))
+    ;; copyWithin(target, start, end)
+    (def-method realm tp "copyWithin" 2 (this args)
+      (with-ta-v (o this)
+        (let* ((l (len o))
+               (to (clamp-idx (arg 0 args) l 0))
+               (from (clamp-idx (arg 1 args) l 0))
+               (end (if (js-undefined-p (arg 2 args)) l (clamp-idx (arg 2 args) l l)))
+               (count (min (- end from) (- l to))))
+          (when (> count 0)
+            (let ((tmp (make-array count)))
+              (dotimes (i count) (setf (aref tmp i) (ta-read o (+ from i))))
+              (dotimes (i count) (ta-write o (+ to i) (aref tmp i)))))
+          o)))
+    ;; indexOf / lastIndexOf / includes
+    (def-method realm tp "indexOf" 1 (this args)
+      (with-ta-v (o this)
+        (block done
+          (let* ((l (len o)) (target (arg 0 args)))
+            (when (zerop l) (return-from done -1d0))
+            (let ((start (if (>= (length args) 2)
+                            (let ((n (to-integer-or-infinity (arg 1 args))))
+                              (cond ((= n *inf*) (return-from done -1d0))
+                                    ((= n *-inf*) 0)
+                                    ((< n 0) (max 0 (+ l (truncate n))))
+                                    (t (truncate n))))
+                            0)))
+            (loop for i from start below l
+                  when (js-strict-equal (ta-read o i) target) do (return-from done (float i 1d0)))
+            -1d0)))))
+    (def-method realm tp "lastIndexOf" 1 (this args)
+      (with-ta-v (o this)
+        (block done
+          (let* ((l (len o)) (target (arg 0 args)))
+            (when (zerop l) (return-from done -1d0))
+            (let ((start (if (>= (length args) 2)
+                            (let ((n (to-integer-or-infinity (arg 1 args))))
+                              (cond ((= n *inf*) (1- l))
+                                    ((= n *-inf*) (return-from done -1d0))
+                                    ((< n 0) (+ l (truncate n)))
+                                    (t (min (truncate n) (1- l)))))
+                            (1- l))))
+            (loop for i from start downto 0
+                  when (js-strict-equal (ta-read o i) target) do (return-from done (float i 1d0)))
+            -1d0)))))
+    (def-method realm tp "includes" 1 (this args)
+      (with-ta-v (o this)
+        (block done
+          (let* ((l (len o)) (target (arg 0 args)))
+            (when (zerop l) (return-from done *false*)) ; length checked before ToInteger(fromIndex)
+            (let ((start (let ((n (to-integer-or-infinity (arg 1 args))))
+                           (cond ((< n 0) (max 0 (+ l (truncate n)))) ((= n *inf*) l) (t (truncate n))))))
+              (js-bool (loop for i from start below l
+                             thereis (same-value-zero (ta-read o i) target))))))))
+    ;; join
+    (def-method realm tp "join" 1 (this args)
+      (with-ta-v (o this)
+        (let ((sep (if (js-undefined-p (arg 0 args)) "," (to-string (arg 0 args)))) (l (len o)))
+          (with-output-to-string (s)
+            (dotimes (i l) (when (plusp i) (write-string sep s))
+              (let ((v (ta-read o i))) (unless (js-null-or-undef v) (write-string (to-string v) s))))))))
+    ;; reverse (in place)
+    (def-method realm tp "reverse" 0 (this args)
+      (with-ta-v (o this)
+        (let ((l (len o)))
+          (dotimes (i (floor l 2))
+            (let ((a (ta-read o i)) (b (ta-read o (- l 1 i))))
+              (ta-write o i b) (ta-write o (- l 1 i) a))))
+        o))
+    ;; forEach / map / filter / some / every / find* / reduce*
+    (macrolet ((cb (name) `(let ((f (arg 0 args)))
+                             (unless (js-callable-p f) (js-throw (make-native-error "TypeError" ,name)))
+                             f)))
+      (def-method realm tp "forEach" 1 (this args)
+        (with-ta-v (o this)
+          (let ((f (cb "not callable")) (ta (arg 1 args)) (l (len o)))
+            (dotimes (i l) (js-call f ta (list (ta-read o i) (float i 1d0) o)))
+            *undefined*)))
+      (def-method realm tp "map" 1 (this args)
+        (with-ta-v (o this)
+          (let* ((f (cb "not callable")) (ta (arg 1 args)) (l (len o))
+                 (out (ta-from-length (ta-type-of o) l (ta-species-proto o nil))))
+            (dotimes (i l) (ta-write out i (to-number (js-call f ta (list (ta-read o i) (float i 1d0) o)))))
+            out)))
+      (def-method realm tp "filter" 1 (this args)
+        (with-ta-v (o this)
+          (let ((f (cb "not callable")) (ta (arg 1 args)) (l (len o)) (kept '()))
+            (dotimes (i l)
+              (let ((v (ta-read o i)))
+                (when (js-truthy (js-call f ta (list v (float i 1d0) o))) (push v kept))))
+            (let* ((vals (nreverse kept)) (out (ta-from-length (ta-type-of o) (length vals) (ta-species-proto o nil))) (i 0))
+              (dolist (v vals) (ta-write out i v) (incf i))
+              out))))
+      (def-method realm tp "some" 1 (this args)
+        (with-ta-v (o this)
+          (let ((f (cb "not callable")) (ta (arg 1 args)) (l (len o)))
+            (js-bool (dotimes (i l nil)
+                       (when (js-truthy (js-call f ta (list (ta-read o i) (float i 1d0) o))) (return t)))))))
+      (def-method realm tp "every" 1 (this args)
+        (with-ta-v (o this)
+          (let ((f (cb "not callable")) (ta (arg 1 args)) (l (len o)))
+            (js-bool (dotimes (i l t)
+                       (unless (js-truthy (js-call f ta (list (ta-read o i) (float i 1d0) o))) (return nil)))))))
+      (def-method realm tp "find" 1 (this args)
+        (with-ta-v (o this)
+          (block done (let ((f (cb "not callable")) (ta (arg 1 args)) (l (len o)))
+            (dotimes (i l) (let ((v (ta-read o i)))
+                             (when (js-truthy (js-call f ta (list v (float i 1d0) o))) (return-from done v))))
+            *undefined*))))
+      (def-method realm tp "findIndex" 1 (this args)
+        (with-ta-v (o this)
+          (block done (let ((f (cb "not callable")) (ta (arg 1 args)) (l (len o)))
+            (dotimes (i l) (when (js-truthy (js-call f ta (list (ta-read o i) (float i 1d0) o))) (return-from done (float i 1d0))))
+            -1d0))))
+      (def-method realm tp "findLast" 1 (this args)
+        (with-ta-v (o this)
+          (block done (let ((f (cb "not callable")) (ta (arg 1 args)) (l (len o)))
+            (loop for i from (1- l) downto 0 do (let ((v (ta-read o i)))
+              (when (js-truthy (js-call f ta (list v (float i 1d0) o))) (return-from done v))))
+            *undefined*))))
+      (def-method realm tp "findLastIndex" 1 (this args)
+        (with-ta-v (o this)
+          (block done (let ((f (cb "not callable")) (ta (arg 1 args)) (l (len o)))
+            (loop for i from (1- l) downto 0 do
+              (when (js-truthy (js-call f ta (list (ta-read o i) (float i 1d0) o))) (return-from done (float i 1d0))))
+            -1d0))))
+      (def-method realm tp "reduce" 1 (this args)
+        (with-ta-v (o this)
+          (let ((f (cb "not callable")) (l (len o)) (acc (arg 1 args)) (has (>= (length args) 2)) (i 0))
+            (unless has (when (zerop l) (js-throw (make-native-error "TypeError" "Reduce of empty array with no initial value")))
+              (setf acc (ta-read o 0) i 1))
+            (loop while (< i l) do (setf acc (js-call f *undefined* (list acc (ta-read o i) (float i 1d0) o))) (incf i))
+            acc)))
+      (def-method realm tp "reduceRight" 1 (this args)
+        (with-ta-v (o this)
+          (let ((f (cb "not callable")) (l (len o)) (acc (arg 1 args)) (has (>= (length args) 2)) (i (1- (len o))))
+            (unless has (when (zerop l) (js-throw (make-native-error "TypeError" "Reduce of empty array with no initial value")))
+              (setf acc (ta-read o (1- l)) i (- l 2)))
+            (loop while (>= i 0) do (setf acc (js-call f *undefined* (list acc (ta-read o i) (float i 1d0) o))) (decf i))
+            acc))))
+    ;; slice(begin, end)
+    (def-method realm tp "slice" 2 (this args)
+      (with-ta-v (o this)
+        (let* ((l (len o)) (start (clamp-idx (arg 0 args) l 0))
+               (end (if (js-undefined-p (arg 1 args)) l (clamp-idx (arg 1 args) l l)))
+               (count (max 0 (- end start)))
+               (out (ta-from-length (ta-type-of o) count (ta-species-proto o nil))))
+          (when (and (> count 0) (ta-detached-p o))
+            (js-throw (make-native-error "TypeError" "detached")))
+          (dotimes (i count) (ta-write out i (ta-read o (+ start i))))
+          out)))
+    ;; subarray(begin, end) — shares the SAME buffer
+    (def-method realm tp "subarray" 2 (this args)
+      (with-ta (o this)
+        (let* ((l (ta-elt-length o)) (start (clamp-idx (arg 0 args) l 0))
+               (end (if (js-undefined-p (arg 1 args)) l (clamp-idx (arg 1 args) l l)))
+               (count (max 0 (- end start)))
+               (size (ta-type-size (ta-type-of o))))
+          (make-typed-array (ta-type-of o) (ta-buffer o)
+                            (+ (ta-byte-offset o) (* start size)) count
+                            (ta-species-proto o nil)))))
+    ;; set(source, offset)
+    (def-method realm tp "set" 1 (this args)
+      (with-ta-v (o this)
+        (let ((src (arg 0 args)) (offset (to-integer-or-infinity (arg 1 args))))
+          (when (< offset 0) (js-throw (make-native-error "RangeError" "offset out of range")))
+          (when (ta-detached-p o) (js-throw (make-native-error "TypeError" "detached")))
+          (let ((off (truncate offset)))
+            (if (typed-array-p src)
+                (let ((slen (ta-elt-length src)))
+                  (when (> (+ off slen) (len o)) (js-throw (make-native-error "RangeError" "source too large")))
+                  ;; copy via a temp to be safe against overlap/type mismatch
+                  (let ((tmp (make-array slen)))
+                    (dotimes (i slen) (setf (aref tmp i) (ta-read src i)))
+                    (dotimes (i slen) (ta-write o (+ off i) (aref tmp i)))))
+                (let ((slen (to-int-index (js-get src "length"))))
+                  (when (> (+ off slen) (len o)) (js-throw (make-native-error "RangeError" "source too large")))
+                  (dotimes (i slen) (ta-write o (+ off i) (to-number (js-get src (princ-to-string i))))))))
+          *undefined*)))
+    ;; sort(comparefn)
+    (def-method realm tp "sort" 1 (this args)
+      (with-ta-v (o this)
+        (let ((cmp (arg 0 args)) (l (len o)))
+          (unless (or (js-undefined-p cmp) (js-callable-p cmp))
+            (js-throw (make-native-error "TypeError" "comparefn must be a function")))
+          (let ((vals (make-array l)))
+            (dotimes (i l) (setf (aref vals i) (ta-read o i)))
+            (setf vals (stable-sort vals
+                        (if (js-callable-p cmp)
+                            (lambda (a b) (< (let ((r (to-number (js-call cmp *undefined* (list a b))))) (if (js-nan-p r) 0d0 r)) 0))
+                            #'ta-default-less)))
+            (dotimes (i l) (ta-write o i (aref vals i))))
+          o)))
+    (def-method realm tp "toSorted" 1 (this args)
+      (with-ta-v (o this)
+        (let ((cmp (arg 0 args)) (l (len o)))
+          (unless (or (js-undefined-p cmp) (js-callable-p cmp))
+            (js-throw (make-native-error "TypeError" "comparefn must be a function")))
+          (let ((out (ta-from-length (ta-type-of o) l (ta-species-proto o nil))) (vals (make-array l)))
+            (dotimes (i l) (setf (aref vals i) (ta-read o i)))
+            (setf vals (stable-sort vals (if (js-callable-p cmp)
+                        (lambda (a b) (< (let ((r (to-number (js-call cmp *undefined* (list a b))))) (if (js-nan-p r) 0d0 r)) 0))
+                        #'ta-default-less)))
+            (dotimes (i l) (ta-write out i (aref vals i)))
+            out))))
+    (def-method realm tp "toReversed" 0 (this args)
+      (with-ta-v (o this)
+        (let* ((l (len o)) (out (ta-from-length (ta-type-of o) l (ta-species-proto o nil))))
+          (dotimes (i l) (ta-write out i (ta-read o (- l 1 i))))
+          out)))
+    (def-method realm tp "with" 2 (this args)
+      (with-ta-v (o this)
+        (let* ((l (len o)) (rel (to-integer-or-infinity (arg 0 args)))
+               (k (if (>= rel 0) (truncate rel) (+ l (truncate rel))))
+               (v (to-number (arg 1 args))))
+          (when (or (< k 0) (>= k l)) (js-throw (make-native-error "RangeError" "index out of range")))
+          (let ((out (ta-from-length (ta-type-of o) l (ta-species-proto o nil))))
+            (dotimes (i l) (ta-write out i (if (= i k) v (ta-read o i))))
+            out))))
+    ;; toString / toLocaleString → Array.prototype.join semantics
+    (def-method realm tp "toString" 0 (this args)
+      (let ((j (js-get this "join"))) (if (js-callable-p j) (js-call j this '()) "[object TypedArray]")))
+    (def-method realm tp "toLocaleString" 0 (this args)
+      (with-ta-v (o this)
+        (let ((l (len o)))
+          (with-output-to-string (s)
+            (dotimes (i l) (when (plusp i) (write-string "," s))
+              (let ((v (ta-read o i)))
+                (unless (js-null-or-undef v)
+                  ;; spec: call each element's toLocaleString and ToString the result
+                  (let ((f (js-get v "toLocaleString")))
+                    (write-string (to-string (if (js-callable-p f) (js-call f v '()) v)) s)))))))))
+    ;; iterators: keys / values / entries / @@iterator
+    (def-method realm tp "keys" 0 (this args)
+      (with-ta-v (o this) (make-ta-iterator realm o :key)))
+    (def-method realm tp "values" 0 (this args)
+      (with-ta-v (o this) (make-ta-iterator realm o :value)))
+    (def-method realm tp "entries" 0 (this args)
+      (with-ta-v (o this) (make-ta-iterator realm o :entry)))
+    (when *symbol-iterator*
+      (put tp *symbol-iterator*
+           (native-function realm "[Symbol.iterator]"
+             (lambda (this args) (declare (ignore args))
+               (with-ta-v (o this) (make-ta-iterator realm o :value))) 0)
+           :enumerable nil :writable t :configurable t))))
+
+(defun ta-default-less (a b)
+  "Default TypedArray numeric sort comparator (ascending; NaN last; -0 before +0)."
+  (cond ((and (js-nan-p a) (js-nan-p b)) nil)
+        ((js-nan-p a) nil) ((js-nan-p b) t)
+        ((and (zerop a) (zerop b)) (and (js-negative-zero-p a) (not (js-negative-zero-p b))))
+        (t (< a b))))
+
+(defun clamp-idx (v len default)
+  "Clamp a relative index to [0,len] (negative from end)."
+  (if (js-undefined-p v) default
+      (let ((n (to-integer-or-infinity v)))
+        (cond ((= n *-inf*) 0) ((= n *inf*) len)
+              ((< n 0) (max 0 (+ len (truncate n))))
+              (t (min len (truncate n)))))))
+
+(defun make-ta-iterator (realm o kind)
+  (let ((i 0) (it (make-object :proto (realm-object-proto realm) :class "Array Iterator")))
+    (def-method realm it "next" 0 (this args)
+      (let ((res (make-object :proto (realm-object-proto realm)))
+            (l (ta-length-checked o)))
+        (if (< i l)
+            (progn (put res "value"
+                        (ecase kind (:key (float i 1d0)) (:value (ta-read o i))
+                          (:entry (make-array-object (list (float i 1d0) (ta-read o i))))))
+                   (put res "done" *false*) (incf i))
+            (progn (put res "value" *undefined*) (put res "done" *true*)))
+        res))
+    (when *symbol-iterator*
+      (put it *symbol-iterator* (native-function realm "[Symbol.iterator]" (lambda (this args) (declare (ignore args)) this) 0) :enumerable nil))
+    it))
+
+;;; ---------------------------------------------------------------------------
+;;; %TypedArray% statics: from, of
+;;; ---------------------------------------------------------------------------
+(defun install-ta-statics (realm ta-ctor)
+  ;; %TypedArray%.of — this is the constructor
+  (def-method realm ta-ctor "of" 0 (this args)
+    (unless (and (js-object-p this) (js-object-construct this))
+      (js-throw (make-native-error "TypeError" "this is not a constructor")))
+    (let* ((len (length args)) (o (js-construct this (list (float len 1d0)))) (i 0))
+      (dolist (v args) (js-set o (princ-to-string i) v) (incf i))
+      o))
+  (def-method realm ta-ctor "from" 1 (this args)
+    (unless (and (js-object-p this) (js-object-construct this))
+      (js-throw (make-native-error "TypeError" "this is not a constructor")))
+    (let ((src (arg 0 args)) (mapf (arg 1 args)) (vals '()))
+      (unless (or (js-undefined-p mapf) (js-callable-p mapf))
+        (js-throw (make-native-error "TypeError" "mapfn is not callable")))
+      (if (and *symbol-iterator* (js-object-p src) (js-callable-p (js-get src *symbol-iterator*)))
+          (let ((it (get-iterator src)))
+            (loop (let ((r (iterator-step it)))
+                    (when (js-truthy (js-get r "done")) (return))
+                    (push (js-get r "value") vals))))
+          (let* ((so (to-object src)) (l (to-int-index (js-get so "length"))))
+            (dotimes (i l) (push (js-get so (princ-to-string i)) vals))))
+      (let* ((lst (nreverse vals)) (len (length lst))
+             (o (js-construct this (list (float len 1d0)))) (i 0))
+        (dolist (v lst)
+          (js-set o (princ-to-string i)
+                  (if (js-callable-p mapf) (js-call mapf *undefined* (list v (float i 1d0))) v))
+          (incf i))
+        o)))
+  ;; get %TypedArray%[@@species] → this
+  (let ((species (well-known-species realm)))
+    (when species
+      (put-accessor ta-ctor species
+                    :get (native-function realm "get [Symbol.species]"
+                           (lambda (this args) (declare (ignore args)) this) 0)
+                    :enumerable nil :configurable t))))
 
 (register-builtin-installer 'install-typedarray)
