@@ -387,7 +387,10 @@
 ;; quantifiers, catastrophic backtracking) would otherwise recurse the CL
 ;; control stack to a FATAL, uncatchable exhaustion. On exceed we THROW
 ;; 'regex-overflow, caught in regex-exec -> treat as no match.
-(defparameter *regex-max-steps* 1500000)
+;; Kept below the CL control-stack depth the CPS matcher can reach (each
+;; quantifier repetition nests a frame); a deep/pathological match throws
+;; 'regex-overflow well before a fatal stack exhaustion.
+(defparameter *regex-max-steps* 40000)
 (declaim (inline regex-step))
 (defun regex-step (mc)
   (when (> (the fixnum (incf (the fixnum (mctx-steps mc)))) (the fixnum *regex-max-steps*))
