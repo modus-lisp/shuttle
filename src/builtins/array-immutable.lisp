@@ -1,0 +1,87 @@
+;;;; See array-iteration.lisp for the convention + available helpers.
+;;;; Fill the (install-array-immutable realm) body; do not touch other files.
+(in-package #:shuttle)
+
+(defun %sort-compare (x y cmp)
+  "SortCompare abstract op. Returns a CL real (<0, 0, >0). undefined sorts last."
+  (cond ((eq x *undefined*) (if (eq y *undefined*) 0 1))
+        ((eq y *undefined*) -1)
+        ((not (eq cmp *undefined*))
+         (let ((r (to-number (js-call cmp *undefined* (list x y)))))
+           (if (js-nan-p r) 0 r)))
+        (t (let ((sx (to-string x)) (sy (to-string y)))
+             (cond ((string< sx sy) -1) ((string> sx sy) 1) (t 0))))))
+
+(defun sort-copy (items cmp)
+  "Stable sort of a CL list per ECMAScript SortCompare, returning a new list."
+  (stable-sort (copy-list items)
+               (lambda (a b) (< (%sort-compare a b cmp) 0))))
+
+(defun install-array-immutable (realm)
+  (let ((ap (realm-array-proto realm)))
+    (flet ((len (this)
+             ;; LengthOfArrayLike = ToLength(Get(this,"length")); a CL non-neg int.
+             (truncate (to-length (js-get this "length"))))
+           (snapshot (this l)
+             ;; Read elements 0..l-1 via Get into a CL vector (holes -> undefined).
+             (let ((v (make-array l)))
+               (dotimes (i l v)
+                 (setf (aref v i) (js-get this (princ-to-string i))))))
+           (check-len (n)
+             ;; ArrayCreate(len) throws RangeError if len > 2^32 - 1.
+             (when (> n 4294967295)
+               (js-throw (make-native-error "RangeError" "Invalid array length")))))
+      (def-method realm ap "toReversed" 0 (this args)
+        (declare (ignore args))
+        (let* ((l (len this)) (out '()))
+          ;; Spec reads from index (l-1) down to 0.
+          (loop for i from (1- l) downto 0
+                do (push (js-get this (princ-to-string i)) out))
+          (make-array-object (nreverse out))))
+
+      (def-method realm ap "with" 1 (this args)
+        (let* ((l (len this))
+               (rel (to-integer-or-infinity (arg 0 args)))
+               (value (arg 1 args))
+               (actual (if (>= rel 0) rel (+ l rel))))
+          (when (or (< actual 0) (>= actual l))
+            (js-throw (make-native-error "RangeError" "Invalid index")))
+          (check-len l)
+          (let ((idx (truncate actual)) (v (snapshot this l)) (out '()))
+            (dotimes (i l)
+              (push (if (= i idx) value (aref v i)) out))
+            (make-array-object (nreverse out)))))
+
+      (def-method realm ap "toSorted" 1 (this args)
+        (let ((cmp (arg 0 args)))
+          (unless (eq cmp *undefined*)
+            (unless (js-callable-p cmp)
+              (js-throw (make-native-error "TypeError" "comparefn is not a function"))))
+          (let* ((l (len this))
+                 (v (snapshot this l))
+                 (items (coerce v 'list)))
+            (make-array-object (sort-copy items cmp)))))
+
+      (def-method realm ap "toSpliced" 2 (this args)
+        (let* ((l (len this))
+               (rel (to-integer-or-infinity (arg 0 args)))
+               (start (cond ((= rel *-inf*) 0)
+                            ((< rel 0) (max (+ l rel) 0))
+                            (t (min rel l))))
+               (start (truncate start))
+               (insert (if (>= (length args) 1) (nthcdr 2 args) '()))
+               (ins-count (length insert))
+               (skip (cond ((< (length args) 1) 0)
+                           ((< (length args) 2) (- l start))
+                           (t (let ((sc (to-integer-or-infinity (arg 1 args))))
+                                (min (max sc 0) (- l start))))))
+               (skip (truncate skip))
+               (new-len (+ (- l skip) ins-count)))
+          (check-len new-len)
+          (let ((v (snapshot this l)) (out '()))
+          (dotimes (i start) (push (aref v i) out))
+          (dolist (item insert) (push item out))
+          (loop for i from (+ start skip) below l do (push (aref v i) out))
+          (make-array-object (nreverse out))))))))
+
+(register-builtin-installer 'install-array-immutable)
