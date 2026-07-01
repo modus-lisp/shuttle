@@ -17,6 +17,8 @@
     (let ((n (namestring path)))
       (unless (search "_FIXTURE" n)
         (incf i) (when (zerop (mod i 2000)) (format *error-output* "~&  ...~d~%" i))
+        (ignore-errors (with-open-file (c "/tmp/cur262" :direction :output :if-exists :supersede
+                                          :if-does-not-exist :create) (write-string n c)))
         (let* ((rel (subseq n rootlen))
                (parts (split rel #\/))
                (area (if (>= (length parts) 2) (format nil "~a/~a" (first parts) (second parts)) (first parts)))

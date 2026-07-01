@@ -214,6 +214,7 @@
   yielded                                     ; value handed out at a yield
   (done nil)
   (started nil)
+  (executing nil)                             ; t while resumed (re-entrant next/return/throw -> TypeError)
   error)                                      ; a shuttle-error to propagate to the consumer
 
 (defvar *current-generator* nil)              ; the genstate the running thread belongs to
@@ -335,9 +336,14 @@
         (:throw (js-throw value))
         (:return (return-from generator-resume (iter-result value t)))
         (t (return-from generator-resume (iter-result *undefined* t)))))
-    (setf (genstate-mode gs) mode (genstate-sent gs) value)
+    ;; re-entrant resume (e.g. the body calls its own .next/.return/.throw while
+    ;; running) -> TypeError, per the "executing" generator state.
+    (when (genstate-executing gs)
+      (js-throw (make-native-error "TypeError" "Generator is already executing")))
+    (setf (genstate-executing gs) t (genstate-mode gs) mode (genstate-sent gs) value)
     (sb-thread:signal-semaphore (genstate-to-gen-sem gs))
     (sb-thread:wait-on-semaphore (genstate-to-consumer-sem gs))
+    (setf (genstate-executing gs) nil)
     (when (genstate-error gs)
       (let ((e (genstate-error gs))) (setf (genstate-error gs) nil) (error e)))
     (if (genstate-done gs)
