@@ -5,8 +5,9 @@
 
 (defparameter *punctuators*
   ;; longest first so the maximal-munch scan matches correctly
-  '("===" "!==" "..." ">>>" "==" "!=" "<=" ">=" "&&" "||" "=>" "++" "--"
-    "+=" "-=" "*=" "/=" "%=" "<<" ">>"
+  '(">>>=" "===" "!==" "..." ">>>" "**=" "<<=" ">>=" "&&=" "||=" "??=" "?."
+    "==" "!=" "<=" ">=" "&&" "||" "??" "**" "=>" "++" "--"
+    "+=" "-=" "*=" "/=" "%=" "&=" "|=" "^=" "<<" ">>"
     "+" "-" "*" "/" "%" "<" ">" "=" "(" ")" "{" "}" "[" "]" ";" "," "." ":" "!" "?" "&" "|" "~" "^"))
 
 (defun id-start-p (c) (or (alpha-char-p c) (char= c #\_) (char= c #\$)))
@@ -83,7 +84,10 @@
                (emit :ident (subseq src start i))))
             ;; punctuator (maximal munch)
             (t (let ((p (find-if (lambda (p) (and (<= (+ i (length p)) n)
-                                                  (string= p src :start2 i :end2 (+ i (length p)))))
+                                                  (string= p src :start2 i :end2 (+ i (length p)))
+                                                  ;; `?.` only when NOT followed by a digit (else it's `? .5`)
+                                                  (not (and (string= p "?.")
+                                                            (< (+ i 2) n) (digit-char-p (char src (+ i 2)))))))
                                  *punctuators*)))
                  (if p (progn (emit :punct p) (incf i (length p)))
                      (js-throw (format nil "Unexpected character ~s" c)))))))))

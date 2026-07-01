@@ -19,8 +19,11 @@
     ("==" . 8) ("!=" . 8) ("===" . 8) ("!==" . 8)
     ("<" . 9) (">" . 9) ("<=" . 9) (">=" . 9)
     ("<<" . 10) (">>" . 10) (">>>" . 10)
-    ("+" . 11) ("-" . 11) ("*" . 12) ("/" . 12) ("%" . 12)))
-(defparameter *assignops* '("=" "+=" "-=" "*=" "/=" "%="))
+    ("+" . 11) ("-" . 11) ("*" . 12) ("/" . 12) ("%" . 12)
+    ("**" . 14)))                       ; ** right-assoc, handled specially below
+(defparameter *assignops* '("=" "+=" "-=" "*=" "/=" "%=" "**="
+                            "<<=" ">>=" ">>>=" "&=" "|=" "^=" "&&=" "||=" "??="))
+(defparameter *nullish-op* "??")        ; parsed with logical precedence
 
 (defun parse-program (src)
   (let ((*toks* (tokenize src)) (*pos* 0) (stmts '()))
@@ -122,6 +125,16 @@
                   (list :func name (nreverse params) body)))))
 
 ;;; ---- expressions (Pratt) ----
+(defun assignable-target-p (node op)
+  "Is NODE a valid AssignmentTarget for assignment operator OP?
+   Simple (=): identifiers, member accesses, and (for plain =) destructuring
+   patterns. Compound ops require a simple reference."
+  (case (car node)
+    (:ident t)
+    (:member t)
+    ((:array :object) (string= op "="))     ; destructuring only for plain assignment
+    (t nil)))
+
 (defun parse-expr (min-bp)
   (let ((left (parse-unary)))
     (loop
@@ -129,6 +142,8 @@
         (cond
           ;; assignment (right-assoc), lowest
           ((and (eq tt :punct) (member tv *assignops* :test #'string=) (>= 1 (1- min-bp)))
+           (unless (assignable-target-p left tv)
+             (js-throw (make-native-error "SyntaxError" "Invalid left-hand side in assignment")))
            (adv) (setf left (list :assign tv left (parse-expr 1))))
           ;; conditional ?:
           ((and (punct? "?") (>= 2 min-bp))
@@ -137,6 +152,12 @@
           ;; instanceof / in (keyword operators, relational precedence)
           ((and (eq tt :ident) (member tv '("instanceof" "in") :test #'string=) (>= 9 min-bp))
            (adv) (setf left (list :bin tv left (parse-expr 10))))
+          ;; nullish coalescing ?? (logical, short-circuits on null/undefined)
+          ((and (eq tt :punct) (string= tv "??") (>= 5 min-bp))
+           (adv) (setf left (list :logical "??" left (parse-expr 6))))
+          ;; ** right-associative (recurse at same bp, not bp+1)
+          ((and (eq tt :punct) (string= tv "**") (>= 14 min-bp))
+           (adv) (setf left (list :bin "**" left (parse-expr 14))))
           ;; binary / logical
           ((and (eq tt :punct) (assoc tv *binops* :test #'string=))
            (let ((bp (cdr (assoc tv *binops* :test #'string=))))

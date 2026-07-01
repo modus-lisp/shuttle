@@ -15,7 +15,7 @@
     (dolist (in instrs) (if (eq (car in) :label) (setf (gethash (cadr in) pos) idx) (incf idx)))
     (dolist (in instrs)
       (unless (eq (car in) :label)
-        (push (if (member (car in) '(:jmp :jmp-if-false :jmp-if-true :and-jmp :or-jmp :push-handler))
+        (push (if (member (car in) '(:jmp :jmp-if-false :jmp-if-true :and-jmp :or-jmp :nullish-jmp :push-handler))
                   (list (car in) (gethash (cadr in) pos)) in) out)))
     (coerce (nreverse out) 'vector)))
 
@@ -156,9 +156,11 @@
                           (if (fourth tgt) (compile-expr (third tgt)) (em :const (second (third tgt))))
                           (em :del-prop))
                    (em :const *true*))))   ; delete of a non-reference is true (sloppy)
-    (:logical (let ((end (lbl)))
+    (:logical (let ((end (lbl)) (op (second node)))
                 (compile-expr (third node))
-                (em (if (string= (second node) "&&") :and-jmp :or-jmp) end)
+                (em (cond ((string= op "&&") :and-jmp)
+                          ((string= op "||") :or-jmp)
+                          (t :nullish-jmp)) end)   ; ??
                 (compile-expr (fourth node)) (em :label end)))
     (:cond (let ((l1 (lbl)) (l2 (lbl)))
              (compile-expr (second node)) (em :jmp-if-false l1)
@@ -186,7 +188,37 @@
   (mapc #'compile-expr args)
   (em :call (length args)))
 
+(defun logical-assign-op (op)
+  "For &&= ||= ??= return the short-circuit op string; else nil."
+  (cond ((string= op "&&=") "&&") ((string= op "||=") "||") ((string= op "??=") "??")))
+
+(defun compile-logical-assign (lop target value)
+  "x <op>= v  where <op> in {&& || ??}: read x; short-circuit; else assign v.
+   Result on stack = final value of the reference."
+  (let ((end (lbl))
+        (jmpop (cond ((string= lop "&&") :and-jmp) ((string= lop "||") :or-jmp) (t :nullish-jmp))))
+    (ecase (car target)
+      (:ident
+       (em :get-var (second target))        ; current value on stack
+       (em jmpop end)                        ; keep it & skip if short-circuits
+       (compile-expr value) (em :set-var (second target))
+       (em :label end))
+      (:member
+       (let ((short (lbl)) (obj (string (gensym "O"))) (k (string (gensym "K"))))
+         (compile-expr (second target)) (em :declare-var obj)   ; save obj
+         (if (fourth target) (compile-expr (third target)) (em :const (second (third target))))
+         (em :declare-var k)                                    ; save key
+         (em :get-var obj) (em :get-var k) (em :get-prop)       ; old on stack
+         (em jmpop short)                                       ; short-circuit: keep old
+         (em :pop)                                              ; drop old, recompute for set
+         (em :get-var obj) (em :get-var k) (compile-expr value) (em :set-prop)
+         (em :jmp end)
+         (em :label short)                                      ; old already on stack = result
+         (em :label end))))))
+
 (defun compile-assign (op target value)
+  (when (logical-assign-op op)
+    (return-from compile-assign (compile-logical-assign (logical-assign-op op) target value)))
   (let ((base (and (> (length op) 1) (subseq op 0 (1- (length op))))))  ; "+=" -> "+"
     (ecase (car target)
       (:ident (if base (progn (em :get-var (second target)) (compile-expr value) (em :bin base))
