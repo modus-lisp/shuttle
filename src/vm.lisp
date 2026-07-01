@@ -36,7 +36,10 @@
       (t (js-throw "Cannot box value")))))
 
 ;;; ---- environments ----
-(defstruct env vars parent)
+;;; A binding value of the TDZ sentinel means "declared but not yet initialized"
+;;; (let/const temporal dead zone). CONSTS holds names that may not be reassigned.
+(defvar *tdz* '#:tdz)                    ; unique uninitialized marker
+(defstruct env vars parent consts)
 (defun new-env (parent) (make-env :vars (make-hash-table :test 'equal) :parent parent))
 (defun env-root (e) (loop while (env-parent e) do (setf e (env-parent e))) e)
 (defun env-get (env name)
@@ -45,17 +48,28 @@
         do (multiple-value-bind (v p) (gethash name (env-vars e)) (when p (return-from env-get (values v t)))))
   (values *undefined* nil))
 (defun env-get-checked (env name)
-  "Read a binding, throwing ReferenceError if the name is not declared."
+  "Read a binding, throwing ReferenceError if not declared, or if still in TDZ."
   (multiple-value-bind (v p) (env-get env name)
-    (if p v (js-throw (make-native-error "ReferenceError" (format nil "~a is not defined" name))))))
+    (cond ((not p) (js-throw (make-native-error "ReferenceError" (format nil "~a is not defined" name))))
+          ((eq v *tdz*) (js-throw (make-native-error "ReferenceError"
+                          (format nil "Cannot access '~a' before initialization" name))))
+          (t v))))
 (defun env-typeof (env name)
-  (multiple-value-bind (v p) (env-get env name) (if p (js-typeof v) "undefined")))
+  (multiple-value-bind (v p) (env-get env name)
+    (cond ((not p) "undefined")
+          ((eq v *tdz*) (js-throw (make-native-error "ReferenceError"
+                          (format nil "Cannot access '~a' before initialization" name))))
+          (t (js-typeof v)))))
 (defun env-set (env name val)
   (loop for e = env then (env-parent e) while e
         do (when (nth-value 1 (gethash name (env-vars e)))
+             (when (and (env-consts e) (member name (env-consts e) :test #'string=))
+               (js-throw (make-native-error "TypeError" (format nil "Assignment to constant variable."))))
              (setf (gethash name (env-vars e)) val) (return-from env-set val)))
   (setf (gethash name (env-vars (env-root env))) val) val)              ; sloppy implicit global
 (defun env-declare (env name val) (setf (gethash name (env-vars env)) val))
+(defun env-declare-const (env name val) (setf (gethash name (env-vars env)) val)
+  (pushnew name (env-consts env) :test #'string=))
 
 ;;; ---- object builders ----
 (defun make-array-object (elems)
@@ -228,13 +242,18 @@
         (let* ((in (aref instrs pc)) (op (car in)) (a (cdr in)))
           (incf pc)
           (case op
-            (:push-handler (push (cons (first a) (fill-pointer stack)) handlers))
+            (:push-handler (push (list (first a) (fill-pointer stack) env) handlers))
             (:pop-handler (pop handlers))
             (:const (push! (first a)))
             (:get-var (push! (env-get-checked env (first a))))
             (:typeof-var (push! (env-typeof env (first a))))
             (:set-var (env-set env (first a) (peek!)))
             (:declare-var (env-declare env (first a) (pop!)))
+            (:push-env (setf env (new-env env)))
+            (:pop-env (setf env (env-parent env)))
+            (:tdz-declare (env-declare env (first a) *tdz*))
+            (:init-let (env-declare env (first a) (pop!)))
+            (:init-const (env-declare-const env (first a) (pop!)))
             (:get-this (push! this))
             (:load-arg (let ((n (first a))) (push! (if (< n (length call-args)) (aref call-args n) *undefined*))))
             (:load-rest (let ((n (first a)))
@@ -334,7 +353,7 @@
             (t (error "shuttle vm: bad op ~a" op)))))
         (shuttle-error (e)
           (if handlers
-              (destructuring-bind (catch-pc . saved-sp) (pop handlers)
-                (setf (fill-pointer stack) saved-sp pc catch-pc)
+              (destructuring-bind (catch-pc saved-sp saved-env) (pop handlers)
+                (setf (fill-pointer stack) saved-sp pc catch-pc env saved-env)  ; restore scope
                 (vector-push-extend (shuttle-error-value e) stack))   ; thrown value -> catch param
               (error e))))))))

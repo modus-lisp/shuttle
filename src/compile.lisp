@@ -7,8 +7,11 @@
 (defstruct code name params instrs)
 (defvar *out*)
 (defvar *break-target* nil) (defvar *continue-target* nil)
+(defvar *scope-depth* 0)                 ; current lexical block-env nesting within the fn
+(defvar *break-depth* 0) (defvar *continue-depth* 0)  ; scope depth at the loop/switch target
 (defun em (op &rest args) (push (cons op args) *out*))
 (defun lbl () (gensym "L"))
+(defun pop-envs (count) (dotimes (_ count) (em :pop-env)))
 
 (defun assemble (rev-instrs)
   (let ((instrs (nreverse rev-instrs)) (pos (make-hash-table)) (idx 0) (out '()))
@@ -63,7 +66,11 @@
     (dolist (v (collect-var-names body))
       (unless (member v pnames :test #'string=)
         (em :const *undefined*) (em :declare-var v)))
-    (compile-stmt body)
+    ;; function/top-level body: hoist its OWN lexicals into the function env (no extra block)
+    (let ((stmts (if (eq (car body) :block) (second body) (list body))))
+      (dolist (n (block-lexical-names stmts)) (em :tdz-declare n))
+      (dolist (fn (block-lexical-fns stmts)) (compile-expr fn) (em :init-let (second fn)))
+      (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s))))
     (unless toplevel (em :const *undefined*) (em :ret))   ; functions default-return undefined
     (make-code :name name :params params :instrs (assemble *out*))))
 
@@ -119,6 +126,13 @@
     (em :dup) (em :const *undefined*) (em :bin "!==") (em :jmp-if-true skip)
     (em :pop) (compile-expr default-expr)
     (em :label skip)))
+
+(defun bind-lexical (tgt kind)
+  "Initialize a let/const binding TGT from the value on top of the stack.
+   KIND is :let or :const. Names are TDZ-pre-declared by the block prologue."
+  (cond
+    ((stringp tgt) (em (if (eq kind :const) :init-const :init-let) tgt))
+    (t (bind-target tgt))))                  ; patterns: leaf names init via declare-var
 
 (defun bind-target (tgt)
   "Bind the value on top of the stack to TGT (name or pattern). Consumes it."
@@ -190,7 +204,9 @@
   (when (consp node)
     (case (car node)
       ((:func :arrow) acc)               ; nested function scope: stop
-      (:var (dolist (d (third node)) (setf acc (target-names (car d) acc))) acc)
+      (:var (if (string= (second node) "var")   ; only `var` hoists to function scope
+                (progn (dolist (d (third node)) (setf acc (target-names (car d) acc))) acc)
+                acc))
       (:for-in (setf acc (collect-var-names (fourth node) (collect-var-names (second node) acc))))
       (:for-of (setf acc (collect-var-names (fourth node) (collect-var-names (second node) acc))))
       (t (dolist (x (cdr node))
@@ -199,15 +215,57 @@
                   (dolist (y x) (when (consp y) (setf acc (collect-var-names y acc)))))))
          acc))))
 
+(defun lexical-decls (stmts)
+  "The (:var KIND DECLS) nodes that are let/const, directly in STMTS (not nested)."
+  (remove-if-not (lambda (s) (and (consp s) (eq (car s) :var)
+                                  (member (second s) '("let" "const") :test #'string=)))
+                 stmts))
+
+(defun block-lexical-names (stmts)
+  "All names bound by let/const declarations directly in STMTS."
+  (let ((acc '()))
+    (dolist (d (lexical-decls stmts) acc)
+      (dolist (decl (third d)) (setf acc (target-names (car decl) acc))))))
+
+(defun hoisted-func-names (stmts)
+  "Names of function declarations directly in STMTS (block-level fn hoisting)."
+  (loop for s in stmts when (and (consp s) (eq (car s) :func) (second s))
+        collect (second s)))
+
+(defun compile-scoped-block (stmts)
+  "Compile a block that declares let/const: new env, TDZ-hoist lexicals,
+   hoist block-level function decls, run statements, pop env."
+  (let ((lex (block-lexical-names stmts)))
+    (if (null lex)
+        (mapc #'compile-stmt stmts)          ; no lexicals: keep it flat
+        (progn
+          (em :push-env)
+          (let ((*scope-depth* (1+ *scope-depth*)))
+            (dolist (n lex) (em :tdz-declare n))          ; temporal dead zone
+            ;; hoist block-scoped function declarations (initialized to undefined then defined)
+            (dolist (fn (block-lexical-fns stmts))
+              (compile-expr fn) (em :init-let (second fn)))
+            (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s)))
+            (em :pop-env))))))
+
+(defun block-lexical-fns (stmts)
+  "Function declarations directly in STMTS (hoisted at block scope)."
+  (remove-if-not #'block-hoisted-fn-p stmts))
+(defun block-hoisted-fn-p (s) (and (consp s) (eq (car s) :func) (second s)))
+
 ;;; ---- statements ----
 (defun compile-stmt (node)
   (ecase (car node)
-    (:block (mapc #'compile-stmt (second node)))
+    (:block (compile-scoped-block (second node)))
     (:empty nil)
     (:expr (compile-expr (second node)) (em :save-completion))
-    (:var (loop for (tgt . init) in (third node)
-                do (if init (compile-expr init) (em :const *undefined*))
-                   (if (stringp tgt) (em :declare-var tgt) (bind-target tgt))))
+    (:var (let ((kind (second node)))
+            (loop for (tgt . init) in (third node)
+                  do (if init (compile-expr init) (em :const *undefined*))
+                     (cond
+                       ((string= kind "const") (bind-lexical tgt :const))
+                       ((string= kind "let")   (bind-lexical tgt :let))
+                       (t (if (stringp tgt) (em :declare-var tgt) (bind-target tgt)))))))
     (:func (compile-expr node) (em :declare-var (second node)))
     (:return (compile-expr (second node)) (em :ret))
     (:throw (compile-expr (second node)) (em :throw-op))
@@ -218,21 +276,17 @@
            (em :label l2)))
     (:while (let ((top (lbl)) (end (lbl)))
               (em :label top) (compile-expr (second node)) (em :jmp-if-false end)
-              (let ((*break-target* end) (*continue-target* top)) (compile-stmt (third node)))
+              (let ((*break-target* end) (*continue-target* top)
+                    (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*))
+                (compile-stmt (third node)))
               (em :jmp top) (em :label end)))
-    (:for (destructuring-bind (init test update body) (cdr node)
-            (let ((top (lbl)) (cont (lbl)) (end (lbl)))
-              (when init (compile-stmt (if (eq (car init) :var) init (list :expr (second init)))))
-              (em :label top)
-              (when test (compile-expr test) (em :jmp-if-false end))
-              (let ((*break-target* end) (*continue-target* cont)) (compile-stmt body))
-              (em :label cont)
-              (when update (compile-expr update) (em :pop))
-              (em :jmp top) (em :label end))))
-    (:for-in (compile-for-in node))
-    (:for-of (compile-for-of node))
-    (:break (if *break-target* (em :jmp *break-target*) (js-throw "illegal break")))
-    (:continue (if *continue-target* (em :jmp *continue-target*) (js-throw "illegal continue")))
+    (:for (compile-for node))
+    (:for-in (compile-scoped-loop node #'compile-for-in))
+    (:for-of (compile-scoped-loop node #'compile-for-of))
+    (:break (if *break-target* (progn (pop-envs (- *scope-depth* *break-depth*)) (em :jmp *break-target*))
+                (js-throw "illegal break")))
+    (:continue (if *continue-target* (progn (pop-envs (- *scope-depth* *continue-depth*)) (em :jmp *continue-target*))
+                   (js-throw "illegal continue")))
     (:switch (destructuring-bind (disc cases default) (cdr node)
                (let ((dv (string (gensym "SW"))) (end (lbl)) (deflabel (lbl))
                      (clabels (mapcar (lambda (c) (cons c (lbl))) cases)))
@@ -240,7 +294,7 @@
                  (dolist (cl clabels)
                    (em :get-var dv) (compile-expr (car (car cl))) (em :bin "===") (em :jmp-if-true (cdr cl)))
                  (em :jmp deflabel)
-                 (let ((*break-target* end))
+                 (let ((*break-target* end) (*break-depth* *scope-depth*))
                    (dolist (cl clabels) (em :label (cdr cl)) (mapc #'compile-stmt (cdr (car cl))))
                    (em :label deflabel) (when default (mapc #'compile-stmt default)))
                  (em :label end))))
@@ -248,10 +302,46 @@
             (if catch
                 (let ((lc (lbl)) (after (lbl)))
                   (em :push-handler lc) (compile-stmt blk) (em :pop-handler) (em :jmp after)
-                  (em :label lc) (if param (em :declare-var param) (em :pop))   ; bind/discard thrown value
-                  (compile-stmt catch) (em :label after))
+                  (em :label lc)                                  ; thrown value on stack
+                  (em :push-env)                                  ; catch parameter scope
+                  (let ((*scope-depth* (1+ *scope-depth*)))
+                    (cond ((null param) (em :pop))
+                          ((stringp param) (em :declare-var param))
+                          (t (bind-target param)))               ; destructuring catch param
+                    (compile-stmt catch))
+                  (em :pop-env)
+                  (em :label after))
                 (compile-stmt blk))
             (when fin (compile-stmt fin))))))   ; v0: finally runs on the normal/caught path
+
+(defun compile-for (node)
+  (destructuring-bind (init test update body) (cdr node)
+    (let ((lexical (and init (eq (car init) :var)
+                        (member (second init) '("let" "const") :test #'string=))))
+      (when lexical (em :push-env))
+      (let ((*scope-depth* (if lexical (1+ *scope-depth*) *scope-depth*)))
+        (let ((top (lbl)) (cont (lbl)) (end (lbl)))
+          (when init (compile-stmt (if (eq (car init) :var) init (list :expr (second init)))))
+          (em :label top)
+          (when test (compile-expr test) (em :jmp-if-false end))
+          (let ((*break-target* end) (*continue-target* cont)
+                (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*))
+            (compile-stmt body))
+          (em :label cont)
+          (when update (compile-expr update) (em :pop))
+          (em :jmp top) (em :label end)))
+      (when lexical (em :pop-env)))))
+
+(defun compile-scoped-loop (node inner)
+  "Wrap a for-in/for-of in a block env when its head declares let/const."
+  (let* ((head (second node))
+         (lexical (and (consp head) (eq (car head) :var)
+                       (member (second head) '("let" "const") :test #'string=))))
+    (if lexical
+        (progn (em :push-env)
+               (let ((*scope-depth* (1+ *scope-depth*))) (funcall inner node))
+               (em :pop-env))
+        (funcall inner node))))
 
 (defun for-head-assign (head)
   "Bind the value currently on top of the stack to the loop target (consumes it)."
