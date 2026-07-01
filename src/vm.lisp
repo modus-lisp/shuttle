@@ -250,6 +250,11 @@
             (:to-str (push! (to-string (pop!))))
             (:swap (let ((n (fill-pointer stack)))
                      (rotatef (aref stack (- n 1)) (aref stack (- n 2)))))
+            (:rot3 (let ((n (fill-pointer stack)))   ; [a b c] -> [b c a]
+                     (let ((a (aref stack (- n 3))))
+                       (setf (aref stack (- n 3)) (aref stack (- n 2))
+                             (aref stack (- n 2)) (aref stack (- n 1))
+                             (aref stack (- n 1)) a))))
             (:nullish-short (let ((v (peek!)))   ; if top is null/undefined, jump to SHORT (leave it)
                               (when (or (eq v *null*) (eq v *undefined*)) (setf pc (first a)))))
             (:save-completion (setf completion (pop!)))

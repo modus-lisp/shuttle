@@ -43,8 +43,8 @@
     ((eq (car tgt) :apat)
      (dolist (e (second tgt) acc)
        (cond ((null e))
-             ((eq (car e) :rest) (setf acc (target-names (second e) acc)))
-             ((eq (car e) :default) (setf acc (target-names (second e) acc)))
+             ((and (consp e) (eq (car e) :rest)) (setf acc (target-names (second e) acc)))
+             ((and (consp e) (eq (car e) :default)) (setf acc (target-names (second e) acc)))
              (t (setf acc (target-names e acc))))))
     ((eq (car tgt) :opat)
      (dolist (pr (second tgt) acc)
@@ -129,12 +129,68 @@
     ((eq (car tgt) :opat) (compile-object-destructure tgt))
     (t (js-throw "bad binding target"))))
 
+;;; ---- destructuring ASSIGNMENT (LHS is expression-form: :ident/:member/:array/:object) ----
+(defun assign-to-target (tgt)
+  "Value on top of stack -> assign to expression-form TGT, consuming the value."
+  (ecase (car tgt)
+    (:ident (em :set-var (second tgt)) (em :pop))
+    (:member
+     ;; stack: val ; need obj key val -> set-prop -> pop
+     (compile-expr (second tgt))
+     (if (fourth tgt) (compile-expr (third tgt)) (em :const (second (third tgt))))
+     (em :rot3)                              ; bring val above obj,key : obj key val
+     (em :set-prop) (em :pop))
+    ((:array :object) (compile-assign-pattern tgt))))
+
+(defun assign-elem-with-default (elem)
+  "ELEM may be (:assign \"=\" TGT DEFAULT). Applies default if value is undefined,
+   then assigns. Value on top of stack."
+  (if (and (consp elem) (eq (car elem) :assign) (string= (second elem) "="))
+      (progn (apply-default (fourth elem)) (assign-to-target (third elem)))
+      (assign-to-target elem)))
+
+(defun compile-assign-pattern (pat)
+  "Destructure the value on top of the stack into expression-form pattern PAT.
+   Consumes the value."
+  (ecase (car pat)
+    (:array
+     (let ((it (string (gensym "IT"))) (elems (second pat)))
+       (em :get-iterator) (em :declare-var it)
+       (dolist (e elems)
+         (cond
+           ((null e) (em :get-var it) (em :iter-next) (em :pop))       ; hole
+           ((and (consp e) (eq (car e) :spread))
+            (em :get-var it) (em :iter-rest) (assign-to-target (second e)))
+           (t (em :get-var it) (em :iter-next) (em :get-prop-c "value")
+              (assign-elem-with-default e))))))
+    (:object
+     (let ((src (string (gensym "SRC"))) (seen '()))
+       (em :declare-var src)
+       (dolist (pr (second pat))
+         (ecase (car pr)
+           (:spread
+            (em :get-var src) (em :object-rest (reverse seen)) (assign-to-target (second pr)))
+           (:proto                                   ; treat like a normal key __proto__
+            (push "__proto__" seen)
+            (em :get-var src) (em :get-prop-c "__proto__") (assign-to-target (second pr)))
+           (:init
+            (let ((key (second pr)) (val (third pr)))
+              (when (eq (car key) :lit) (push (second key) seen))
+              (em :get-var src)
+              (if (eq (car key) :computed) (progn (compile-expr (second key)) (em :get-prop))
+                  (em :get-prop-c (second key)))
+              ;; val is the target expression (possibly (:assign = tgt default) for {k: t = d}
+              ;; or (:ident name) for shorthand {k}, or (:ident name)+default stored in 4th)
+              (if (fourth pr)                        ; shorthand-with-default {x = d}
+                  (progn (apply-default (fourth pr)) (assign-to-target val))
+                  (assign-elem-with-default val))))))))))
+
 (defun collect-var-names (node &optional acc)
   "Collect `var`-declared names in NODE, NOT descending into nested functions."
   (when (consp node)
     (case (car node)
       ((:func :arrow) acc)               ; nested function scope: stop
-      (:var (dolist (d (third node)) (pushnew (car d) acc :test #'string=)) acc)
+      (:var (dolist (d (third node)) (setf acc (target-names (car d) acc))) acc)
       (:for-in (setf acc (collect-var-names (fourth node) (collect-var-names (second node) acc))))
       (:for-of (setf acc (collect-var-names (fourth node) (collect-var-names (second node) acc))))
       (t (dolist (x (cdr node))
@@ -149,8 +205,9 @@
     (:block (mapc #'compile-stmt (second node)))
     (:empty nil)
     (:expr (compile-expr (second node)) (em :save-completion))
-    (:var (loop for (name . init) in (third node)
-                do (if init (compile-expr init) (em :const *undefined*)) (em :declare-var name)))
+    (:var (loop for (tgt . init) in (third node)
+                do (if init (compile-expr init) (em :const *undefined*))
+                   (if (stringp tgt) (em :declare-var tgt) (bind-target tgt))))
     (:func (compile-expr node) (em :declare-var (second node)))
     (:return (compile-expr (second node)) (em :ret))
     (:throw (compile-expr (second node)) (em :throw-op))
@@ -198,8 +255,14 @@
 
 (defun for-head-assign (head)
   "Bind the value currently on top of the stack to the loop target (consumes it)."
-  (cond ((eq (car head) :var) (em :declare-var (car (first (third head)))))
+  (cond ((eq (car head) :var)
+         (let ((tgt (car (first (third head)))))
+           (if (stringp tgt) (em :declare-var tgt) (bind-target tgt))))
         ((eq (car head) :ident) (em :set-var (second head)) (em :pop))
+        ((member (car head) '(:member))            ; obj.p / obj[k] loop target
+         (compile-assign-pattern head) (em :pop))
+        ((member (car head) '(:array :object))     ; destructuring assignment target
+         (compile-assign-pattern head) (em :pop))
         (t (js-throw "unsupported for-in/of target"))))
 
 (defun compile-for-in (node)
@@ -474,6 +537,12 @@
 (defun compile-assign (op target value)
   (when (logical-assign-op op)
     (return-from compile-assign (compile-logical-assign (logical-assign-op op) target value)))
+  ;; destructuring assignment: [a,b] = v / ({x} = v). Only plain `=`.
+  (when (and (string= op "=") (member (car target) '(:array :object)))
+    (compile-expr value)                     ; RHS value on stack (assignment result)
+    (em :dup)                                ; keep a copy to destructure
+    (compile-assign-pattern target)          ; consumes the copy
+    (return-from compile-assign nil))
   (let ((base (and (> (length op) 1) (subseq op 0 (1- (length op))))))  ; "+=" -> "+"
     (ecase (car target)
       (:ident (if base (progn (em :get-var (second target)) (compile-expr value) (em :bin base))
