@@ -20,12 +20,17 @@
           (%js-array-p e)
           (js-truthy flag)))))
 
+(defun %array-iterator-proto (realm)
+  "The prototype the kernel's make-array-iterator hands out, so keys()/entries()
+   share %ArrayIteratorPrototype% with values()/@@iterator (spec requirement)."
+  (js-object-proto (make-array-iterator realm (make-array-object '()))))
+
 (defun make-array-iterator-kind (realm arr kind)
   "Array iterator like make-array-iterator, but KIND selects what NEXT yields:
    :key -> index number, :value -> element, :entry -> [index, element] array.
    Once exhausted it stays done (spec: [[IteratedArrayLike]] is released)."
   (let ((i 0) (done nil)
-        (it (make-object :proto (realm-object-proto realm) :class "Array Iterator")))
+        (it (make-object :proto (%array-iterator-proto realm) :class "Array Iterator")))
     (def-method realm it "next" 0 (this args)
       (let ((res (make-object :proto (realm-object-proto realm))))
         (if done
@@ -70,6 +75,28 @@
                 (progn (push element out) (incf idx)))))))
     (values out idx)))
 
+(defun %array-species-check (o)
+  "ArraySpeciesCreate's constructor validation (no subclassing support): if
+   O.constructor is neither undefined nor a constructor (nor an object exposing a
+   valid @@species), throw a TypeError.  Otherwise the default ArrayCreate path
+   is used by the caller.  Only applies when IsArray(O) is true — for non-array
+   receivers ArraySpeciesCreate short-circuits to ArrayCreate without reading
+   the constructor at all."
+  (unless (%js-array-p o) (return-from %array-species-check nil))
+  (let ((c (js-get o "constructor")))
+    (unless (js-undefined-p c)
+      (if (js-object-p c)
+          ;; C is an object: consult @@species; null/undefined -> default path.
+          (let* ((sp (well-known-symbol "species"))
+                 (species (if sp (js-get c sp) *undefined*)))
+            (cond ((or (js-undefined-p species) (eq species *null*)) nil)
+                  ((and (js-object-p species) (js-object-construct species)) nil)
+                  (t (js-throw (make-native-error "TypeError"
+                                                  "constructor is not a valid array species")))))
+          ;; C is a primitive other than undefined: IsConstructor is false.
+          (js-throw (make-native-error "TypeError"
+                                       "constructor is not a valid array species"))))))
+
 (defun install-array-transform (realm)
   (let ((ap (realm-array-proto realm)))
     ;; Create the @@isConcatSpreadable well-known symbol and expose it on the
@@ -81,6 +108,22 @@
           (def-value symbol-ctor "isConcatSpreadable" sym
                      :writable nil :configurable nil))))
 
+    ;; Array.prototype [ @@unscopables ]: a null-proto object whose keys are the
+    ;; method names added after ES5 (so `with` blocks don't shadow them).  The
+    ;; well-known symbol isn't otherwise created, so make + expose it on Symbol.
+    (let ((unsym (or (well-known-symbol "unscopables")
+                     (make-js-symbol "Symbol.unscopables"))))
+      (let ((symbol-ctor (ignore-errors (js-get (realm-global realm) "Symbol"))))
+        (when (and symbol-ctor (js-object-p symbol-ctor)
+                   (js-undefined-p (js-get symbol-ctor "unscopables")))
+          (def-value symbol-ctor "unscopables" unsym :writable nil :configurable nil)))
+      (let ((ul (make-object :proto *null*)))
+        (dolist (name '("at" "copyWithin" "entries" "fill" "find" "findIndex"
+                        "findLast" "findLastIndex" "flat" "flatMap" "includes"
+                        "keys" "toReversed" "toSorted" "toSpliced" "values"))
+          (put ul name *true*))
+        (put ap unsym ul :enumerable nil :writable nil :configurable t)))
+
     (flet ((len (this) (to-int-index (js-get this "length"))))
       (declare (ignorable #'len))
 
@@ -90,13 +133,19 @@
           ;; items = [O, ...arguments]; O is ToObject(this value).
           (dolist (e (cons (to-object this) args))
             (if (%concat-spreadable-p e)
-                (let ((l (to-length (js-get e "length"))))
-                  (dotimes (i (truncate l))
+                (let ((l (truncate (to-length (js-get e "length")))))
+                  ;; n + len must not exceed 2^53-1 (checked before copying).
+                  (when (> (+ n l) 9007199254740991)
+                    (js-throw (make-native-error "TypeError" "concat result exceeds maximum array length")))
+                  (dotimes (i l)
                     (let ((k (princ-to-string i)))
                       (when (js-truthy* (js-has e k))
                         (put a (princ-to-string n) (js-get e k))))
                     (incf n)))
-                (progn (put a (princ-to-string n) e) (incf n))))
+                (progn
+                  (when (>= n 9007199254740991)
+                    (js-throw (make-native-error "TypeError" "concat result exceeds maximum array length")))
+                  (put a (princ-to-string n) e) (incf n))))
           (put a "length" (float n 1d0) :enumerable nil)
           a))
 
@@ -105,6 +154,7 @@
                (depth-arg (arg 0 args))
                (depth (if (js-undefined-p depth-arg) 1
                           (to-integer-or-infinity depth-arg))))
+          (%array-species-check o)
           (make-array-object (nreverse (flatten-into o 0 '() depth nil *undefined*)))))
 
       (def-method realm ap "flatMap" 1 (this args)
@@ -113,7 +163,17 @@
                (ta (arg 1 args)))
           (unless (js-callable-p fn)
             (js-throw (make-native-error "TypeError" "flatMap callback is not a function")))
+          (%array-species-check o)
           (make-array-object (nreverse (flatten-into o 0 '() 1 fn ta)))))
+
+      ;; Override kernel values/@@iterator so ToObject(this) coerces primitives
+      ;; and throws on null/undefined.  @@iterator must be the SAME function
+      ;; object as `values` (spec: %Array.prototype.values%).
+      (def-method realm ap "values" 0 (this args)
+        (make-array-iterator-kind realm (to-object this) :value))
+      (when *symbol-iterator*
+        (put ap *symbol-iterator* (js-get ap "values")
+             :enumerable nil :writable t :configurable t))
 
       (def-method realm ap "keys" 0 (this args)
         (make-array-iterator-kind realm (to-object this) :key))

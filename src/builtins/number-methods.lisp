@@ -38,16 +38,49 @@
     (format nil "~a~ae~a~d"
             (subseq digits 0 1) frac (if (minusp e) "-" "+") (abs e))))
 
+;;; --- thisNumberValue (spec 21.1.3) ---------------------------------------
+;;; A Number-prototype method's receiver must have [[NumberData]]: a raw Number
+;;; primitive, or an object whose [[Class]] is "Number" (a Number box). Any other
+;;; object (a Date has a float primitive but class "Date"!) is a TypeError. The
+;;; bare %Number.prototype% object has [[NumberData]] = +0 but the kernel leaves
+;;; its primitive NIL, so treat that single receiver as +0.
+(defun %this-number-value (this np)
+  (cond ((floatp this) this)
+        ((eq this np) 0d0)
+        ((and (js-object-p this)
+              (string= (js-object-class this) "Number")
+              (floatp (js-object-primitive this)))
+         (js-object-primitive this))
+        (t (js-throw (make-native-error "TypeError" "not a Number")))))
+
+;;; Exact fixed-point rendering of a finite double X to F fractional digits,
+;;; round-half-up on the exact rational value (spec 21.1.3.3 step 10: pick the
+;;; integer n minimising |n/10^f - x|, ties to the larger n). Returns the string
+;;; without sign; caller prepends "-".
+(defun %to-fixed-string (ax f)
+  (let* ((r (rational ax))                 ; exact value of the double
+         (scaled (* r (expt 10 f)))        ; exact n-candidate before rounding
+         (fl (floor scaled))
+         (rem (- scaled fl))
+         (n (if (>= rem 1/2) (1+ fl) fl))  ; round half up (ties → larger)
+         (digits (format nil "~d" n)))
+    (if (zerop f)
+        digits
+        ;; ensure at least f+1 digits so we can split off the fractional part
+        (let* ((digits (if (< (length digits) (1+ f))
+                           (concatenate 'string
+                                        (make-string (- (1+ f) (length digits))
+                                                     :initial-element #\0)
+                                        digits)
+                           digits))
+               (split (- (length digits) f)))
+          (concatenate 'string (subseq digits 0 split) "." (subseq digits split))))))
+
 (defun install-number-methods (realm)
   (let ((np (realm-number-proto realm)))
     (declare (ignorable np))
-    ;; %Number.prototype% has [[NumberData]] = +0, but the kernel object leaves
-    ;; its primitive NIL, so this-number would reject it. Treat that receiver as
-    ;; +0 (any other non-Number still throws through this-number).
     (flet ((this-num (this)
-             (if (and (eq this np) (null (js-object-primitive this)))
-                 0d0
-                 (this-number this))))
+             (%this-number-value this np)))
 
     ;; -- Number.prototype.toExponential(fractionDigits) --------------------
     (def-method realm np "toExponential" 1 (this args)
@@ -116,11 +149,70 @@
                           (concatenate 'string s
                                        (%precision-format digits e pp)))))))))))))
 
+    ;; -- Number.prototype.toString(radix) ----------------------------------
+    ;; Override the kernel: proper thisNumberValue (rejects Date etc.), and a
+    ;; RangeError for radix outside 2..36 (the kernel let it reach a Lisp error).
+    (def-method realm np "toString" 1 (this args)
+      (let* ((n (this-num this))
+             (radix (arg 0 args))
+             (r (if (js-undefined-p radix) 10 (to-integer-or-infinity radix))))
+        (when (or (js-nan-p r) (< r 2) (> r 36))
+          (js-throw (make-native-error "RangeError"
+                      "toString() radix must be between 2 and 36")))
+        (let ((ri (truncate r)))
+          (if (= ri 10) (number-to-string n) (number-to-radix-string n ri)))))
+
+    ;; -- Number.prototype.valueOf() ----------------------------------------
+    ;; Override the kernel so the bare proto → +0 and non-Number → TypeError.
+    (def-method realm np "valueOf" 0 (this args)
+      (declare (ignore args))
+      (this-num this))
+
+    ;; -- Number.prototype.toFixed(fractionDigits) --------------------------
+    ;; Exact rendering + spec range (0..100) + proper thisNumberValue. The
+    ;; kernel's ~,vf was neither exact nor range-checked.
+    (def-method realm np "toFixed" 1 (this args)
+      (let* ((x (this-num this))
+             (f (to-integer-or-infinity (arg 0 args))))
+        (when (or (js-nan-p f) (< f 0) (> f 100))
+          (js-throw (make-native-error "RangeError"
+                      "toFixed() digits must be between 0 and 100")))
+        (let ((fi (truncate f)))
+          (cond
+            ((js-nan-p x) "NaN")
+            ((= x *inf*) "Infinity")
+            ((= x *-inf*) "-Infinity")
+            ;; |x| >= 1e21: spec returns ToString(x).
+            ((>= (abs x) 1d21) (number-to-string x))
+            (t (let ((s "") (ax x))
+                 (when (< x 0) (setf s "-") (setf ax (- x)))
+                 (let ((body (%to-fixed-string ax fi)))
+                   ;; -0.000 collapses to no sign only when the rounded result is
+                   ;; all zeros AND x was not negative; a genuine negative that
+                   ;; rounds to zero keeps "-" only if some nonzero digit — match
+                   ;; V8: negative values that round to exactly 0 drop the sign.
+                   (if (and (string= s "-")
+                            (every (lambda (c) (or (char= c #\0) (char= c #\.))) body))
+                       body
+                       (concatenate 'string s body)))))))))
+
     ;; -- Number.prototype.toLocaleString() ---------------------------------
     ;; Simple, spec-permitted fallback: delegate to the default toString.
     (def-method realm np "toLocaleString" 0 (this args)
       (declare (ignore args))
-      (number-to-string (this-num this))))))
+      (number-to-string (this-num this))))
+
+    ;; -- Number.parseInt / Number.parseFloat identity + attributes ----------
+    ;; Spec: these MUST be the very same function objects as the global
+    ;; parseInt/parseFloat, with { writable, non-enumerable, configurable }.
+    ;; The kernel installed fresh copies with default (enumerable) attributes.
+    (let ((ctor (js-get (realm-global realm) "Number"))
+          (gpi (js-get (realm-global realm) "parseInt"))
+          (gpf (js-get (realm-global realm) "parseFloat")))
+      (when (and (js-object-p ctor) gpi)
+        (put ctor "parseInt" gpi :enumerable nil :writable t :configurable t))
+      (when (and (js-object-p ctor) gpf)
+        (put ctor "parseFloat" gpf :enumerable nil :writable t :configurable t)))))
 
 ;;; Given P significant DIGITS and base-10 exponent E, render per the
 ;;; toPrecision spec: exponential when e < -6 or e >= p, else positional.

@@ -74,6 +74,11 @@
   (let ((cre (regexp-compiled o)))
     (if cre (compiled-regex-flags cre) "")))
 
+(defun set-lastindex-or-throw (re v)
+  "Set(RE, \"lastIndex\", V, true): a failed [[Set]] (e.g. non-writable) throws."
+  (when (eq (js-set re "lastIndex" v) *false*)
+    (js-throw (make-native-error "TypeError" "cannot set lastIndex"))))
+
 (defun regexp-do-exec (realm re s)
   "RegExpBuiltinExec: run RE against string S honoring lastIndex for g/y.
    Returns a JS match array or *null*."
@@ -81,18 +86,19 @@
   (let* ((cre (regexp-compiled re))
          (global (compiled-regex-global cre))
          (sticky (compiled-regex-sticky cre))
-         (last-index (if (or global sticky)
-                         (to-length (js-get re "lastIndex"))
-                         0d0))
-         (li (truncate last-index)))
+         ;; Step 4: Get(R,"lastIndex") is ALWAYS performed (observable via a
+         ;; poisoned/valueOf lastIndex). The value is only USED as the starting
+         ;; position (and written back) when global or sticky is set.
+         (last-index (to-length (js-get re "lastIndex")))
+         (li (if (or global sticky) (truncate last-index) 0)))
     (when (> li (length s))
-      (when (or global sticky) (js-set re "lastIndex" 0d0))
+      (when (or global sticky) (set-lastindex-or-throw re 0d0))
       (return-from regexp-do-exec *null*))
     (multiple-value-bind (end caps) (regex-exec cre s li)
       (if (null end)
-          (progn (when (or global sticky) (js-set re "lastIndex" 0d0)) *null*)
+          (progn (when (or global sticky) (set-lastindex-or-throw re 0d0)) *null*)
           (let ((mstart (car (aref caps 0))))
-            (when (or global sticky) (js-set re "lastIndex" (float end 1d0)))
+            (when (or global sticky) (set-lastindex-or-throw re (float end 1d0)))
             (build-match-array realm cre s caps mstart))))))
 
 (defun build-match-array (realm cre s caps mstart)

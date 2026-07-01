@@ -22,6 +22,11 @@
       ((stringp v)
        (let ((o (make-object :proto (realm-string-proto r) :class "String")))
          (setf (js-object-primitive o) v)
+         ;; String exotic: character indices are own enumerable, non-writable,
+         ;; non-configurable data properties.
+         (dotimes (i (length v))
+           (put o (princ-to-string i) (string (char v i))
+                :enumerable t :writable nil :configurable nil))
          (put o "length" (float (length v) 1d0) :enumerable nil :writable nil :configurable nil)
          o))
       ((floatp v)
@@ -83,7 +88,10 @@
 (defun make-array-object (elems)
   (let ((o (make-object :proto (%arr-proto) :class "Array")))
     (loop for e in elems for i from 0 do (put o (princ-to-string i) e))
-    (put o "length" (float (length elems) 1d0)) o))
+    ;; Array "length" is writable but non-enumerable and non-configurable.
+    (put o "length" (float (length elems) 1d0)
+         :enumerable nil :writable t :configurable nil)
+    o))
 (defun make-plain-object (pairs)
   (let ((o (make-object :proto (%obj-proto))))
     (loop for (k . v) in pairs do (put o (if (stringp k) k (to-string k)) v)) o))
@@ -928,10 +936,20 @@
             (if (js-object-p r)
                 (progn
                   ;; adopt the base-created instance's own properties + internal
-                  ;; slots onto THIS (which already has the derived prototype).
+                  ;; slots + primitive onto THIS (which already carries the derived
+                  ;; prototype the caller installed). Rebuild each own descriptor as
+                  ;; a plist (js-get-own-property returns a PROP struct).
                   (dolist (k (js-own-keys r))
                     (let ((d (js-get-own-property r k)))
-                      (when d (js-define-own-property this k d))))
+                      (when (prop-p d)
+                        (js-define-own-property this k
+                          (if (prop-accessor d)
+                              (list :get (prop-get d) :set (prop-set d) :accessor t
+                                    :enumerable (prop-enumerable d) :configurable (prop-configurable d))
+                              (list :value (prop-value d) :writable (prop-writable d)
+                                    :enumerable (prop-enumerable d) :configurable (prop-configurable d)))))))
+                  (when (js-object-primitive r)
+                    (setf (js-object-primitive this) (js-object-primitive r)))
                   (when (js-object-internal r)
                     (setf (js-object-internal this)
                           (append (js-object-internal r) (js-object-internal this))))

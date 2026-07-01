@@ -61,10 +61,11 @@
                    (maxlen (get-max-byte-length-option (arg 1 args))))
               (when (and maxlen (> len maxlen))
                 (js-throw (make-native-error "RangeError" "length exceeds maxByteLength")))
-              (when maxlen (guard-alloc maxlen))
-              (guard-alloc len)
-              ;; OrdinaryCreateFromConstructor reads nt.prototype BEFORE allocating.
+              ;; OrdinaryCreateFromConstructor reads nt.prototype (may throw) BEFORE
+              ;; CreateByteDataBlock allocates / range-checks the size.
               (let ((rproto (proto-from-newtarget nt proto)))
+                (when maxlen (guard-alloc maxlen))
+                (guard-alloc len)
                 (make-array-buffer (make-byte-vector len) rproto maxlen)))))
     (def-value ctor "prototype" proto :writable nil :configurable nil)
     (def-value proto "constructor" ctor)
@@ -133,6 +134,9 @@
         (js-throw (make-native-error "TypeError" "ArrayBuffer is detached")))
       (let ((new-len (to-integer-or-infinity (arg 0 args)))
             (maxlen (ab-max-byte-length this)))
+        ;; ToIntegerOrInfinity(newLength) may have detached the buffer.
+        (when (ab-detached-p this)
+          (js-throw (make-native-error "TypeError" "ArrayBuffer is detached")))
         (when (or (< new-len 0) (= new-len *inf*) (> new-len maxlen))
           (js-throw (make-native-error "RangeError" "Invalid ArrayBuffer resize length")))
         (let* ((n (truncate new-len)) (old (ab-bytes this))
@@ -167,6 +171,9 @@
     (put proto (symbol-tostringtag realm) "ArrayBuffer"
          :enumerable nil :writable nil :configurable t)
     (define-global realm "ArrayBuffer" ctor)
+    ;; Global constructor bindings must be non-enumerable (define-global leaves the
+    ;; global-object property enumerable); fix the attributes here.
+    (def-value (realm-global realm) "ArrayBuffer" ctor)
     ;; ---- $262 host hooks: detachArrayBuffer (used pervasively by TA tests) ----
     (install-262-hooks realm)))
 

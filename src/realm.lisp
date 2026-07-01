@@ -36,8 +36,10 @@
       realm)))
 
 (defun define-global (realm name value)
+  ;; Built-in globals (Object, Array, eval, parseInt, …) are non-enumerable,
+  ;; writable, configurable per spec (unlike global `var` bindings).
   (env-declare (realm-global-env realm) name value)
-  (put (realm-global realm) name value)
+  (put (realm-global realm) name value :enumerable nil)
   value)
 
 (defun eval-script (realm source)
@@ -539,7 +541,7 @@
         (unless (and (= n (with-js-floats (ftruncate n))) (<= 0 n #xFFFFFFFF))
           (js-throw (make-native-error "RangeError" "Invalid array length")))
         (let ((o (make-object :proto (realm-array-proto realm) :class "Array")))
-          (put o "length" n :enumerable nil) o))
+          (put o "length" n :enumerable nil :writable t :configurable nil) o))
       (make-array-object args)))
 
 (defun clamp-index (v len default)
@@ -655,6 +657,11 @@
           (lambda (args nt) (declare (ignore nt))
             (let ((o (make-object :proto sp :class "String")) (s (if args (to-string (arg 0 args)) "")))
               (setf (js-object-primitive o) s)
+              ;; String exotic: each character index is an own enumerable,
+              ;; non-writable, non-configurable data property.
+              (dotimes (i (length s))
+                (put o (princ-to-string i) (string (char s i))
+                     :enumerable t :writable nil :configurable nil))
               (put o "length" (float (length s) 1d0) :enumerable nil :writable nil :configurable nil)
               o)))
     (def-value ctor "prototype" sp :writable nil :configurable nil)

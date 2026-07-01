@@ -143,6 +143,8 @@
             *undefined*))))
     ;; @@toStringTag
     (put proto (symbol-tostringtag realm) "DataView" :enumerable nil :writable nil :configurable t)
-    (define-global realm "DataView" ctor)))
+    (define-global realm "DataView" ctor)
+    ;; Global constructor binding must be non-enumerable.
+    (def-value (realm-global realm) "DataView" ctor)))
 
 (register-builtin-installer 'install-dataview)

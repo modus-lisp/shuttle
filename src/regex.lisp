@@ -119,7 +119,11 @@
        (let ((neg (char= (rp-next p) #\!))
              (body (parse-disjunction p ngroups names)))
          (unless (rp-eat p #\)) (regex-syntax-error "unterminated lookahead"))
-         (parse-quantifier-opt p (list :lookahead neg body))))
+         ;; In /u mode a lookahead is not a QuantifiableAssertion: a following
+         ;; quantifier is a SyntaxError. (Annex B allows it in non-unicode.)
+         (if (rx-parser-unicode p)
+             (list :lookahead neg body)
+             (parse-quantifier-opt p (list :lookahead neg body)))))
       ((and (eql c #\() (eql (rp-peek p 1) #\?)
             (eql (rp-peek p 2) #\<)
             (member (rp-peek p 3) '(#\= #\!)))
@@ -127,7 +131,8 @@
        (let ((neg (char= (rp-next p) #\!))
              (body (parse-disjunction p ngroups names)))
          (unless (rp-eat p #\)) (regex-syntax-error "unterminated lookbehind"))
-         (parse-quantifier-opt p (list :lookbehind neg body))))
+         ;; A lookbehind is never a QuantifiableAssertion in either mode.
+         (list :lookbehind neg body)))
       (t
        (let ((atom (parse-atom p ngroups names)))
          (parse-quantifier-opt p atom))))))
@@ -254,22 +259,34 @@
           (list :char (code-char val)))
         (list :char (rp-next p)))))
 
-(defun parse-char-escape-value (p)
+(defun parse-char-escape-value (p &optional in-class)
   (let ((c (rp-next p)))
     (case c
       (#\n #\Newline) (#\r #\Return) (#\t #\Tab) (#\f #\Page)
-      (#\v (code-char 11)) (#\0 (code-char 0))
+      (#\v (code-char 11))
+      (#\0 (when (and (rx-parser-unicode p)
+                      (let ((d (rp-peek p))) (and d (digit-char-p d))))
+             (regex-syntax-error "\\0 must not be followed by a digit in unicode mode"))
+           (code-char 0))
       (#\b (code-char 8))
       (#\c
        (let ((x (rp-peek p)))
          (if (and x (alpha-char-p x))
              (progn (rp-next p) (code-char (mod (char-code (char-upcase x)) 32)))
-             #\c)))
-      (#\x (or (let ((save (rx-parser-pos p)) (v (parse-hex-value p 2)))
-                 (if v (code-char v) (progn (setf (rx-parser-pos p) save) nil)))
-               #\x))
+             ;; \c not followed by an ASCII letter: legacy identity of 'c'
+             ;; (Annex B); in /u mode this is a SyntaxError.
+             (if (rx-parser-unicode p)
+                 (regex-syntax-error "invalid \\c escape")
+                 #\c))))
+      (#\x (let ((save (rx-parser-pos p)) (v (parse-hex-value p 2)))
+             (cond
+               (v (code-char v))
+               ((rx-parser-unicode p) (regex-syntax-error "invalid \\x escape"))
+               (t (setf (rx-parser-pos p) save) #\x))))
       (#\u (parse-unicode-escape p))
-      (t c))))
+      (t (unless (valid-identity-escape-p p c in-class)
+           (regex-syntax-error (format nil "invalid identity escape \\~a" c)))
+         c))))
 
 (defun parse-unicode-escape (p)
   (cond
@@ -308,6 +325,16 @@
         (setf val (+ (* val 16) (digit-char-p (rp-next p) 16)))))
     val))
 
+;;; In /u mode, IdentityEscape is restricted to SyntaxCharacter + '/'.
+;;; (Class context additionally allows '-'.)  Returns T if CH is a valid
+;;; identity escape for the current mode/context.
+(defun syntax-character-p (c)
+  (member c '(#\^ #\$ #\\ #\. #\* #\+ #\? #\( #\) #\[ #\] #\{ #\} #\| )))
+(defun valid-identity-escape-p (p c in-class)
+  (if (rx-parser-unicode p)
+      (or (syntax-character-p c) (char= c #\/) (and in-class (char= c #\-)))
+      t))
+
 ;;; ---- character classes ----
 (defun parse-char-class (p)
   (rp-next p)
@@ -320,18 +347,27 @@
           (if (and (eql (rp-peek p) #\-)
                    (rp-peek p 1)
                    (not (eql (rp-peek p 1) #\]))
-                   (consp atom) (eq (car atom) :ch))
+                   (consp atom)
+                   ;; A range needs a low bound. In /u the low bound must be a
+                   ;; single char (a class-escape as bound is a SyntaxError).
+                   (or (eq (car atom) :ch)
+                       (and (rx-parser-unicode p) (eq (car atom) :class-escape))))
               (progn
                 (rp-next p)
                 (let ((hi (parse-class-atom p)))
-                  (if (and (consp hi) (eq (car hi) :ch))
-                      (let ((lo-c (cadr atom)) (hi-c (cadr hi)))
-                        (when (> (char-code lo-c) (char-code hi-c))
-                          (regex-syntax-error "range out of order in character class"))
-                        (push (list :range lo-c hi-c) items))
-                      (progn (push atom items)
-                             (push (list :ch #\-) items)
-                             (push hi items)))))
+                  (cond
+                    ((and (eq (car atom) :ch) (consp hi) (eq (car hi) :ch))
+                     (let ((lo-c (cadr atom)) (hi-c (cadr hi)))
+                       (when (> (char-code lo-c) (char-code hi-c))
+                         (regex-syntax-error "range out of order in character class"))
+                       (push (list :range lo-c hi-c) items)))
+                    ;; /u: a class-escape on either side of '-' is invalid.
+                    ((rx-parser-unicode p)
+                     (regex-syntax-error "invalid class range with character-class escape"))
+                    (t
+                     (push atom items)
+                     (push (list :ch #\-) items)
+                     (push hi items)))))
               (push atom items)))))
     (list :char-class neg (nreverse items))))
 
@@ -346,7 +382,7 @@
               ((member e '(#\d #\D #\w #\W #\s #\S))
                (rp-next p) (list :class-escape e))
               ((char= e #\b) (rp-next p) (list :ch (code-char 8)))
-              (t (list :ch (parse-char-escape-value p))))))
+              (t (list :ch (parse-char-escape-value p t))))))
         (progn (rp-next p) (list :ch c)))))
 
 ;;; ===========================================================================
@@ -401,6 +437,20 @@
       (char= (char-upcase a) (char-upcase b))
       (char= a b)))
 
+(declaim (inline high-surrogate-p low-surrogate-p))
+(defun high-surrogate-p (c) (<= #xD800 (char-code c) #xDBFF))
+(defun low-surrogate-p (c)  (<= #xDC00 (char-code c) #xDFFF))
+
+;; Width (in UTF-16 code units) of the code point starting at POS. Under /u a
+;; high surrogate followed by a low surrogate is a single 2-unit code point;
+;; everything else (and all of non-unicode mode) is 1 unit.
+(defun rx-cp-width (mc pos)
+  (if (and (mctx-unicode mc)
+           (< (1+ pos) (mctx-len mc))
+           (high-surrogate-p (char (mctx-input mc) pos))
+           (low-surrogate-p (char (mctx-input mc) (1+ pos))))
+      2 1))
+
 ;;; ===========================================================================
 ;;; Compile AST -> node matcher.  A node matcher: (lambda (mc pos k) ...) -> bool.
 ;;; ===========================================================================
@@ -442,17 +492,29 @@
         (when (funcall m mc pos k) (return t))))))
 
 (defun compile-char (c)
-  (lambda (mc pos k)
-    (and (< pos (mctx-len mc))
-         (rx-char-eq mc (char (mctx-input mc) pos) c)
-         (funcall k (1+ pos)))))
+  (if (> (char-code c) #xFFFF)
+      ;; An astral pattern char (from \u{...} in /u mode) must match the two
+      ;; UTF-16 code units of its surrogate-pair encoding in the input.
+      (let* ((cp (- (char-code c) #x10000))
+             (hi (code-char (+ #xD800 (ash cp -10))))
+             (lo (code-char (+ #xDC00 (logand cp #x3FF)))))
+        (lambda (mc pos k)
+          (and (< (1+ pos) (mctx-len mc))
+               (char= (char (mctx-input mc) pos) hi)
+               (char= (char (mctx-input mc) (1+ pos)) lo)
+               (funcall k (+ pos 2)))))
+      (lambda (mc pos k)
+        (and (< pos (mctx-len mc))
+             (rx-char-eq mc (char (mctx-input mc) pos) c)
+             (funcall k (1+ pos))))))
 
 (defun compile-dot ()
   (lambda (mc pos k)
     (and (< pos (mctx-len mc))
          (or (mctx-dot-all mc)
              (not (line-terminator-p (char (mctx-input mc) pos))))
-         (funcall k (1+ pos)))))
+         ;; In /u a '.' consumes a whole code point (a surrogate pair counts once).
+         (funcall k (+ pos (rx-cp-width mc pos))))))
 
 (defun compile-bol ()
   (lambda (mc pos k)
@@ -639,19 +701,30 @@
   (let* ((len (length input))
          (n (compiled-regex-n-captures cre))
          (sticky (compiled-regex-sticky cre))
+         (unicode (compiled-regex-unicode cre))
          (matcher (compiled-regex-matcher cre)))
     (when (> start len) (return-from regex-exec nil))
     (catch 'regex-overflow
-    (loop for pos from start to len do
-      (let* ((caps (make-array (1+ n) :initial-element nil))
-             (mc (make-mctx :input input :len len :captures caps
-                            :ignore-case (compiled-regex-ignore-case cre)
-                            :multiline (compiled-regex-multiline cre)
-                            :dot-all (compiled-regex-dot-all cre)
-                            :unicode (compiled-regex-unicode cre)))
-             (end nil))
-        (when (funcall matcher mc pos (lambda (p) (setf end p) t))
-          (setf (aref caps 0) (cons pos end))
-          (return-from regex-exec (values end caps)))
-        (when sticky (return-from regex-exec nil))))
+    ;; Scan candidate start positions. Under /u we advance by whole code
+    ;; points (AdvanceStringIndex), so a match is never anchored in the middle
+    ;; of a surrogate pair.
+    (let ((pos start))
+      (loop
+        (let* ((caps (make-array (1+ n) :initial-element nil))
+               (mc (make-mctx :input input :len len :captures caps
+                              :ignore-case (compiled-regex-ignore-case cre)
+                              :multiline (compiled-regex-multiline cre)
+                              :dot-all (compiled-regex-dot-all cre)
+                              :unicode unicode))
+               (end nil))
+          (when (funcall matcher mc pos (lambda (p) (setf end p) t))
+            (setf (aref caps 0) (cons pos end))
+            (return-from regex-exec (values end caps)))
+          (when sticky (return-from regex-exec nil))
+          (when (>= pos len) (return))
+          (incf pos (if (and unicode
+                             (< (1+ pos) len)
+                             (high-surrogate-p (char input pos))
+                             (low-surrogate-p (char input (1+ pos))))
+                        2 1)))))
     nil)))

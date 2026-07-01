@@ -153,23 +153,35 @@
   (js-truthy (js-call (set-record-has rec) (set-record-obj rec) (list key))))
 
 (defun sr-keys-iterator (rec)
-  "GetKeysIterator: call rec.keys() and validate it's an iterator (has next)."
+  "GetKeysIterator: call rec.keys(), then GetIteratorDirect (read .next ONCE).
+   Returns (values iterator next-method)."
   (let ((it (js-call (set-record-keys rec) (set-record-obj rec) '())))
     (unless (js-object-p it)
       (js-throw (make-native-error "TypeError" "keys() did not return an object")))
-    (unless (js-callable-p (js-get it "next"))
-      (js-throw (make-native-error "TypeError" "keys() iterator has no next")))
-    it))
+    (let ((next (js-get it "next")))          ; read once (GetIteratorDirect)
+      (unless (js-callable-p next)
+        (js-throw (make-native-error "TypeError" "keys() iterator has no next")))
+      (values it next))))
 
 (defmacro sr-do-keys ((var rec) &body body)
-  "Iterate the set-like record's keys iterator, binding VAR (normalized -0)."
-  (let ((it (gensym)) (r (gensym)))
-    `(let ((,it (sr-keys-iterator ,rec)))
-       (loop
-         (let ((,r (iterator-step ,it)))
-           (when (js-truthy (js-get ,r "done")) (return))
-           (let ((,var (ms-normalize-key (js-get ,r "value"))))
-             ,@body))))))
+  "Iterate the set-like record's keys iterator, binding VAR (normalized -0).
+   The iterator's .next is read ONCE (GetIteratorDirect) and reused each step.
+   If BODY exits the loop early (a non-local transfer of control out of the
+   macro — e.g. return-from because a decision was reached), IteratorClose the
+   keys iterator (call its return()). When the iterator is exhausted normally
+   (done=true), return() is NOT called (the spec CompletionRecord is normal)."
+  (let ((it (gensym)) (next (gensym)) (r (gensym)) (exhausted (gensym)))
+    `(multiple-value-bind (,it ,next) (sr-keys-iterator ,rec)
+       (let ((,exhausted nil))
+         (unwind-protect
+              (loop
+                (let ((,r (js-call ,next ,it '())))
+                  (unless (js-object-p ,r)
+                    (js-throw (make-native-error "TypeError" "iterator result is not an object")))
+                  (when (js-truthy (js-get ,r "done")) (setf ,exhausted t) (return))
+                  (let ((,var (ms-normalize-key (js-get ,r "value"))))
+                    ,@body)))
+           (unless ,exhausted (ms-iterator-close ,it)))))))
 
 (defun ms-this-set-data (this)
   (ms-this-data this :set-data))
@@ -212,6 +224,42 @@
     (def-value ctor "prototype" proto :writable nil :configurable nil)
     (def-value proto "constructor" ctor)
 
+    ;; ---- Map.groupBy(items, callbackfn) [array-grouping proposal] ----
+    ;; GroupBy with key-coercion = "zero" (SameValueZero keys, -0 -> +0). Groups
+    ;; VALUES into per-key arrays; returns a fresh Map.
+    (def-method realm ctor "groupBy" 2 (this args)
+      (declare (ignore this))
+      (let ((items (arg 0 args)) (cb (arg 1 args)))
+        (when (js-null-or-undef items)
+          (js-throw (make-native-error "TypeError" "items is not iterable")))
+        (unless (js-callable-p cb)
+          (js-throw (make-native-error "TypeError" "callbackfn is not callable")))
+        (let* ((data (make-ms-data))
+               (result (make-object :proto proto :class "Map"
+                                    :internal (list :map-data data)))
+               (it (get-iterator items)) (i 0))
+          (let ((normal nil))
+            (unwind-protect
+                 (progn
+                   (loop
+                     (let ((r (iterator-step it)))
+                       (when (js-truthy (js-get r "done")) (return))
+                       (let* ((v (js-get r "value"))
+                              (key (ms-normalize-key
+                                    (js-call cb *undefined* (list v (float i 1d0)))))
+                              (e (ms-find data key)))
+                         (if e
+                             ;; append v to the existing group array
+                             (let* ((arr (ms-entry-value e))
+                                    (len (truncate (to-number (js-get arr "length")))))
+                               (js-set arr (princ-to-string len) v)
+                               (js-set arr "length" (float (1+ len) 1d0)))
+                             (ms-set data key (make-array-object (list v))))
+                         (incf i))))
+                   (setf normal t))
+              (unless normal (ms-iterator-close it))))
+          result)))
+
     (def-method realm proto "get" 1 (this args)
       (let* ((data (ms-this-data this :map-data))
              (e (ms-find data (ms-normalize-key (arg 0 args)))))
@@ -220,6 +268,25 @@
       (let ((data (ms-this-data this :map-data)))
         (ms-set data (ms-normalize-key (arg 0 args)) (arg 1 args))
         this))
+    ;; ---- upsert proposal: getOrInsert / getOrInsertComputed ----
+    (def-method realm proto "getOrInsert" 2 (this args)
+      (let* ((data (ms-this-data this :map-data))
+             (key (ms-normalize-key (arg 0 args)))
+             (e (ms-find data key)))
+        (if e (ms-entry-value e)
+            (let ((v (arg 1 args))) (ms-set data key v) v))))
+    (def-method realm proto "getOrInsertComputed" 2 (this args)
+      (let* ((data (ms-this-data this :map-data))
+             (key (ms-normalize-key (arg 0 args)))
+             (cb (arg 1 args)))
+        (unless (js-callable-p cb)
+          (js-throw (make-native-error "TypeError" "callbackfn is not callable")))
+        (let ((e (ms-find data key)))
+          (if e (ms-entry-value e)
+              ;; Compute with the (normalized) key, then insert. Re-check after the
+              ;; callback (it may have mutated the map); overwrite unconditionally.
+              (let ((v (js-call cb *undefined* (list key))))
+                (ms-set data key v) v)))))
     (def-method realm proto "has" 1 (this args)
       (let ((data (ms-this-data this :map-data)))
         (js-bool (and (ms-find data (ms-normalize-key (arg 0 args))) t))))
@@ -315,6 +382,19 @@
         (float (ms-data-size (ms-this-data this :set-data)) 1d0)))
 
     ;; ---- Set-methods proposal --------------------------------------------
+    ;; DO-SET-LIVE walks THIS's entry vector by index, re-checking liveness at
+    ;; each visit (like forEach) so deletions performed by a set-like's callback
+    ;; mid-iteration are observed (spec: the loop indexes SetData and skips empty
+    ;; slots that were tombstoned before being visited). Early exit via BODY is
+    ;; a normal Lisp non-local transfer.
+    (macrolet ((do-set-live ((var data) &body body)
+                 (let ((d (gensym)) (entries (gensym)) (i (gensym)) (e (gensym)))
+                   `(let* ((,d ,data) (,entries (ms-data-entries ,d)) (,i 0))
+                      (loop while (< ,i (fill-pointer ,entries)) do
+                        (let ((,e (aref ,entries ,i)))
+                          (unless (ms-entry-deleted ,e)
+                            (let ((,var (ms-entry-value ,e))) ,@body)))
+                        (incf ,i))))))
     (flet ((live-values (data)
              (loop for e across (ms-data-entries data)
                    unless (ms-entry-deleted e) collect (ms-entry-value e))))
@@ -331,7 +411,7 @@
                (rec (get-set-record (arg 0 args)))
                (result '()))
           (if (<= (ms-data-size data) (set-record-size rec))
-              (dolist (v (live-values data))
+              (do-set-live (v data)
                 (when (sr-has rec v) (push v result)))
               (let ((seen (make-ms-data)))
                 (sr-do-keys (k rec)
@@ -344,7 +424,7 @@
                (result (make-ms-data)))
           (dolist (v (live-values data)) (ms-set result v v))
           (if (<= (ms-data-size data) (set-record-size rec))
-              (dolist (v (live-values data)) (when (sr-has rec v) (ms-delete result v)))
+              (do-set-live (v data) (when (sr-has rec v) (ms-delete result v)))
               (sr-do-keys (k rec) (when (ms-find result k) (ms-delete result k))))
           (make-fresh-set realm (loop for e across (ms-data-entries result)
                                       unless (ms-entry-deleted e) collect (ms-entry-value e)))))
@@ -364,7 +444,7 @@
           (let* ((data (ms-this-data this :set-data))
                  (rec (get-set-record (arg 0 args))))
             (when (> (ms-data-size data) (set-record-size rec)) (return-from done *false*))
-            (dolist (v (live-values data))
+            (do-set-live (v data)
               (unless (sr-has rec v) (return-from done *false*)))
             *true*)))
       (def-method realm proto "isSupersetOf" 1 (this args)
@@ -380,11 +460,11 @@
           (let* ((data (ms-this-data this :set-data))
                  (rec (get-set-record (arg 0 args))))
             (if (<= (ms-data-size data) (set-record-size rec))
-                (dolist (v (live-values data))
+                (do-set-live (v data)
                   (when (sr-has rec v) (return-from done *false*)))
                 (sr-do-keys (k rec)
                   (when (ms-find data k) (return-from done *false*))))
-            *true*))))
+            *true*)))))
 
     (def-method realm proto "entries" 0 (this args)
       (make-ms-iterator realm (ms-this-data this :set-data) :key+value))

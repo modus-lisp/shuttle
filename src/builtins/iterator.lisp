@@ -46,18 +46,21 @@
         (js-call ret iterator '())))))
 
 (defmacro %iter-close-on-abrupt (iterator &body body)
-  "Run BODY; if it throws, call iterator.return() (swallowing that return's
-   throw only if BODY didn't throw — here we let BODY's throw win) then re-raise."
+  "Run BODY; if it throws (abrupt completion), IteratorClose the ITERATOR and then
+   re-raise BODY's original throw. Per IfAbruptCloseIterator/IteratorClose: when the
+   incoming completion is a throw, the ORIGINAL throw wins even if return() also
+   throws — return()'s throw is swallowed."
   (let ((it (gensym)) (e (gensym)))
     `(let ((,it ,iterator))
        (handler-case (progn ,@body)
          (shuttle-error (,e)
-           ;; IfAbruptCloseIterator: try to close; if return() itself throws,
-           ;; that new throw replaces the original (spec: return the abrupt
-           ;; completion from the close). Otherwise re-raise the original.
+           ;; IteratorClose with an abrupt (throw) incoming completion: call
+           ;; return() for side effects, but discard any throw it produces so the
+           ;; original completion (,e) propagates.
            (let ((ret (and (js-object-p ,it) (js-get ,it "return"))))
              (when (and ret (not (js-null-or-undef ret)) (js-callable-p ret))
-               (js-call ret ,it '())))   ; if this throws, it propagates (replaces)
+               (handler-case (js-call ret ,it '())
+                 (shuttle-error () nil))))
            (error ,e))))))
 
 (defun %iter-step-value (iterator next)
@@ -118,19 +121,27 @@
    STEP is a form evaluated on each next() that returns (values value done-p).
    CLOSE is a form run when the helper is closed early / exhausted (calls the
    underlying .return())."
-  (let ((r (gensym)) (hp (gensym)) (obj (gensym)) (donef (gensym))
+  (let ((r (gensym)) (hp (gensym)) (obj (gensym)) (donef (gensym)) (runningf (gensym))
         (this (gensym)) (args (gensym)) (v (gensym)) (d (gensym)))
-    `(let* ((,r ,realm) (,hp ,helper-proto) (,donef nil) ,@bindings
+    `(let* ((,r ,realm) (,hp ,helper-proto) (,donef nil) (,runningf nil) ,@bindings
             (,obj (make-object :proto ,hp :class "Iterator Helper")))
        (put ,obj "next"
             (native-function ,r "next"
               (lambda (,this ,args) (declare (ignore ,this ,args))
+                ;; Generator-brand re-entrancy check: calling next() while the
+                ;; helper is already running (e.g. the mapper called it) is a
+                ;; TypeError (spec: GeneratorValidate state = executing).
+                (when ,runningf
+                  (js-throw (make-native-error "TypeError" "Iterator helper is already running")))
                 (let ((res (make-object :proto (realm-object-proto ,r))))
                   (if ,donef
                       (progn (put res "value" *undefined*) (put res "done" *true*))
                       (multiple-value-bind (,v ,d)
-                          (handler-case ,step
-                            (shuttle-error (e) (setf ,donef t) (error e)))
+                          (progn (setf ,runningf t)
+                                 (unwind-protect
+                                      (handler-case ,step
+                                        (shuttle-error (e) (setf ,donef t) (error e)))
+                                   (setf ,runningf nil)))
                         (if ,d
                             (progn (setf ,donef t)
                                    (put res "value" *undefined*) (put res "done" *true*))
@@ -376,6 +387,34 @@
                   (return v))
                 (incf i)))))))
 
+    ;; ---- %WrapForValidIteratorPrototype% shared next/return (Iterator.from) ----
+    ;; Wrappers carry the underlying iterator under :wrap-iterated and its .next
+    ;; method under :wrap-next. next/return are shared prototype methods that
+    ;; RequireInternalSlot([[Iterated]]).
+    (flet ((wrap-slot (this)
+             (let ((it (and (js-object-p this) (js-object-internal this)
+                            (getf (js-object-internal this) :wrap-iterated))))
+               (unless it
+                 (js-throw (make-native-error "TypeError"
+                             "method called on incompatible receiver (not a wrapper)")))
+               it)))
+      (def-method realm wrap-proto "next" 0 (this args)
+        (declare (ignore args))
+        (let ((it (wrap-slot this))
+              (next (getf (js-object-internal this) :wrap-next)))
+          (js-call next it '())))
+      (def-method realm wrap-proto "return" 0 (this args)
+        (declare (ignore args))
+        (let* ((it (wrap-slot this))
+               (ret (js-get it "return")))
+          (if (js-null-or-undef ret)
+              (let ((res (make-object :proto (realm-object-proto realm))))
+                (put res "value" *undefined*) (put res "done" *true*) res)
+              (progn
+                (unless (js-callable-p ret)
+                  (js-throw (make-native-error "TypeError" "return is not a function")))
+                (js-call ret it '()))))))
+
     ;; ---- Iterator.prototype[@@toStringTag] getter/setter (SetterThatIgnoresPrototypeProperties) ----
     (let ((getter (native-function realm "get [Symbol.toStringTag]"
                     (lambda (this args) (declare (ignore this args)) "Iterator") 0))
@@ -428,21 +467,9 @@
           ;; If it already inherits from %IteratorPrototype%, return it directly.
           (if (%inherits-from it iproto)
               it
-              ;; else wrap in %WrapForValidIteratorPrototype%
-              (let ((wrap (make-object :proto wrap-proto :class "Iterator")))
-                (def-method realm wrap "next" 0 (wthis wargs)
-                  (declare (ignore wthis wargs))
-                  (js-call next it '()))
-                (def-method realm wrap "return" 0 (wthis wargs)
-                  (declare (ignore wthis wargs))
-                  (let ((ret (js-get it "return")) (res (make-object :proto (realm-object-proto realm))))
-                    (if (js-null-or-undef ret)
-                        (progn (put res "value" *undefined*) (put res "done" *true*) res)
-                        (progn
-                          (unless (js-callable-p ret)
-                            (js-throw (make-native-error "TypeError" "return is not a function")))
-                          (js-call ret it '())))))
-                wrap))))
+              ;; else wrap in %WrapForValidIteratorPrototype% with [[Iterated]]/[[Next]]
+              (make-object :proto wrap-proto :class "Iterator"
+                           :internal (list :wrap-iterated it :wrap-next next)))))
 
       (define-global realm "Iterator" ctor)
       ;; define-global installs the property as enumerable; spec built-in globals

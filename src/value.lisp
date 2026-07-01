@@ -91,7 +91,8 @@
     ((js-object-p o)
      (let ((d (gethash (prop-key key) (js-object-props o))))
        (cond (d (if (prop-accessor d)
-                    (if (prop-get d) (js-call (prop-get d) receiver '()) *undefined*)
+                    (let ((g (prop-get d)))
+                      (if (and g (not (js-undefined-p g))) (js-call g receiver '()) *undefined*))
                     (prop-value d)))
              ((js-object-p (js-object-proto o)) (js-get (js-object-proto o) key receiver))
              (t *undefined*))))
@@ -134,6 +135,17 @@
 (defun array-length (o)
   (let ((ld (gethash "length" (js-object-props o)))) (if ld (truncate (prop-value ld)) 0)))
 
+(defun %array-indices->=  (o newlen)
+  "Present own array-index integers of O that are >= NEWLEN, in DESCENDING order.
+   Iterates the property table (not the 0..2^32 range), so shrinking a sparse
+   array is cheap regardless of how large its length is."
+  (let ((idxs '()))
+    (maphash (lambda (k v) (declare (ignore v))
+               (when (and (stringp k) (array-index-string-p k))
+                 (let ((i (parse-integer k))) (when (>= i newlen) (push i idxs)))))
+             (js-object-props o))
+    (sort idxs #'>)))
+
 (defun array-set-length (o v)
   "Array exotic [[Set]] \"length\": coerce to uint32 (RangeError on mismatch);
    when shrinking, delete indices >= new length (highest first, honoring
@@ -144,14 +156,13 @@
       (when (and ld (not (prop-writable ld))) (return-from array-set-length *false*))
       (let ((oldlen (if ld (truncate (prop-value ld)) 0)))
         (when (< newlen oldlen)
-          (loop for i from (1- oldlen) downto newlen
-                for k = (princ-to-string i)
-                for d = (gethash k (js-object-props o))
-                when d do
-                  (if (prop-configurable d)
-                      (progn (remhash k (js-object-props o)) (%key-forget o k))
-                      (progn (when ld (setf (prop-value ld) (float (1+ i) 1d0)))
-                             (return-from array-set-length *false*)))))
+          (dolist (i (%array-indices->= o newlen))
+            (let ((k (princ-to-string i)) (d nil))
+              (setf d (gethash k (js-object-props o)))
+              (if (prop-configurable d)
+                  (progn (remhash k (js-object-props o)) (%key-forget o k))
+                  (progn (when ld (setf (prop-value ld) (float (1+ i) 1d0)))
+                         (return-from array-set-length *false*))))))
         (if ld (setf (prop-value ld) (float newlen 1d0))
             (put o "length" (float newlen 1d0) :enumerable nil))
         *true*))))
@@ -167,23 +178,32 @@
     (let ((proto (primitive-proto o)))
       (return-from ordinary-set (if (js-object-p proto) (js-set proto key v o) *false*))))
   ;; ---- Array exotic [[Set]]: length maintenance ----
+  ;; Only the length property and the index fast-path (own writable-data /
+  ;; absent index that extends length) are special-cased here. An index that
+  ;; already holds an own accessor or a non-writable data property falls
+  ;; through to the ordinary logic below, so its setter runs / write is rejected.
   (when (and (js-array-p o) (eq o receiver))
     (let ((k (prop-key key)))
       (when (stringp k)
         (cond ((string= k "length") (return-from ordinary-set (array-set-length o v)))
               ((array-index-string-p k)
-               (let* ((idx (parse-integer k)) (len (array-length o))
-                      (ld (gethash "length" (js-object-props o))))
-                 (when (and ld (not (prop-writable ld)) (>= idx len))
-                   (return-from ordinary-set *false*))
-                 (let ((res (%create-data-on-receiver o k v)))
-                   (when (and (eq res *true*) ld (>= idx len))
-                     (setf (prop-value ld) (float (1+ idx) 1d0)))
-                   (return-from ordinary-set res))))))))
+               (let ((own (gethash k (js-object-props o))))
+                 (when (or (null own) (and (not (prop-accessor own)) (prop-writable own)))
+                   (let* ((idx (parse-integer k)) (len (array-length o))
+                          (ld (gethash "length" (js-object-props o))))
+                     (when (and ld (not (prop-writable ld)) (>= idx len))
+                       (return-from ordinary-set *false*))
+                     (let ((res (%create-data-on-receiver o k v)))
+                       (when (and (eq res *true*) ld (>= idx len))
+                         (setf (prop-value ld) (float (1+ idx) 1d0)))
+                       (return-from ordinary-set res))))))))))
   (let* ((k (prop-key key)) (d (gethash k (js-object-props o))))
     (cond
       ((and d (prop-accessor d))
-       (if (prop-set d) (progn (js-call (prop-set d) receiver (list v)) *true*) *false*))
+       (let ((s (prop-set d)))
+         (if (and s (not (js-undefined-p s)))
+             (progn (js-call s receiver (list v)) *true*)
+             *false*)))
       ((and d (not (prop-writable d))) *false*)
       (d (if (eq o receiver)
              (progn (setf (prop-value d) v) *true*)
@@ -256,19 +276,84 @@
       (if tr (funcall tr o (prop-key key))
           (gethash (prop-key key) (js-object-props o))))))
 
+(defun array-define-length (o desc)
+  "ArraySetLength(A, Desc): the Array exotic [[DefineOwnProperty]] for \"length\".
+   Returns T/NIL."
+  ;; No [[Value]] field: only attributes change (writable/enumerable/configurable).
+  (unless (present-p desc :value)
+    (return-from array-define-length (ordinary-define-own-property o "length" desc)))
+  (let* ((val (getf desc :value))
+         (newlen (to-uint32 val))
+         (numlen (to-number val)))
+    (unless (= newlen numlen) (js-throw (make-native-error "RangeError" "Invalid array length")))
+    (let* ((ld (gethash "length" (js-object-props o)))
+           (oldlen (if ld (truncate (prop-value ld)) 0))
+           ;; newLenDesc: same as desc but value coerced to newlen
+           (newdesc (let ((d (copy-list desc))) (setf (getf d :value) (float newlen 1d0)) d)))
+      (when (>= newlen oldlen)
+        (return-from array-define-length (ordinary-define-own-property o "length" newdesc)))
+      (when (and ld (not (prop-writable ld)))
+        (return-from array-define-length nil))
+      ;; Decide new writability; defer making it non-writable until after shrink.
+      (let ((new-writable (or (not (present-p newdesc :writable)) (getf newdesc :writable))))
+        (unless new-writable (setf (getf newdesc :writable) t))
+        (unless (ordinary-define-own-property o "length" newdesc)
+          (return-from array-define-length nil))
+        ;; Delete present indices >= newlen, highest first, honoring
+        ;; non-configurable. Iterate existing keys only (sparse-safe).
+        (dolist (i (%array-indices->= o newlen))
+          (let* ((kk (princ-to-string i)) (d (gethash kk (js-object-props o))))
+            (if (prop-configurable d)
+                (progn (remhash kk (js-object-props o)) (%key-forget o kk))
+                (progn
+                  (let ((ld2 (gethash "length" (js-object-props o))))
+                    (when ld2 (setf (prop-value ld2) (float (1+ i) 1d0))))
+                  (unless new-writable
+                    (ordinary-define-own-property o "length" (list :writable nil)))
+                  (return-from array-define-length nil)))))
+        (unless new-writable
+          (ordinary-define-own-property o "length" (list :writable nil)))
+        t))))
+
+(defun array-define-own-property (o key desc)
+  "Array exotic [[DefineOwnProperty]]: special-cases \"length\" and array indices."
+  (let ((k (prop-key key)))
+    (cond
+      ((and (stringp k) (string= k "length")) (array-define-length o desc))
+      ((and (stringp k) (array-index-string-p k))
+       (let* ((index (parse-integer k))
+              (ld (gethash "length" (js-object-props o)))
+              (oldlen (if ld (truncate (prop-value ld)) 0)))
+         (when (and (>= index oldlen) ld (not (prop-writable ld)))
+           (return-from array-define-own-property nil))
+         (unless (ordinary-define-own-property o k desc)
+           (return-from array-define-own-property nil))
+         (when (>= index oldlen)
+           (let ((ld2 (gethash "length" (js-object-props o))))
+             (if ld2 (setf (prop-value ld2) (float (1+ index) 1d0))
+                 (put o "length" (float (1+ index) 1d0) :enumerable nil))))
+         t))
+      (t (ordinary-define-own-property o k desc)))))
+
 (defun js-define-own-property (o key desc)
   "[[DefineOwnProperty]]. DESC is a PROP-like plist of the FIELDS THAT ARE
    PRESENT (:value/:get/:set/:writable/:enumerable/:configurable/:accessor).
    Returns T on success, NIL on rejection (caller decides throw vs silent)."
   (let ((tr (and (js-object-internal o) (getf (js-object-internal o) :define-own-property))))
     (when tr (return-from js-define-own-property (funcall tr o (prop-key key) desc))))
+  (when (js-array-p o)
+    (return-from js-define-own-property (array-define-own-property o key desc)))
+  (ordinary-define-own-property o key desc))
+
+(defun ordinary-define-own-property (o key desc)
+  "OrdinaryDefineOwnProperty (no exotic dispatch). Returns T/NIL."
   (let* ((k (prop-key key)) (cur (gethash k (js-object-props o)))
          (accessor (if (present-p desc :accessor) (getf desc :accessor)
                        (or (present-p desc :get) (present-p desc :set)))))
     (cond
       ;; new property
       ((null cur)
-       (unless (js-object-extensible o) (return-from js-define-own-property nil))
+       (unless (js-object-extensible o) (return-from ordinary-define-own-property nil))
        (let ((p (if accessor
                     (make-prop :accessor t
                                :get (if (present-p desc :get) (getf desc :get) *undefined*)
@@ -281,42 +366,47 @@
                                :configurable (and (present-p desc :configurable) (getf desc :configurable))))))
          (setf (gethash k (js-object-props o)) p) (%key-touch o k) t))
       ;; existing property — validate against configurable
+      ;; (ValidateAndApplyPropertyDescriptor). DESC's descriptor "kind":
+      ;;   data     = has :value or :writable
+      ;;   accessor = has :get or :set
+      ;;   generic  = neither (only enumerable/configurable, or empty)
       (t
-       (let ((cfg (prop-configurable cur)))
+       (let* ((cfg (prop-configurable cur))
+              (desc-data (or (present-p desc :value) (present-p desc :writable)))
+              (desc-acc  (or (present-p desc :get) (present-p desc :set)))
+              (cur-acc   (prop-accessor cur)))
          ;; reject illegal changes on a non-configurable property
          (when (not cfg)
            (when (and (present-p desc :configurable) (getf desc :configurable))
-             (return-from js-define-own-property nil))
+             (return-from ordinary-define-own-property nil))
            (when (and (present-p desc :enumerable)
                       (not (eq (and (getf desc :enumerable) t) (prop-enumerable cur))))
-             (return-from js-define-own-property nil))
-           (when (and (present-p desc :accessor) (not (eq accessor (prop-accessor cur))))
-             (return-from js-define-own-property nil))
-           (if (prop-accessor cur)
+             (return-from ordinary-define-own-property nil))
+           ;; changing the descriptor kind (data<->accessor) is forbidden
+           (when (or (and desc-acc (not cur-acc)) (and desc-data cur-acc))
+             (return-from ordinary-define-own-property nil))
+           (if cur-acc
                (progn
                  (when (and (present-p desc :get) (not (eq (getf desc :get) (or (prop-get cur) *undefined*))))
-                   (return-from js-define-own-property nil))
+                   (return-from ordinary-define-own-property nil))
                  (when (and (present-p desc :set) (not (eq (getf desc :set) (or (prop-set cur) *undefined*))))
-                   (return-from js-define-own-property nil)))
-               (progn
-                 (when (not (prop-writable cur))
-                   (when (and (present-p desc :writable) (getf desc :writable))
-                     (return-from js-define-own-property nil))
-                   (when (and (present-p desc :value)
-                              (not (same-value (getf desc :value) (prop-value cur))))
-                     (return-from js-define-own-property nil))))))
-         ;; apply
-         (when (present-p desc :accessor)
-           (if accessor
-               (setf (prop-accessor cur) t (prop-value cur) *undefined*
-                     (prop-writable cur) t
-                     (prop-get cur) (if (present-p desc :get) (getf desc :get) (prop-get cur))
-                     (prop-set cur) (if (present-p desc :set) (getf desc :set) (prop-set cur)))
-               (setf (prop-accessor cur) nil (prop-get cur) nil (prop-set cur) nil
-                     (prop-value cur) (if (present-p desc :value) (getf desc :value) *undefined*)
-                     (prop-writable cur) (and (present-p desc :writable) (getf desc :writable)))))
-         (when (present-p desc :get) (setf (prop-get cur) (getf desc :get) (prop-accessor cur) t))
-         (when (present-p desc :set) (setf (prop-set cur) (getf desc :set) (prop-accessor cur) t))
+                   (return-from ordinary-define-own-property nil)))
+               ;; current is data; if also non-writable, value/writable are locked
+               (when (not (prop-writable cur))
+                 (when (and (present-p desc :writable) (getf desc :writable))
+                   (return-from ordinary-define-own-property nil))
+                 (when (and (present-p desc :value)
+                            (not (same-value (getf desc :value) (prop-value cur))))
+                   (return-from ordinary-define-own-property nil)))))
+         ;; apply — first, a kind change resets the unrelated fields to defaults
+         (when (and desc-acc (not cur-acc))
+           (setf (prop-accessor cur) t (prop-value cur) *undefined* (prop-writable cur) nil
+                 (prop-get cur) *undefined* (prop-set cur) *undefined*))
+         (when (and desc-data cur-acc)
+           (setf (prop-accessor cur) nil (prop-get cur) nil (prop-set cur) nil
+                 (prop-value cur) *undefined* (prop-writable cur) nil))
+         (when (present-p desc :get) (setf (prop-get cur) (getf desc :get)))
+         (when (present-p desc :set) (setf (prop-set cur) (getf desc :set)))
          (when (present-p desc :value) (setf (prop-value cur) (getf desc :value)))
          (when (present-p desc :writable) (setf (prop-writable cur) (and (getf desc :writable) t)))
          (when (present-p desc :enumerable) (setf (prop-enumerable cur) (and (getf desc :enumerable) t)))

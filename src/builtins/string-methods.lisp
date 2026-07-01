@@ -52,8 +52,57 @@
               (t (write-char ch out) (incf i)))))
     (get-output-stream-string out)))
 
+;;; --- ES whitespace / line-terminator set (WhiteSpace + LineTerminator) -------
+;;; The kernel's +js-ws+ (value.lisp) omits several Unicode Zs code points
+;;; (U+1680, U+2000..U+200A, U+202F, U+205F, U+3000). trim/trimStart/trimEnd
+;;; below use this fuller set and OVERRIDE the kernel installers.
+(defparameter +str-ws-chars+
+  (mapcar #'code-char
+          '(#x0009 #x000A #x000B #x000C #x000D #x0020 #x00A0 #x1680
+            #x2000 #x2001 #x2002 #x2003 #x2004 #x2005 #x2006 #x2007
+            #x2008 #x2009 #x200A #x2028 #x2029 #x202F #x205F #x3000
+            #xFEFF)))
+
+(defun str-integer-or-inf (v)
+  "ToIntegerOrInfinity as an exact CL rational/keyword: real number, :+inf, :-inf.
+   Unlike to-int-index (realm.lisp) this preserves +/-Infinity so callers can
+   clamp against length correctly."
+  (let ((n (to-number v)))
+    (cond ((js-nan-p n) 0)
+          ((= n *inf*) :+inf)
+          ((= n *-inf*) :-inf)
+          (t (truncate n)))))
+
+(defun str-clamp-pos (v len)
+  "min(max(ToIntegerOrInfinity(v),0),len) -> a CL fixnum in [0,len]."
+  (let ((n (str-integer-or-inf v)))
+    (cond ((eq n :+inf) len)
+          ((eq n :-inf) 0)
+          ((< n 0) 0)
+          ((> n len) len)
+          (t n))))
+
+(defun str-is-regexp-p (v)
+  "IsRegExp: object whose @@match is truthy (or undefined @@match + RegExp exotic)."
+  (and (js-object-p v)
+       (let ((m (and (boundp '*symbol-match*) (symbol-value '*symbol-match*)
+                     (js-get v (symbol-value '*symbol-match*)))))
+         (if (or (null m) (js-undefined-p m))
+             (and (fboundp 'regexp-object-p) (funcall 'regexp-object-p v))
+             (js-truthy m)))))
+
+(defun str-reject-regexp (v method)
+  (when (str-is-regexp-p v)
+    (js-throw (make-native-error "TypeError"
+                (format nil "First argument to String.prototype.~a must not be a regular expression" method)))))
+
 (defun install-string-methods (realm)
   (let ((sp (realm-string-proto realm)))
+    ;; String.prototype is a String exotic object with [[StringData]] = "".
+    ;; The kernel makes it a plain object; set its primitive so toString/valueOf
+    ;; (and ToPrimitive via ==) treat it as the empty string.
+    (unless (stringp (js-object-primitive sp))
+      (setf (js-object-primitive sp) ""))
     (macrolet ((sm (name len (s args) &body body)
                  `(def-method realm sp ,name ,len (this ,args)
                     (require-object-coercible this)
@@ -87,7 +136,121 @@
       ;; String.prototype.toWellFormed() — lone surrogates -> U+FFFD.
       (sm "toWellFormed" 0 (s args)
         (declare (ignore args))
-        (string-to-well-formed s)))
+        (string-to-well-formed s))
+
+      ;; --- OVERRIDES of kernel methods (installers run after install-string) ---
+
+      ;; trim/trimStart/trimEnd — kernel's +js-ws+ misses several Zs code points.
+      (sm "trim" 0 (s args) (declare (ignore args)) (string-trim +str-ws-chars+ s))
+      (sm "trimStart" 0 (s args) (declare (ignore args)) (string-left-trim +str-ws-chars+ s))
+      (sm "trimEnd" 0 (s args) (declare (ignore args)) (string-right-trim +str-ws-chars+ s))
+
+      ;; indexOf — kernel clamps +Infinity position to 0; must clamp to len.
+      ;; Order: ToString(this) [sm], ToString(search), ToIntegerOrInfinity(pos).
+      (sm "indexOf" 1 (s args)
+        (let* ((sub (to-string (arg 0 args)))
+               (len (length s))
+               (from (str-clamp-pos (arg 1 args) len))
+               (p (search sub s :start2 (min from len))))
+          (if p (float p 1d0) -1d0)))
+
+      ;; lastIndexOf — kernel ignores position; per spec ToNumber(position) must
+      ;; run (and can throw) between ToString(search) and the search itself.
+      (sm "lastIndexOf" 1 (s args)
+        (let* ((sub (to-string (arg 0 args)))
+               (len (length s))
+               (numpos (to-number (arg 1 args)))     ; ? ToNumber(position)
+               (end (cond ((js-nan-p numpos) len)     ; NaN -> +Infinity -> len
+                          ((= numpos *inf*) len)
+                          ((= numpos *-inf*) 0)
+                          (t (min (max (truncate numpos) 0) len))))
+               ;; search may start at index end (inclusive), so end2 = end+sublen
+               (limit (min len (+ end (length sub))))
+               (p (search sub s :from-end t :end2 limit)))
+          (if p (float p 1d0) -1d0)))
+
+      ;; includes — kernel ignores position and doesn't reject RegExp arg.
+      (sm "includes" 1 (s args)
+        (str-reject-regexp (arg 0 args) "includes")
+        (let* ((sub (to-string (arg 0 args)))
+               (len (length s))
+               (start (str-clamp-pos (arg 1 args) len)))
+          (js-bool (search sub s :start2 start))))
+
+      ;; startsWith — reject RegExp arg; ToIntegerOrInfinity for position.
+      (sm "startsWith" 1 (s args)
+        (str-reject-regexp (arg 0 args) "startsWith")
+        (let* ((sub (to-string (arg 0 args)))
+               (len (length s))
+               (pos (str-clamp-pos (arg 1 args) len)))
+          (js-bool (and (<= (+ pos (length sub)) len)
+                        (string= sub s :start2 pos :end2 (+ pos (length sub)))))))
+
+      ;; endsWith — reject RegExp arg; clamp endPosition to [0,len].
+      (sm "endsWith" 1 (s args)
+        (str-reject-regexp (arg 0 args) "endsWith")
+        (let* ((sub (to-string (arg 0 args)))
+               (len (length s))
+               (end (if (js-undefined-p (arg 1 args)) len (str-clamp-pos (arg 1 args) len)))
+               (start (- end (length sub))))
+          (js-bool (and (>= start 0)
+                        (string= sub s :start2 start :end2 end)))))
+
+      ;; slice — kernel's clamp-index collapses +/-Infinity to 0.
+      (sm "slice" 2 (s args)
+        (let* ((len (length s))
+               (from (let ((n (str-integer-or-inf (arg 0 args))))
+                       (cond ((eq n :+inf) len) ((eq n :-inf) 0)
+                             ((< n 0) (max (+ len n) 0)) (t (min n len)))))
+               (to (if (js-undefined-p (arg 1 args)) len
+                       (let ((n (str-integer-or-inf (arg 1 args))))
+                         (cond ((eq n :+inf) len) ((eq n :-inf) 0)
+                               ((< n 0) (max (+ len n) 0)) (t (min n len)))))))
+          (if (< from to) (subseq s from to) "")))
+
+      ;; substring — kernel's to-int-index collapses +Infinity to 0.
+      (sm "substring" 2 (s args)
+        (let* ((len (length s))
+               (a (let ((n (str-integer-or-inf (arg 0 args))))
+                    (cond ((eq n :+inf) len) ((eq n :-inf) 0) (t (min (max n 0) len)))))
+               (b (if (js-undefined-p (arg 1 args)) len
+                      (let ((n (str-integer-or-inf (arg 1 args))))
+                        (cond ((eq n :+inf) len) ((eq n :-inf) 0) (t (min (max n 0) len)))))))
+          (subseq s (min a b) (max a b))))
+
+      ;; codePointAt — kernel returns the raw code unit; must decode surrogate
+      ;; pairs and return undefined for out-of-range position.
+      (sm "codePointAt" 1 (s args)
+        (let* ((len (length s))
+               (n (str-integer-or-inf (arg 0 args))))
+          (if (or (eq n :-inf) (and (integerp n) (< n 0))
+                  (eq n :+inf) (and (integerp n) (>= n len)))
+              *undefined*
+              (let ((cc (char-code (char s n))))
+                (if (and (lead-surrogate-p cc) (< (1+ n) len)
+                         (trail-surrogate-p (char-code (char s (1+ n)))))
+                    (let ((tc (char-code (char s (1+ n)))))
+                      (float (+ #x10000 (ash (- cc #xD800) 10) (- tc #xDC00)) 1d0))
+                    (float cc 1d0))))))
+
+      ;; repeat — kernel uses to-int-index (drops +Infinity to 0); +Infinity and
+      ;; negative counts must throw RangeError.
+      (sm "repeat" 1 (s args)
+        (let ((n (str-integer-or-inf (arg 0 args))))
+          (when (or (eq n :+inf) (eq n :-inf) (and (integerp n) (< n 0)))
+            (js-throw (make-native-error "RangeError" "Invalid count value")))
+          (with-output-to-string (o) (dotimes (i n) (write-string s o))))))
+
+    ;; --- toString / valueOf: must be String or String box, else TypeError. ---
+    ;; (kernel's this-string coerces numbers/booleans instead of throwing.)
+    (flet ((str-this-value (this what)
+             (cond ((stringp this) this)
+                   ((and (js-object-p this) (stringp (js-object-primitive this)))
+                    (js-object-primitive this))
+                   (t (js-throw (make-native-error "TypeError"
+                                  (format nil "String.prototype.~a requires that 'this' be a String" what)))))))
+      (def-method realm sp "toString" 0 (this args) (declare (ignore args)) (str-this-value this "toString"))
+      (def-method realm sp "valueOf" 0 (this args) (declare (ignore args)) (str-this-value this "valueOf")))
 
     ;; --- statics on the String constructor ------------------------------------
     (let ((ctor (js-get (realm-global realm) "String")))

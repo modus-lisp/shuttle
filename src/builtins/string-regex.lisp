@@ -3,13 +3,16 @@
 ;;;; builtins/regexp.lisp.
 (in-package #:shuttle)
 
-;;; Dispatch helper: obj[@@sym](args...) if present+callable -> (values result T),
-;;; else (values nil nil).
+;;; Dispatch helper implementing GetMethod(obj, sym) + Call semantics:
+;;;   - property undefined/null -> method absent -> (values nil nil)
+;;;   - property present but not callable -> TypeError (GetMethod step 3)
+;;;   - callable -> Call(method, obj, «this-arg, method-args…») -> (values r T)
 (defun call-symbol-method (obj sym this-arg &rest method-args)
   (let ((m (js-get obj sym)))
-    (if (js-callable-p m)
-        (values (js-call m obj (cons this-arg method-args)) t)
-        (values nil nil))))
+    (cond
+      ((js-null-or-undef m) (values nil nil))
+      ((js-callable-p m) (values (js-call m obj (cons this-arg method-args)) t))
+      (t (js-throw (make-native-error "TypeError" "method is not callable"))))))
 
 (defun regexp-like-p (v)
   "IsRegExp: has @@match truthy, or is a RegExp exotic."
@@ -29,7 +32,7 @@
         (require-object-coercible this)
         (let ((regexp (arg 0 args)))
           (when (js-object-p regexp)
-            (multiple-value-bind (r present) (call-symbol-method regexp *symbol-match* (to-string this))
+            (multiple-value-bind (r present) (call-symbol-method regexp *symbol-match* this)
               (when present (return-from done r))))
           (let ((s (to-string this))
                 (rx (make-regexp-object realm (if (js-undefined-p regexp) "" (to-string regexp)) "")))
@@ -45,7 +48,7 @@
               (unless (find #\g (to-string flags))
                 (js-throw (make-native-error "TypeError" "matchAll must be called with a global RegExp")))))
           (when (js-object-p regexp)
-            (multiple-value-bind (r present) (call-symbol-method regexp *symbol-match-all* (to-string this))
+            (multiple-value-bind (r present) (call-symbol-method regexp *symbol-match-all* this)
               (when present (return-from done r))))
           (let ((s (to-string this))
                 (rx (make-regexp-object realm (if (js-undefined-p regexp) "" (to-string regexp)) "g")))
@@ -56,7 +59,7 @@
         (require-object-coercible this)
         (let ((regexp (arg 0 args)))
           (when (js-object-p regexp)
-            (multiple-value-bind (r present) (call-symbol-method regexp *symbol-search* (to-string this))
+            (multiple-value-bind (r present) (call-symbol-method regexp *symbol-search* this)
               (when present (return-from done r))))
           (let ((s (to-string this))
                 (rx (make-regexp-object realm (if (js-undefined-p regexp) "" (to-string regexp)) "")))
@@ -67,7 +70,7 @@
         (require-object-coercible this)
         (let ((separator (arg 0 args)) (limit (arg 1 args)))
           (when (js-object-p separator)
-            (multiple-value-bind (r present) (call-symbol-method separator *symbol-split* (to-string this) limit)
+            (multiple-value-bind (r present) (call-symbol-method separator *symbol-split* this limit)
               (when present (return-from done r))))
           (string-split realm (to-string this) separator limit))))
     ;; ---- replace ----
@@ -76,7 +79,7 @@
         (require-object-coercible this)
         (let ((search-value (arg 0 args)) (replace-value (arg 1 args)))
           (when (js-object-p search-value)
-            (multiple-value-bind (r present) (call-symbol-method search-value *symbol-replace* (to-string this) replace-value)
+            (multiple-value-bind (r present) (call-symbol-method search-value *symbol-replace* this replace-value)
               (when present (return-from done r))))
           (string-replace-plain realm (to-string this) search-value replace-value nil))))
     ;; ---- replaceAll ----
@@ -90,7 +93,7 @@
               (unless (find #\g (to-string flags))
                 (js-throw (make-native-error "TypeError" "replaceAll must be called with a global RegExp")))))
           (when (js-object-p search-value)
-            (multiple-value-bind (r present) (call-symbol-method search-value *symbol-replace* (to-string this) replace-value)
+            (multiple-value-bind (r present) (call-symbol-method search-value *symbol-replace* this replace-value)
               (when present (return-from done r))))
           (string-replace-plain realm (to-string this) search-value replace-value t))))))
 

@@ -169,8 +169,10 @@
           (pad2 (hours-from-time tv)) (pad2 (min-from-time tv)) (pad2 (sec-from-time tv))))
 
 (defun timezone-string (tv)
+  ;; TimeZoneString: signed 4-digit offset + descriptive name. TimeString already
+  ;; contributes the trailing " GMT", so this begins at the offset. Offset 0 (UTC).
   (declare (ignore tv))
-  "GMT+0000 (Coordinated Universal Time)")
+  "+0000 (Coordinated Universal Time)")
 
 (defun to-date-string-full (tv)
   (if (date-finite-p tv)
@@ -466,22 +468,29 @@
         ;; component this method sets. Slots < INDEX keep the existing value; the
         ;; slot at INDEX (arg 0) and following supplied args override.
         (flet ((set-time-part (this args index)
-                 ;; Read the time value first, then coerce every supplied arg in
-                 ;; order (observable via valueOf), THEN compute. When tv is NaN
-                 ;; the missing slots are NaN, so the result stays NaN.
+                 ;; Read the time value (t) FIRST (thisTimeValue), then coerce the
+                 ;; args in order (observable via valueOf). The leading slot (at
+                 ;; INDEX, i.e. arg 0) is ALWAYS ToNumber'd — even with zero args
+                 ;; ToNumber(undefined)=NaN. Subsequent slots are coerced only when
+                 ;; explicitly supplied. Per spec, if t is NaN the method returns
+                 ;; NaN WITHOUT updating [[DateValue]] (a valueOf side-effect that
+                 ;; set the date must survive).
                  (let* ((tv (date-tv this))
-                        ;; coerce provided args left-to-right into a vector by slot
                         (supplied (make-array 4 :initial-element nil)))
-                   (loop for j from index below 4
+                   ;; leading slot always coerced (arg 0 -> undefined when absent)
+                   (setf (aref supplied index) (to-number (arg 0 args)))
+                   (loop for j from (1+ index) below 4
                          for ai = (- j index)
                          while (< ai (length args))
                          do (setf (aref supplied j) (to-number (arg ai args))))
-                   (let* ((h  (or (aref supplied 0) (hours-from-time tv)))
-                          (mi (or (aref supplied 1) (min-from-time tv)))
-                          (s  (or (aref supplied 2) (sec-from-time tv)))
-                          (ms (or (aref supplied 3) (ms-from-time tv))))
-                     (set-date-tv this
-                                  (time-clip (make-date (day tv) (make-time h mi s ms))))))))
+                   (if (not (date-finite-p tv))
+                       *nan*
+                       (let* ((h  (or (aref supplied 0) (hours-from-time tv)))
+                              (mi (or (aref supplied 1) (min-from-time tv)))
+                              (s  (or (aref supplied 2) (sec-from-time tv)))
+                              (ms (or (aref supplied 3) (ms-from-time tv))))
+                         (set-date-tv this
+                                      (time-clip (make-date (day tv) (make-time h mi s ms)))))))))
           (def-method realm dp "setMilliseconds" 1 (this args) (set-time-part this args 3))
           (def-method realm dp "setUTCMilliseconds" 1 (this args) (set-time-part this args 3))
           (def-method realm dp "setSeconds" 2 (this args) (set-time-part this args 2))
@@ -493,22 +502,29 @@
 
         ;; date-portion setters: setDate/setMonth/setFullYear
         (flet ((set-date-part (this args which)
-                 ;; setFullYear: if t is NaN, use +0. setDate/setMonth: t stays NaN
-                 ;; (existing components read as NaN -> result NaN). Coerce all
-                 ;; supplied args (left-to-right) before computing.
+                 ;; Read t FIRST (thisTimeValue). Then coerce every supplied arg in
+                 ;; source order (observable via valueOf); leading slots are always
+                 ;; coerced. setFullYear: if t is NaN use +0 as the time base and
+                 ;; still write. setDate/setMonth: if t is NaN, return NaN WITHOUT
+                 ;; writing [[DateValue]] (a valueOf side-effect must survive).
                  (let* ((tv (date-tv this))
-                        ;; For setFullYear the year is always supplied; substitute +0
-                        ;; for the time base when tv is NaN.
                         (base (if (and (eq which :year) (not (date-finite-p tv))) 0d0 tv))
-                        (yr (if (eq which :year) (to-number (arg 0 args)) (year-from-time base)))
-                        (mo (cond ((eq which :year) (if (>= (length args) 2) (to-number (arg 1 args)) (month-from-time base)))
-                                  ((eq which :month) (to-number (arg 0 args)))
-                                  (t (month-from-time base))))
-                        (dt (cond ((eq which :year) (if (>= (length args) 3) (to-number (arg 2 args)) (date-from-time base)))
-                                  ((eq which :month) (if (>= (length args) 2) (to-number (arg 1 args)) (date-from-time base)))
-                                  (t (to-number (arg 0 args)))))
-                        (time (time-within-day base)))
-                   (set-date-tv this (time-clip (make-date (make-day yr mo dt) time))))))
+                        ;; Coerce supplied args left-to-right regardless of NaN base.
+                        (a-year  (when (eq which :year) (to-number (arg 0 args))))
+                        (a-mon   (cond ((eq which :year) (when (>= (length args) 2) (to-number (arg 1 args))))
+                                       ((eq which :month) (to-number (arg 0 args)))
+                                       (t nil)))
+                        (a-date  (cond ((eq which :year) (when (>= (length args) 3) (to-number (arg 2 args))))
+                                       ((eq which :month) (when (>= (length args) 2) (to-number (arg 1 args))))
+                                       (t (to-number (arg 0 args))))))
+                   (if (and (not (eq which :year)) (not (date-finite-p tv)))
+                       ;; t is NaN and this is setDate/setMonth: don't write.
+                       *nan*
+                       (let* ((yr (if (eq which :year) a-year (year-from-time base)))
+                              (mo (or a-mon (month-from-time base)))
+                              (dt (or a-date (date-from-time base)))
+                              (time (time-within-day base)))
+                         (set-date-tv this (time-clip (make-date (make-day yr mo dt) time))))))))
           (def-method realm dp "setDate" 1 (this args) (set-date-part this args :date))
           (def-method realm dp "setUTCDate" 1 (this args) (set-date-part this args :date))
           (def-method realm dp "setMonth" 2 (this args) (set-date-part this args :month))

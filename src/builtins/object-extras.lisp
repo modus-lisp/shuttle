@@ -35,6 +35,44 @@
         (op (realm-object-proto realm)))
     (when (js-object-p octor)
 
+      ;; ----- Object.setPrototypeOf(O, proto) [OVERRIDE] -------------------
+      ;; The kernel static sets the prototype unconditionally, which lets it
+      ;; create cycles (→ later chain-walks hang) and ignores non-extensible
+      ;; objects. Redefine with the full OrdinarySetPrototypeOf semantics and
+      ;; throw TypeError when [[SetPrototypeOf]] would return false.
+      (def-method realm octor "setPrototypeOf" 2 (this args)
+        (let ((o (arg 0 args)) (proto (arg 1 args)))
+          (require-object-coercible o "Object.setPrototypeOf")
+          (unless (or (js-object-p proto) (eq proto *null*))
+            (js-throw (make-native-error "TypeError" "Object prototype may only be an Object or null")))
+          (when (js-object-p o)
+            (unless (object-extras-set-prototype-of o proto)
+              (js-throw (make-native-error "TypeError"
+                          "Object.setPrototypeOf: cyclic prototype value or non-extensible object"))))
+          o))
+
+      ;; ----- Object.assign(target, ...sources) [OVERRIDE] ----------------
+      ;; The kernel static uses js-set and drops failures silently. Spec calls
+      ;; Set(to, key, value, true): a false result (non-writable target prop,
+      ;; non-extensible target, accessor without setter) must throw TypeError.
+      ;; Reading each source key value can trigger a getter, so re-check the
+      ;; own descriptor's enumerability against the CURRENT source (it may have
+      ;; changed), matching the spec's per-key CopyDataProperties loop.
+      (def-method realm octor "assign" 2 (this args)
+        (let ((target (to-object (arg 0 args))))
+          (dolist (src (rest args))
+            (unless (js-null-or-undef src)
+              (let ((so (to-object src)))
+                (dolist (k (js-own-keys so))
+                  (let ((d (js-get-own-property so k)))
+                    (when (and d (prop-enumerable d))
+                      (let ((val (js-get so k)))
+                        (let ((ok (js-set target k val target)))
+                          (when (or (null ok) (eq ok *false*))
+                            (js-throw (make-native-error "TypeError"
+                                        "Object.assign: cannot assign to target property")))))))))))
+          target))
+
       ;; ----- Object.fromEntries(iterable) ---------------------------------
       ;; AddEntriesFromIterable using CreateDataPropertyOnObject (define, not set).
       ;; Reads entry."0"/entry."1" as properties; closes the iterator on abrupt.
@@ -107,6 +145,55 @@
                                 (put groups key (make-array-object (list value))))))
                       (shuttle-error (c) (object-extras-iterator-close-throw it c))))
                   (incf k)))))))
+
+      ;; ----- Object.prototype.hasOwnProperty(V) [OVERRIDE] ---------------
+      ;; Spec order: ToPropertyKey(V) BEFORE ToObject(this) (B.2.2 / 20.1.3.2).
+      ;; The kernel evaluates ToObject first, so a non-coercible `this` masks a
+      ;; throwing key coercion. Redefine to coerce the key first.
+      (def-method realm op "hasOwnProperty" 1 (this args)
+        (let ((key (to-property-key (arg 0 args))))
+          (js-bool (and (js-get-own-property (to-object this) key) t))))
+
+      ;; ----- Object.prototype.__define[GS]etter__ / __lookup[GS]etter__ ----
+      ;; Annex B B.2.2.2–B.2.2.5. Order matters: ToObject(this) first (so a
+      ;; non-coercible receiver throws before the key is coerced), then the
+      ;; callable check, then ToPropertyKey, then DefinePropertyOrThrow.
+      (def-method realm op "__defineGetter__" 2 (this args)
+        (let ((o (to-object this)) (getter (arg 1 args)))
+          (unless (js-callable-p getter)
+            (js-throw (make-native-error "TypeError" "Object.prototype.__defineGetter__: getter must be callable")))
+          (let ((key (to-property-key (arg 0 args))))
+            (unless (js-define-own-property o key
+                       (list :accessor t :get getter :enumerable t :configurable t))
+              (js-throw (make-native-error "TypeError" "Cannot define getter")))
+            *undefined*)))
+      (def-method realm op "__defineSetter__" 2 (this args)
+        (let ((o (to-object this)) (setter (arg 1 args)))
+          (unless (js-callable-p setter)
+            (js-throw (make-native-error "TypeError" "Object.prototype.__defineSetter__: setter must be callable")))
+          (let ((key (to-property-key (arg 0 args))))
+            (unless (js-define-own-property o key
+                       (list :accessor t :set setter :enumerable t :configurable t))
+              (js-throw (make-native-error "TypeError" "Cannot define setter")))
+            *undefined*)))
+      (def-method realm op "__lookupGetter__" 1 (this args)
+        (let ((o (to-object this)) (key (to-property-key (arg 0 args))))
+          (loop
+            (let ((d (js-get-own-property o key)))
+              (when d
+                (return-from nil
+                  (if (prop-accessor d) (or (prop-get d) *undefined*) *undefined*))))
+            (let ((p (js-object-proto o)))
+              (if (js-object-p p) (setf o p) (return-from nil *undefined*))))))
+      (def-method realm op "__lookupSetter__" 1 (this args)
+        (let ((o (to-object this)) (key (to-property-key (arg 0 args))))
+          (loop
+            (let ((d (js-get-own-property o key)))
+              (when d
+                (return-from nil
+                  (if (prop-accessor d) (or (prop-set d) *undefined*) *undefined*))))
+            (let ((p (js-object-proto o)))
+              (if (js-object-p p) (setf o p) (return-from nil *undefined*))))))
 
       ;; ----- Object.prototype.__proto__ accessor (Annex B) ----------------
       ;; get: RequireObjectCoercible -> ToObject -> [[GetPrototypeOf]].
