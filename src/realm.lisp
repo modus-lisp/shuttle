@@ -662,12 +662,14 @@
     (def-method realm ctor "fromCharCode" 1 (this args)
       (map 'string (lambda (a) (code-char (logand (to-int-index a) #xFFFF))) args))
     (def-value sp "length" 0d0 :writable nil :configurable nil)
+    ;; toString/valueOf must NOT ToString(this) first — that would re-enter this
+    ;; very method on a String box and recurse. They read the primitive directly.
+    (def-method realm sp "toString" 0 (this args) (this-string this))
+    (def-method realm sp "valueOf" 0 (this args) (this-string this))
     (macrolet ((sm (name len (s args) &body body)
                  `(def-method realm sp ,name ,len (this ,args)
                     (require-object-coercible this)
                     (let ((,s (to-string this))) (declare (ignorable ,s)) ,@body))))
-      (sm "toString" 0 (s args) (declare (ignore args)) (this-string this))
-      (sm "valueOf" 0 (s args) (declare (ignore args)) (this-string this))
       (sm "charAt" 1 (s args) (let ((i (to-int-index (arg 0 args)))) (if (< -1 i (length s)) (string (char s i)) "")))
       (sm "charCodeAt" 1 (s args) (let ((i (to-int-index (arg 0 args)))) (if (< -1 i (length s)) (float (char-code (char s i)) 1d0) *nan*)))
       (sm "codePointAt" 1 (s args) (let ((i (to-int-index (arg 0 args)))) (if (< -1 i (length s)) (float (char-code (char s i)) 1d0) *undefined*)))
