@@ -36,6 +36,7 @@
     ((punct? "{") (parse-block))
     ((or (kw? "var") (kw? "let") (kw? "const")) (parse-var))
     ((kw? "function") (parse-function nil))
+    ((kw? "class") (parse-class nil))
     ((kw? "return") (adv) (let ((e (if (or (punct? ";") (punct? "}") (eq (cur-type) :eof)) *undefined-ast*
                                        (parse-expr 1)))) (opt ";") (list :return e)))
     ((kw? "if") (parse-if))
@@ -187,15 +188,81 @@
     (eat "}")
     (list :opat (nreverse props))))
 
+;;; ---- classes ----
+;;; AST: (:class NAME SUPER-EXPR-OR-NIL MEMBERS)
+;;;   member: (:ctor FUNC)
+;;;           (:method KIND KEY FUNC STATIC)  ; KIND in :method :get :set
+;;;           (:field KEY INIT-OR-NIL STATIC)
+(defun parse-class (exprp)
+  (declare (ignore exprp))
+  (adv)                                          ; 'class'
+  (let ((name (when (and (eq (cur-type) :ident) (not (kw? "extends")))
+                (prog1 (cur-val) (adv))))
+        (super nil))
+    (when (kw? "extends") (adv) (setf super (parse-lhs-expr)))
+    (eat "{")
+    (let ((members '()) (ctor nil))
+      (loop until (punct? "}") do
+        (cond
+          ((punct? ";") (adv))                   ; empty element
+          (t
+           (let ((static nil) (gen nil) (kind :method))
+             ;; `static` prefix (unless it's the member name `static(){}` / `static = ...`)
+             (when (and (kw? "static") (not (member-name-terminator-p)))
+               (adv) (setf static t))
+             (cond
+               ((punct? "*") (adv) (setf gen t))
+               ((and (kw? "get") (not (member-name-terminator-p))) (adv) (setf kind :get))
+               ((and (kw? "set") (not (member-name-terminator-p))) (adv) (setf kind :set)))
+             (let ((key (parse-class-key)))
+               (cond
+                 ((punct? "(")                   ; method / accessor / constructor
+                  (let ((fn (parse-method-tail (key-name key) gen)))
+                    (if (and (not static) (eq kind :method)
+                             (eq (car key) :lit) (string= (second key) "constructor"))
+                        (setf ctor fn)
+                        (push (list :method kind key fn static) members))))
+                 (t                              ; field: key [= init] ;
+                  (let ((init (when (opt "=") (parse-expr 2))))
+                    (opt ";")
+                    (push (list :field key init static) members)))))))))
+      (eat "}")
+      (list :class name super (nreverse members) ctor))))
+
+(defun member-name-terminator-p ()
+  "After a possible modifier keyword (static/get/set), is the NEXT token one that
+   means the keyword was actually the member NAME (i.e. `(`, `=`, `;`, `}`)?"
+  (let ((nxt (aref *toks* (1+ *pos*))))
+    (and (eq (car nxt) :punct)
+         (member (cdr nxt) '("(" "=" ";" "}") :test #'string=))))
+
+(defun parse-class-key ()
+  "A class member key: identifier/string/number/computed. Private names (#x) not
+   fully supported; treated as a string key."
+  (cond
+    ((punct? "[") (adv) (let ((e (parse-expr 2))) (eat "]") (list :computed e)))
+    ((eq (cur-type) :str) (list :lit (prog1 (cur-val) (adv))))
+    ((eq (cur-type) :num) (list :lit (number-to-string (prog1 (cur-val) (adv)))))
+    ((eq (cur-type) :ident) (list :lit (prog1 (cur-val) (adv))))
+    (t (js-throw (make-native-error "SyntaxError" "Unexpected token in class member")))))
+
+(defun parse-lhs-expr ()
+  "A left-hand-side expression (for `extends` clause): member/call chain, no
+   binary operators."
+  (parse-member (parse-primary)))
+
+(defvar *in-generator* nil)   ; is `yield` a keyword in the current parse context?
+
 (defun parse-function (exprp)
   (adv)                                       ; 'function'
-  (let ((name (when (eq (cur-type) :ident) (prog1 (cur-val) (adv)))))
-    (eat "(")
-    (let ((params (parse-param-list)))
-      (eat ")")
-      (let ((body (parse-block)))
-        (declare (ignore exprp))
-        (list :func name params body)))))
+  (let ((gen (opt "*")))                      ; function* -> generator
+    (let ((name (when (eq (cur-type) :ident) (prog1 (cur-val) (adv)))))
+      (eat "(")
+      (let ((params (parse-param-list)))
+        (eat ")")
+        (let* ((*in-generator* gen) (body (parse-block)))
+          (declare (ignore exprp))
+          (if gen (list :genfunc name params body) (list :func name params body)))))))
 
 ;;; ---- expressions (Pratt) ----
 (defun assignable-target-p (node op)
@@ -209,6 +276,15 @@
     (t nil)))
 
 (defun parse-expr (min-bp)
+  ;; yield: an AssignmentExpression-level form, only inside a generator body.
+  (when (and *in-generator* (kw? "yield") (<= min-bp 2))
+    (adv)
+    (let ((delegate (opt "*")))
+      ;; yield with no argument: followed by a token that can't start an expression
+      (if (or delegate (not (yield-argument-follows-p)))
+          (if delegate (return-from parse-expr (list :yield* (parse-expr 2)))
+              (return-from parse-expr (list :yield nil)))
+          (return-from parse-expr (list :yield (parse-expr 2))))))
   (let ((left (parse-unary)))
     (loop
       (let ((tt (cur-type)) (tv (cur-val)))
@@ -241,6 +317,12 @@
           (t (return)))))
     left))
 
+(defun yield-argument-follows-p ()
+  "After `yield`, does an expression argument follow (vs. bare yield)?"
+  (let ((tt (cur-type)) (tv (cur-val)))
+    (not (or (eq tt :eof)
+             (and (eq tt :punct) (member tv '(")" "]" "}" ";" "," ":") :test #'string=))))))
+
 (defun parse-unary ()
   (let ((tt (cur-type)) (tv (cur-val)))
     (cond
@@ -248,8 +330,9 @@
       ((kw? "typeof") (adv) (list :unary "typeof" (parse-unary)))
       ((kw? "void") (adv) (list :unary "void" (parse-unary)))
       ((kw? "delete") (adv) (list :delete (parse-unary)))
-      ((kw? "new") (adv) (let ((callee (parse-member (parse-primary) nil))) ; member, but NOT the call
-                           (list :new callee (if (punct? "(") (parse-args) '()))))
+      ((kw? "new") (adv) (let* ((callee (parse-member (parse-primary) nil)) ; member, but NOT the call
+                                (newexpr (list :new callee (if (punct? "(") (parse-args) '()))))
+                           (parse-member newexpr)))    ; trailing .m() / [k] / () after new
       ((or (punct? "++") (punct? "--")) (let ((op tv)) (adv) (list :update op t (parse-unary))))
       (t (parse-postfix)))))
 
@@ -300,11 +383,20 @@
     (cond
       ((eq tt :num) (adv) (list :num tv))
       ((eq tt :str) (adv) (list :str tv))
+      ((eq tt :regex) (adv) (list :regex (car tv) (cdr tv)))   ; (:regex pattern flags)
       ((eq tt :template) (parse-template-node))
       ((kw? "true") (adv) '(:bool t)) ((kw? "false") (adv) '(:bool nil))
       ((kw? "null") (adv) '(:null)) ((kw? "undefined") (adv) '(:undefined))
       ((kw? "this") (adv) '(:this))
+      ((kw? "super")
+       (adv)
+       (cond
+         ((punct? "(") (list :super-call (parse-args)))               ; super(...)
+         ((punct? ".") (adv) (prog1 (list :super-member (list :str (cur-val)) nil) (adv)))
+         ((punct? "[") (adv) (let ((k (parse-expr 1))) (eat "]") (list :super-member k t)))
+         (t (js-throw (make-native-error "SyntaxError" "Unexpected 'super'")))))
       ((kw? "function") (parse-function t))
+      ((kw? "class") (parse-class t))
       ((punct? "(") (parse-paren-or-arrow))
       ((punct? "[") (parse-array-literal))
       ((punct? "{") (parse-object-literal))
@@ -371,13 +463,15 @@
     ((eq (cur-type) :ident) (list :lit (prog1 (cur-val) (adv))))
     (t (js-throw (make-native-error "SyntaxError" "Unexpected token in object literal")))))
 
-(defun parse-method-tail (name-string)
-  "Parse `(params){body}` as a function expression AST for a method/accessor."
+(defun parse-method-tail (name-string &optional gen)
+  "Parse `(params){body}` as a function expression AST for a method/accessor.
+   When GEN, the body is a generator body (yield is a keyword)."
   (eat "(")
   (let ((params (parse-param-list)))
     (eat ")")
-    (let ((body (parse-block)))
-      (list :func name-string params body))))
+    (let* ((*in-generator* gen) (body (parse-block)))
+      (if gen (list :genfunc name-string params body)
+          (list :func name-string params body)))))
 
 (defun parse-object-literal ()
   (eat "{")
@@ -394,6 +488,10 @@
         ((and (kw? "set") (accessor-follows-p))
          (adv) (let ((key (parse-property-key)))
                  (push (list :set key (parse-method-tail (key-name key))) props)))
+        ;; generator method: *key(...){...}
+        ((punct? "*")
+         (adv) (let ((key (parse-property-key)))
+                 (push (list :init key (parse-method-tail (key-name key) t)) props)))
         (t
          (let ((key (parse-property-key)))
            (cond

@@ -138,24 +138,276 @@
         (put o *symbol-iterator* (js-get av *symbol-iterator*) :enumerable nil)))
     o))
 
-(defun make-js-function (code env)
+(defun fn-home (fn) (getf (js-object-internal fn) :home))
+(defun (setf fn-home) (v fn) (setf (getf (js-object-internal fn) :home) v))
+(defun fn-super-ctor (fn) (getf (js-object-internal fn) :super-ctor))
+(defun (setf fn-super-ctor) (v fn) (setf (getf (js-object-internal fn) :super-ctor) v))
+
+(defun make-js-function (code env &key kind)
+  "KIND: nil = ordinary function; :method = has [[HomeObject]] (super),
+   :generator = a generator function; :class-base / :class-derived = a class ctor."
   (let ((fn (make-object :proto (%fn-proto) :class "Function")))
-    (put fn "length" (float (length (code-params code)) 1d0) :enumerable nil :writable nil)
+    (put fn "length" (float (fn-declared-length (code-params code)) 1d0) :enumerable nil :writable nil)
     (when (code-name code) (put fn "name" (code-name code) :enumerable nil :writable nil))
     (setf (js-object-call fn)
-          (lambda (this args)
-            (let ((fenv (new-env env)))
-              (env-declare fenv "arguments" (make-arguments-object args))
-              (run code fenv this args))))
-    (setf (js-object-construct fn)
-          (lambda (args new-target) (declare (ignore new-target))
-            (let* ((pp (js-get fn "prototype"))
-                   (obj (make-object :proto (if (js-object-p pp) pp (%obj-proto)))))
-              (let ((r (funcall (js-object-call fn) obj args))) (if (js-object-p r) r obj)))))
+          (if (eq kind :generator)
+              (lambda (this args)
+                (make-generator-object code env this args fn))
+              (lambda (this args)
+                (let ((fenv (new-env env)))
+                  (env-declare fenv "arguments" (make-arguments-object args))
+                  (run code fenv this args fn)))))
+    ;; class constructors: only callable via `new`; the [[Construct]] initializes
+    ;; the instance (derived ctors require super() to run the base first).
+    (cond
+      ((member kind '(:class-base :class-derived))
+       ;; the real runner: super() and new both call this to run the ctor body.
+       (setf (getf (js-object-internal fn) :ctor-run)
+             (lambda (this args) (let ((fenv (new-env env)))
+                                   (env-declare fenv "arguments" (make-arguments-object args))
+                                   (run code fenv this args fn))))
+       (setf (js-object-construct fn)
+             (lambda (args new-target)
+               (let* ((pp (js-get (or new-target fn) "prototype"))
+                      (obj (make-object :proto (if (js-object-p pp) pp (%obj-proto)))))
+                 (let ((r (funcall (getf (js-object-internal fn) :ctor-run) obj args)))
+                   (if (js-object-p r) r obj)))))
+       ;; class ctors are not plain-callable: throw on [[Call]]
+       (setf (js-object-call fn)
+             (lambda (this args) (declare (ignore this args))
+               (js-throw (make-native-error "TypeError"
+                          (format nil "Class constructor ~a cannot be invoked without 'new'"
+                                  (or (code-name code) "")))))))
+      (t
+       (setf (js-object-construct fn)
+             (lambda (args new-target) (declare (ignore new-target))
+               (let* ((pp (js-get fn "prototype"))
+                      (obj (make-object :proto (if (js-object-p pp) pp (%obj-proto)))))
+                 (let ((r (funcall (js-object-call fn) obj args))) (if (js-object-p r) r obj)))))))
     ;; a fresh .prototype so `new` works and methods can be attached
-    (let ((proto (make-object :proto (%obj-proto)))) (put proto "constructor" fn :enumerable nil)
-      (put fn "prototype" proto :enumerable nil))
+    ;; (methods/getters/setters and arrows don't get one — but keep it simple:
+    ;;  generators get a prototype whose proto is the generator prototype elsewhere.)
+    (unless (eq kind :method)
+      (let ((proto (make-object :proto (if (eq kind :generator) (generator-prototype) (%obj-proto)))))
+        (unless (eq kind :generator) (put proto "constructor" fn :enumerable nil))
+        (put fn "prototype" proto :enumerable nil :writable (not (eq kind :generator)))))
     fn))
+
+(defun fn-declared-length (params)
+  "The .length of a function: count leading params before the first default/rest."
+  (let ((n 0))
+    (dolist (p params n)
+      (when (and (consp p) (member (car p) '(:default :rest))) (return n))
+      (incf n))))
+
+;;; ---- generators (thread-backed coroutines) ----
+;;; A generator runs its body on a dedicated worker thread. At each `yield` the
+;;; worker blocks on RESUME-SEM and the consumer thread proceeds; `.next(v)` hands
+;;; V back and unblocks the worker. This gives true VM-frame suspend/resume without
+;;; CPS-transforming the bytecode. Threads are cheap here (short-lived, gated).
+(defstruct genstate
+  thread
+  (to-gen-sem (sb-thread:make-semaphore))     ; consumer -> generator (resume)
+  (to-consumer-sem (sb-thread:make-semaphore)) ; generator -> consumer (yielded/done)
+  sent                                        ; value passed into .next(v) / throw / return
+  mode                                        ; :next :throw :return  (how to resume)
+  yielded                                     ; value handed out at a yield
+  (done nil)
+  (started nil)
+  error)                                      ; a shuttle-error to propagate to the consumer
+
+(defvar *current-generator* nil)              ; the genstate the running thread belongs to
+(defvar *generators-created* 0)               ; counter to periodically reclaim leaked threads
+(defvar *live-generators* '())                ; suspended (non-done) genstates, newest first
+(defparameter *max-live-generators* 300)      ; hard cap on concurrent worker threads
+
+(defun terminate-generator (gs)
+  "Force an abandoned suspended generator's worker to unwind and exit."
+  (unless (genstate-done gs)
+    (setf (genstate-done gs) t (genstate-mode gs) :terminate)
+    (ignore-errors (sb-thread:signal-semaphore (genstate-to-gen-sem gs)))
+    (let ((th (genstate-thread gs)))
+      (when (and th (sb-thread:thread-alive-p th))
+        (ignore-errors (sb-thread:join-thread th :timeout 1))))))
+
+(defun reap-generators ()
+  "Drop finished generators from the registry; if still over the cap, forcibly
+   terminate the oldest suspended workers (assumed abandoned by a prior test)."
+  (setf *live-generators* (delete-if #'genstate-done *live-generators*))
+  (when (> (length *live-generators*) *max-live-generators*)
+    ;; oldest are at the tail; terminate down to half the cap
+    (let* ((keep (floor *max-live-generators* 2))
+           (rev (reverse *live-generators*))
+           (kill (nthcdr keep rev)))
+      (dolist (gs kill) (terminate-generator gs))
+      (setf *live-generators* (delete-if #'genstate-done *live-generators*)))))
+
+(define-condition generator-terminate (error) ())  ; unwinds an abandoned generator's thread
+
+(defun gen-yield (value)
+  "Called from inside a generator's worker thread at a `yield`. Hands VALUE to the
+   consumer, blocks until resumed, and returns the sent value (or throws)."
+  (let ((gs *current-generator*))
+    (setf (genstate-yielded gs) value)
+    (sb-thread:signal-semaphore (genstate-to-consumer-sem gs))
+    (sb-thread:wait-on-semaphore (genstate-to-gen-sem gs))
+    (case (genstate-mode gs)
+      (:throw  (js-throw (genstate-sent gs)))
+      (:return (throw 'generator-return (genstate-sent gs)))
+      (:terminate (error 'generator-terminate))    ; abandoned: unwind the worker
+      (t (genstate-sent gs)))))
+
+(defvar *generator-proto-cache* nil)   ; alist (realm . %GeneratorPrototype%)
+(defun generator-prototype ()
+  "The shared %GeneratorPrototype% for the current realm (next/return/throw/@@it)."
+  (let ((cell (assoc *current-realm* *generator-proto-cache*)))
+    (if cell (cdr cell)
+        (let ((gp (make-object :proto (%obj-proto))))
+          (flet ((native (name fn) (let ((f (make-object :proto (%fn-proto) :class "Function")))
+                                     (setf (js-object-call f) fn)
+                                     (put f "name" name :enumerable nil :writable nil)
+                                     (put gp name f :enumerable nil))))
+            (native "next"   (lambda (this args) (generator-resume this :next (if args (car args) *undefined*))))
+            (native "return" (lambda (this args) (generator-resume this :return (if args (car args) *undefined*))))
+            (native "throw"  (lambda (this args) (generator-resume this :throw (if args (car args) *undefined*)))))
+          (when *symbol-iterator*
+            (let ((f (make-object :proto (%fn-proto) :class "Function")))
+              (setf (js-object-call f) (lambda (this args) (declare (ignore args)) this))
+              (put f "name" "[Symbol.iterator]" :enumerable nil :writable nil)
+              (put gp *symbol-iterator* f :enumerable nil)))
+          (push (cons *current-realm* gp) *generator-proto-cache*)
+          gp))))
+
+(defun make-generator-object (code env this args fn)
+  "Create a generator object whose worker thread will run CODE. The object exposes
+   next/return/throw and @@iterator (returns itself)."
+  ;; keep leaked (abandoned, suspended) generator threads bounded (see reap).
+  (incf *generators-created*)
+  (when (zerop (mod *generators-created* 64)) (reap-generators))
+  (let* ((gs (make-genstate))
+         (gproto (let ((pp (js-get fn "prototype"))) (if (js-object-p pp) pp (generator-prototype))))
+         (gobj (make-object :proto gproto :class "Generator"))
+         (realm *current-realm*))
+    (setf (getf (js-object-internal gobj) :genstate) gs)
+    ;; the worker: waits for the first resume, then runs the body.
+    (setf (genstate-thread gs)
+          (sb-thread:make-thread
+           (lambda ()
+             (block worker
+               (let ((*current-realm* realm) (*current-generator* gs)
+                     (*steps* 0))
+                 (sb-thread:wait-on-semaphore (genstate-to-gen-sem gs))
+                 (handler-case
+                     (progn
+                       (when (eq (genstate-mode gs) :terminate) (return-from worker))
+                       (let ((rv (catch 'generator-return
+                                   (case (genstate-mode gs)
+                                     (:throw (js-throw (genstate-sent gs)))
+                                     (:return (genstate-sent gs))
+                                     (t (let ((fenv (new-env env)))
+                                          (env-declare fenv "arguments" (make-arguments-object args))
+                                          (run code fenv this args fn)))))))
+                         (setf (genstate-yielded gs) rv (genstate-done gs) t)))
+                   (generator-terminate () (return-from worker))   ; abandoned: silent exit
+                   (shuttle-error (e) (setf (genstate-error gs) e (genstate-done gs) t))
+                   ;; ANY other serious condition (timeout, stack, host bug): mark done
+                   ;; and surface as a JS error to the consumer — never let it quit the
+                   ;; whole process (--disable-debugger would kill everything).
+                   (serious-condition (e)
+                     (setf (genstate-error gs)
+                           (make-condition 'shuttle-error
+                                           :value (make-native-error "Error"
+                                                    (format nil "generator error: ~a" e)))
+                           (genstate-done gs) t)))
+                 (sb-thread:signal-semaphore (genstate-to-consumer-sem gs)))))
+           :name "shuttle-generator"))
+    (push gs *live-generators*)
+    gobj))
+
+(defun generator-resume (gobj mode value)
+  "Resume GOBJ's generator with MODE (:next/:throw/:return) and VALUE. Returns a
+   result object {value, done}."
+  (let ((gs (getf (js-object-internal gobj) :genstate)))
+    (unless gs (js-throw (make-native-error "TypeError" "not a generator")))
+    (when (genstate-done gs)
+      ;; already finished: return/next -> {value: v, done:true}; throw -> throw
+      (case mode
+        (:throw (js-throw value))
+        (:return (return-from generator-resume (iter-result value t)))
+        (t (return-from generator-resume (iter-result *undefined* t)))))
+    (setf (genstate-mode gs) mode (genstate-sent gs) value)
+    (sb-thread:signal-semaphore (genstate-to-gen-sem gs))
+    (sb-thread:wait-on-semaphore (genstate-to-consumer-sem gs))
+    (when (genstate-error gs)
+      (let ((e (genstate-error gs))) (setf (genstate-error gs) nil) (error e)))
+    (if (genstate-done gs)
+        (iter-result (genstate-yielded gs) t)
+        (iter-result (genstate-yielded gs) nil))))
+
+(defun iter-result (value done)
+  (let ((o (make-object :proto (%obj-proto))))
+    (put o "value" value) (put o "done" (js-bool done)) o))
+
+(defun yield-star-delegate (iterable)
+  "yield* ITERABLE: drive the inner iterator, yielding each produced value and
+   forwarding .next(sent) to it; return the iterator's final value."
+  (let* ((it (get-iterator iterable))
+         (next (js-get it "next"))
+         (sent *undefined*))
+    (loop
+      (let ((r (js-call next it (list sent))))
+        (unless (js-object-p r) (js-throw (make-native-error "TypeError" "iterator result is not an object")))
+        (when (js-truthy (js-get r "done"))
+          (return-from yield-star-delegate (js-get r "value")))
+        (setf sent (gen-yield (js-get r "value")))))))
+
+;;; ---- classes ----
+(defun build-class (ctor-code super derived env &optional cname)
+  "Create the class: a constructor function + a prototype object. SUPER is the
+   parent class value (undefined if none). Returns the constructor object."
+  (let* ((super-present (not (eq super *undefined*)))
+         (super-ctor (cond ((not super-present) nil)
+                           ((eq super *null*) :null)
+                           ((js-callable-p super) super)
+                           (t (js-throw (make-native-error "TypeError" "Class extends value is not a constructor or null")))))
+         (parent-proto (cond ((not super-present) (%obj-proto))
+                             ((eq super *null*) *null*)
+                             (t (let ((pp (js-get super "prototype")))
+                                  (cond ((js-object-p pp) pp) ((eq pp *null*) *null*)
+                                        (t (js-throw (make-native-error "TypeError" "Class extends prototype is not an object or null"))))))))
+         (proto (make-object :proto parent-proto))
+         (fn (make-js-function ctor-code env :kind (if derived :class-derived :class-base))))
+    ;; wire prototype <-> constructor
+    (put proto "constructor" fn :enumerable nil :writable t :configurable t)
+    ;; replace the auto-created prototype with ours
+    (js-define-own-property fn "prototype"
+      (list :value proto :writable nil :enumerable nil :configurable nil))
+    ;; constructor's [[Prototype]] chains to the parent constructor (static inherit)
+    (when super-present
+      (setf (js-object-proto fn) (if (eq super-ctor :null) (%fn-proto) super)))
+    ;; the constructor's name is the class name (not "constructor")
+    (js-define-own-property fn "name"
+      (list :value (if cname cname "") :writable nil :enumerable nil :configurable t))
+    ;; home object for super.* in the constructor = the prototype
+    (setf (fn-home fn) proto)
+    (setf (fn-super-ctor fn) (if (eq super-ctor :null) :null super-ctor))
+    fn))
+
+(defun run-super-ctor (super-ctor this args)
+  "Execute super(...): run the parent class constructor's body on THIS."
+  (cond
+    ((or (null super-ctor) (eq super-ctor :null))
+     (js-throw (make-native-error "SyntaxError" "'super' keyword unexpected here")))
+    (t
+     ;; class ctors stash their raw runner under :ctor-run; ordinary functions use [[Call]]
+     (let ((run-fn (getf (js-object-internal super-ctor) :ctor-run)))
+       (if run-fn
+           (funcall run-fn this args)
+           ;; a non-class base (e.g. extends a native/function): construct & copy?
+           ;; Simplest: call its [[Call]] with this.
+           (let ((c (js-object-call super-ctor)))
+             (if c (funcall c this args)
+                 (js-throw (make-native-error "TypeError" "super constructor is not callable")))))))))
 
 ;;; ---- operators ----
 (defun to-int32 (v)
@@ -226,10 +478,12 @@
 (declaim (type fixnum *steps* *max-steps*))
 (defparameter *steps* 0) (defparameter *max-steps* 2000000)   ; per-run budget (guards infinite loops)
 
-(defun run (code env this &optional call-args)
+(defun run (code env this &optional call-args fn-obj)
   (let ((instrs (code-instrs code)) (pc 0)
         (call-args (coerce call-args 'vector))
         (stack (make-array 64 :adjustable t :fill-pointer 0)) (completion *undefined*)
+        (home (and fn-obj (fn-home fn-obj)))          ; [[HomeObject]] for super
+        (super-ctor (and fn-obj (fn-super-ctor fn-obj)))
         (handlers '()))                      ; ((catch-pc . saved-sp) ...) for try/catch
     (macrolet ((push! (v) `(vector-push-extend ,v stack))
                (pop! () `(vector-pop stack))
@@ -310,6 +564,39 @@
             (:new-spread (let* ((argsarr (pop!)) (callee (pop!)))
                            (push! (js-construct callee (array-object-to-list argsarr)))))
             (:closure (push! (make-js-function (first a) env)))
+            (:genclosure (push! (make-js-function (first a) env :kind :generator)))
+            (:yield (push! (gen-yield (pop!))))
+            (:yield-star (push! (yield-star-delegate (pop!))))
+            ;; ---- classes ----
+            (:make-class (let* ((super (pop!)) (ctor-code (first a)) (derived (second a))
+                                (cname (third a)))
+                           (push! (build-class ctor-code super derived env cname))))
+            (:class-method (let* ((fn (pop!)) (k (pop!)) (ctor (peek!))
+                                  (kind (first a)) (static (second a))
+                                  (target (if static ctor (js-get ctor "prototype"))))
+                             (setf (fn-home fn) target)     ; [[HomeObject]] for super
+                             (put fn "name" (if (stringp k) k (to-string k)) :enumerable nil :writable nil)
+                             (case kind
+                               (:get (js-define-own-property target (prop-key k)
+                                       (list :get fn :accessor t :enumerable nil :configurable t)))
+                               (:set (js-define-own-property target (prop-key k)
+                                       (list :set fn :accessor t :enumerable nil :configurable t)))
+                               (t (js-define-own-property target (prop-key k)
+                                    (list :value fn :writable t :enumerable nil :configurable t))))))
+            (:class-static-field (let* ((v (pop!)) (k (pop!)) (ctor (peek!)))
+                                   (js-define-own-property ctor (prop-key k)
+                                     (list :value v :writable t :enumerable t :configurable t))))
+            (:super-get (let ((k (pop!)))
+                          (let ((base (and (js-object-p home) (js-object-proto home))))
+                            (push! (if (js-object-p base) (js-get base k this) *undefined*)))))
+            (:super-get-method (let ((k (pop!)))
+                                 (let ((base (and (js-object-p home) (js-object-proto home))))
+                                   (push! this)            ; thisv
+                                   (push! (if (js-object-p base) (js-get base k this) *undefined*)))))
+            (:super-call (let ((args (nreverse (loop repeat (first a) collect (pop!)))))
+                           (run-super-ctor super-ctor this args) (push! this)))
+            (:super-call-spread (let ((argsarr (pop!)))
+                                  (run-super-ctor super-ctor this (array-object-to-list argsarr)) (push! this)))
             (:array (push! (make-array-object (nreverse (loop repeat (first a) collect (pop!))))))
             (:object (push! (make-plain-object
                              (nreverse (loop repeat (first a) collect (let ((v (pop!)) (k (pop!))) (cons k v)))))))

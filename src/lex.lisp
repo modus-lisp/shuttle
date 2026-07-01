@@ -13,6 +13,54 @@
 (defun id-start-p (c) (or (alpha-char-p c) (char= c #\_) (char= c #\$)))
 (defun id-part-p  (c) (or (alphanumericp c) (char= c #\_) (char= c #\$)))
 
+(defparameter *regex-not-after-keywords*
+  ;; identifier tokens after which a `/` is DIVISION, not a regex (they produce a value)
+  '("this" "true" "false" "null" "super"))
+
+(defun regex-allowed-p (toks)
+  "Given the tokens emitted so far, may a `/` begin a regex literal here?
+   Regex is allowed where a value/expression is expected: at start-of-input, and
+   after punctuators/keywords that cannot end an expression. Division follows a
+   token that produces a value: a number, string, template, regex, most
+   identifiers, or a closing `)`/`]`/`}`."
+  (if (zerop (fill-pointer toks)) t
+      (let* ((tok (aref toks (1- (fill-pointer toks)))) (type (car tok)) (val (cdr tok)))
+        (case type
+          ((:num :str :template :regex) nil)     ; these produce a value -> division
+          (:ident (cond ((member val *regex-not-after-keywords* :test #'string=) nil)
+                        ;; a reserved word that is NOT a value keyword: regex allowed
+                        ;; (return, typeof, delete, in, of, case, do, else, yield, void, new, ...)
+                        ((member val '("return" "typeof" "instanceof" "in" "of" "new" "delete"
+                                       "void" "do" "else" "yield" "case" "throw" "await")
+                                 :test #'string=) t)
+                        ;; a plain identifier -> value -> division
+                        (t nil)))
+          (:punct (cond ((member val '(")" "]" "}") :test #'string=) nil)   ; value-producing closers
+                        (t t)))                  ; other punctuators expect an expression
+          (t t)))))
+
+(defun scan-regex (src i n)
+  "Scan a regex literal starting at SRC[I] (which is the opening `/`). Returns
+   (values PATTERN FLAGS NEW-I) or NIL if it isn't a well-formed regex."
+  (let ((j (1+ i)) (in-class nil))
+    (loop
+      (when (>= j n) (return-from scan-regex nil))    ; unterminated -> not a regex
+      (let ((c (char src j)))
+        (cond
+          ((char= c #\Newline) (return-from scan-regex nil))
+          ((char= c #\\)                               ; escape: consume next char
+           (incf j) (when (or (>= j n) (char= (char src j) #\Newline)) (return-from scan-regex nil))
+           (incf j))
+          ((char= c #\[) (setf in-class t) (incf j))
+          ((char= c #\]) (setf in-class nil) (incf j))
+          ((and (char= c #\/) (not in-class)) (return))  ; end of body
+          (t (incf j)))))
+    (let ((pattern (subseq src (1+ i) j)))
+      (incf j)                                          ; past closing /
+      (let ((fstart j))
+        (loop while (and (< j n) (id-part-p (char src j))) do (incf j))
+        (values pattern (subseq src fstart j) j)))))
+
 (defun tokenize (src)
   (let ((i 0) (n (length src)) (toks (make-array 0 :adjustable t :fill-pointer 0)))
     (labels ((peek (&optional (k 0)) (if (< (+ i k) n) (char src (+ i k)) #\Nul))
@@ -27,6 +75,15 @@
             ((and (char= c #\/) (char= (peek 1) #\*))
              (incf i 2) (loop until (or (>= i n) (and (char= (char src i) #\*) (char= (peek 1) #\/))) do (incf i))
              (incf i 2))
+            ;; regex literal  /pattern/flags  (only where a value/expression is expected)
+            ((and (char= c #\/) (regex-allowed-p toks))
+             (multiple-value-bind (pat flags nj) (scan-regex src i n)
+               (if pat
+                   (progn (setf i nj) (emit :regex (cons pat flags)))
+                   (let ((p (find-if (lambda (p) (and (<= (+ i (length p)) n)
+                                                      (string= p src :start2 i :end2 (+ i (length p)))))
+                                     *punctuators*)))
+                     (emit :punct p) (incf i (length p))))))
             ;; template literal  `...${expr}...`
             ((char= c #\`)
              (incf i)                          ; past opening backtick
@@ -122,9 +179,10 @@
                                 (float (parse-integer text :start 2 :radix 16) 1d0)
                                 (let ((*read-default-float-format* 'double-float))
                                   (float (read-from-string text) 1d0)))))))
-            ;; identifier / keyword
-            ((id-start-p c)
-             (let ((start i)) (loop while (and (< i n) (id-part-p (char src i))) do (incf i))
+            ;; identifier / keyword  (also #private-name as a lexeme)
+            ((or (id-start-p c) (and (char= c #\#) (< (1+ i) n) (id-start-p (char src (1+ i)))))
+             (let ((start i)) (when (char= c #\#) (incf i))
+               (loop while (and (< i n) (id-part-p (char src i))) do (incf i))
                (emit :ident (subseq src start i))))
             ;; punctuator (maximal munch)
             (t (let ((p (find-if (lambda (p) (and (<= (+ i (length p)) n)
