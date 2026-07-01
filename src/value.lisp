@@ -207,7 +207,7 @@
 (defun ordinary-has (o key)
   (let ((k (prop-key key)))
     (or (nth-value 1 (gethash k (js-object-props o)))
-        (and (js-object-p (js-object-proto o)) (eq *true* (js-has (js-object-proto o) k))))))
+        (and (js-object-p (js-object-proto o)) (js-truthy* (js-has (js-object-proto o) k))))))
 (defun ordinary-delete (o key)
   (let* ((k (prop-key key)) (d (gethash k (js-object-props o))))
     (cond ((null d) *true*)
@@ -501,7 +501,8 @@
         (t (eq a b))))
 
 (defun js-equal (a b)             ; loose == (the common cases)
-  (cond ((eq (js-null-or-undef a) (js-null-or-undef b)) (and (js-null-or-undef a) t))
+  (cond ((or (js-null-or-undef a) (js-null-or-undef b))   ; null/undefined only equal each other
+         (and (js-null-or-undef a) (js-null-or-undef b) t))
         ((js-strict-equal a b) t)
         ((and (floatp a) (stringp b)) (js-strict-equal a (to-number b)))
         ((and (stringp a) (floatp b)) (js-strict-equal (to-number a) b))
