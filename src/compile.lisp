@@ -15,7 +15,7 @@
     (dolist (in instrs) (if (eq (car in) :label) (setf (gethash (cadr in) pos) idx) (incf idx)))
     (dolist (in instrs)
       (unless (eq (car in) :label)
-        (push (if (member (car in) '(:jmp :jmp-if-false :jmp-if-true :and-jmp :or-jmp :nullish-jmp :push-handler))
+        (push (if (member (car in) '(:jmp :jmp-if-false :jmp-if-true :and-jmp :or-jmp :nullish-jmp :nullish-short :push-handler))
                   (list (car in) (gethash (cadr in) pos)) in) out)))
     (coerce (nreverse out) 'vector)))
 
@@ -23,16 +23,111 @@
   ;; top-level falls off the end so RUN returns the completion value (eval semantics)
   (compile-fn nil '() (parse-program src) t))
 
+(defun param-names (params &optional acc)
+  "All identifier names bound by a parameter list (incl. destructured/rest)."
+  (dolist (p params acc)
+    (setf acc (target-names (param-target p) acc))))
+
+(defun param-target (p)
+  "The binding target of a single param form (peel :default/:rest wrappers)."
+  (cond ((stringp p) p)
+        ((eq (car p) :default) (second p))
+        ((eq (car p) :rest) (second p))
+        (t p)))                             ; a pattern (:apat/:opat)
+
+(defun target-names (tgt &optional acc)
+  "All names bound by a binding target (name string or destructuring pattern)."
+  (cond
+    ((stringp tgt) (pushnew tgt acc :test #'string=))
+    ((null tgt) acc)                        ; array hole
+    ((eq (car tgt) :apat)
+     (dolist (e (second tgt) acc)
+       (cond ((null e))
+             ((eq (car e) :rest) (setf acc (target-names (second e) acc)))
+             ((eq (car e) :default) (setf acc (target-names (second e) acc)))
+             (t (setf acc (target-names e acc))))))
+    ((eq (car tgt) :opat)
+     (dolist (pr (second tgt) acc)
+       (if (eq (car pr) :rest) (pushnew (second pr) acc :test #'string=)
+           (setf acc (target-names (second pr) acc)))))
+    ((eq (car tgt) :default) (target-names (second tgt) acc))
+    ((eq (car tgt) :rest) (target-names (second tgt) acc))
+    (t acc)))
+
 (defun compile-fn (name params body &optional toplevel)
-  (let ((*out* '()))
+  (let ((*out* '()) (pnames (param-names params)))
+    ;; bind parameters from incoming call args
+    (compile-params params)
     ;; hoist: pre-declare all `var` names (as undefined) so forward reads don't
     ;; ReferenceError. Function declarations are hoisted by :func handling below.
     (dolist (v (collect-var-names body))
-      (unless (member v params :test #'string=)
+      (unless (member v pnames :test #'string=)
         (em :const *undefined*) (em :declare-var v)))
     (compile-stmt body)
     (unless toplevel (em :const *undefined*) (em :ret))   ; functions default-return undefined
     (make-code :name name :params params :instrs (assemble *out*))))
+
+(defun compile-array-destructure (pat)
+  "Value on stack is the iterable. Destructure per (:apat ELEMS)."
+  (let ((it (string (gensym "IT"))) (elems (second pat)))
+    (em :get-iterator) (em :declare-var it)
+    (dolist (e elems)
+      (cond
+        ((null e)                            ; hole: step iterator, discard
+         (em :get-var it) (em :iter-next) (em :pop))
+        ((and (consp e) (eq (car e) :rest))
+         (em :get-var it) (em :iter-rest)    ; collect remaining into an array
+         (bind-target (second e)))
+        ((and (consp e) (eq (car e) :default))
+         (em :get-var it) (em :iter-next) (em :get-prop-c "value")
+         (apply-default (third e))
+         (bind-target (second e)))
+        (t (em :get-var it) (em :iter-next) (em :get-prop-c "value")
+           (bind-target e))))))
+
+(defun compile-object-destructure (pat)
+  "Value on stack is the source object. Destructure per (:opat PROPS)."
+  (let ((src (string (gensym "SRC"))) (props (second pat)) (seen '()))
+    (em :declare-var src)
+    (dolist (pr props)
+      (cond
+        ((eq (car pr) :rest)
+         ;; { ...rest }: copy own enumerable keys not already taken
+         (em :get-var src) (em :object-rest (reverse seen)) (em :declare-var (second pr)))
+        (t (destructuring-bind (key tgt &optional default) pr
+             (push (and (eq (car key) :lit) (second key)) seen)
+             (em :get-var src)
+             (if (eq (car key) :computed) (progn (compile-expr (second key)) (em :get-prop))
+                 (em :get-prop-c (second key)))
+             (when default (apply-default default))
+             (bind-target tgt)))))))
+
+(defun compile-params (params)
+  "Emit the parameter-binding prologue: pull positional args, apply defaults,
+   destructure, and gather rest."
+  (loop for p in params for i from 0 do
+    (cond
+      ((and (consp p) (eq (car p) :rest))
+       (em :load-rest i) (bind-target (second p)))
+      ((and (consp p) (eq (car p) :default))
+       (em :load-arg i) (apply-default (third p)) (bind-target (second p)))
+      (t (em :load-arg i) (bind-target p)))))
+
+(defun apply-default (default-expr)
+  "Top of stack is a value; if it is undefined, replace with DEFAULT-EXPR."
+  (let ((skip (lbl)))
+    (em :dup) (em :const *undefined*) (em :bin "!==") (em :jmp-if-true skip)
+    (em :pop) (compile-expr default-expr)
+    (em :label skip)))
+
+(defun bind-target (tgt)
+  "Bind the value on top of the stack to TGT (name or pattern). Consumes it."
+  (cond
+    ((stringp tgt) (em :declare-var tgt))
+    ((null tgt) (em :pop))                  ; hole: discard
+    ((eq (car tgt) :apat) (compile-array-destructure tgt))
+    ((eq (car tgt) :opat) (compile-object-destructure tgt))
+    (t (js-throw "bad binding target"))))
 
 (defun collect-var-names (node &optional acc)
   "Collect `var`-declared names in NODE, NOT descending into nested functions."
@@ -172,12 +267,157 @@
              (if (fourth node) (progn (compile-expr (third node)) (em :get-prop))
                  (em :get-prop-c (second (third node)))))   ; non-computed key node is (:str name)
     (:call (compile-call (second node) (third node)))
-    (:new (compile-expr (second node)) (mapc #'compile-expr (third node)) (em :new (length (third node))))
-    (:array (mapc #'compile-expr (second node)) (em :array (length (second node))))
-    (:object (loop for (k . v) in (second node) do (em :const k) (compile-expr v))
-             (em :object (length (second node))))
+    (:new (compile-expr (second node))
+          (if (some (lambda (a) (and (consp a) (eq (car a) :spread))) (third node))
+              (progn (compile-arg-array (third node)) (em :new-spread))
+              (progn (mapc #'compile-expr (third node)) (em :new (length (third node))))))
+    (:array (compile-array-literal (second node)))
+    (:object (compile-object-literal (second node)))
     (:func (em :closure (compile-fn (second node) (third node) (fourth node))))
-    (:arrow (em :closure (compile-fn nil (second node) (third node))))))
+    (:arrow (em :closure (compile-fn nil (second node) (third node))))
+    (:spread (compile-expr (second node)))   ; bare spread handled by call/array sites
+    (:template (compile-template node))
+    (:tagged-template (compile-tagged-template node))
+    ((:omember :ocall) (compile-optional-chain node))))
+
+(defun array-has-special-p (elems)
+  (some (lambda (e) (or (null e) (and (consp e) (eq (car e) :spread)))) elems))
+
+(defun compile-array-literal (elems)
+  (if (array-has-special-p elems)
+      ;; build incrementally: fresh array, push/append elements, track length
+      (let ((arr (string (gensym "A"))) (idx (string (gensym "AI"))))
+        (em :new-array) (em :declare-var arr)
+        (em :const 0d0) (em :declare-var idx)
+        (dolist (e elems)
+          (cond
+            ((null e)                        ; hole: just bump length/index
+             (em :get-var idx) (em :const 1d0) (em :bin "+") (em :set-var idx) (em :pop))
+            ((and (consp e) (eq (car e) :spread))
+             (em :get-var arr) (em :get-var idx) (compile-expr (second e))
+             (em :array-spread)              ; arr idx iterable -> newidx
+             (em :set-var idx) (em :pop))
+            (t (em :get-var arr) (em :get-var idx) (compile-expr e) (em :set-prop) (em :pop)
+               (em :get-var idx) (em :const 1d0) (em :bin "+") (em :set-var idx) (em :pop))))
+        ;; set final length (covers trailing holes)
+        (em :get-var arr) (em :const "length") (em :get-var idx) (em :set-prop) (em :pop)
+        (em :get-var arr))
+      (progn (mapc #'compile-expr elems) (em :array (length elems)))))
+
+(defun compile-object-literal (props)
+  (em :new-object)                           ; empty object on stack; each op returns it
+  (dolist (pr props)
+    (ecase (car pr)
+      (:init
+       (let ((key (second pr)) (val (third pr)))
+         (if (eq (car key) :computed) (compile-expr (second key)) (em :const (second key)))
+         (compile-expr val)
+         (em :def-prop)))                    ; obj key val -> obj
+      ((:get :set)
+       (let ((key (second pr)) (fn (third pr)))
+         (if (eq (car key) :computed) (compile-expr (second key)) (em :const (second key)))
+         (compile-expr fn)
+         (em (if (eq (car pr) :get) :def-getter :def-setter))))   ; obj key fn -> obj
+      (:proto
+       (compile-expr (second pr))
+       (em :set-proto))                       ; obj protoval -> obj
+      (:spread
+       (compile-expr (second pr))
+       (em :def-spread)))))                  ; obj src -> obj
+
+;;; ---- template literals / tagged templates ----
+(defun compile-template (node)
+  "(:template (COOKED...) (RAW...) (EXPR-AST...)) -> string concatenation.
+   Result = cooked[0] + String(expr[0]) + cooked[1] + ... "
+  (destructuring-bind (cooked raw exprs) (cdr node)
+    (declare (ignore raw))
+    (em :const (or (first cooked) ""))
+    (loop for e in exprs
+          for rest on (cdr cooked) do
+      (compile-expr e) (em :to-str) (em :bin "+")
+      (em :const (or (car rest) "")) (em :bin "+"))))
+
+(defun compile-tagged-template (node)
+  "tag`...` -> tag(stringsArray, ...substitutions) with stringsArray.raw set."
+  (destructuring-bind (tag tmpl) (cdr node)
+    (destructuring-bind (cooked raw exprs) (cdr tmpl)
+      ;; determine `this` and callee like a normal call
+      (if (member (car tag) '(:member :omember))
+          (progn (compile-expr (second tag)) (em :dup)
+                 (if (fourth tag) (progn (compile-expr (third tag)) (em :get-prop))
+                     (em :get-prop-c (second (third tag)))))
+          (progn (em :const *undefined*) (compile-expr tag)))
+      ;; build the strings array (cooked) with a .raw array
+      (em :new-array)
+      (loop for s in cooked for i from 0 do
+        (em :dup) (em :const (princ-to-string i)) (em :const s) (em :set-prop) (em :pop))
+      (em :dup) (em :const "length") (em :const (float (length cooked) 1d0)) (em :set-prop) (em :pop)
+      ;; .raw
+      (em :dup) (em :const "raw") (em :new-array)
+      (loop for s in raw for i from 0 do
+        (em :dup) (em :const (princ-to-string i)) (em :const s) (em :set-prop) (em :pop))
+      (em :dup) (em :const "length") (em :const (float (length raw) 1d0)) (em :set-prop) (em :pop)
+      (em :set-prop) (em :pop)
+      ;; substitutions as remaining args
+      (dolist (e exprs) (compile-expr e))
+      (em :call (1+ (length exprs))))))
+
+;;; ---- optional chaining ----
+(defun optional-chain-p (node)
+  (and (consp node) (member (car node) '(:omember :ocall))))
+
+(defun compile-optional-chain (node)
+  "Compile a chain containing at least one ?. link. If any optional link's base
+   is null/undefined, the whole chain evaluates to undefined."
+  (let ((end (lbl)))
+    (compile-chain-link node end)
+    (let ((done (lbl)))
+      (em :jmp done)
+      (em :label end) (em :pop) (em :const *undefined*)   ; discard base, yield undefined
+      (em :label done))))
+
+(defun compile-chain-link (node short)
+  "Emit code leaving the link's value on the stack; on an optional null/undefined
+   base, jump to SHORT (with the base value still on the stack to be popped)."
+  (ecase (car node)
+    (:omember
+     (compile-chain-base (second node) short)
+     (em :dup) (em :nullish-short short)      ; if base nullish, jump to short (base on stack)
+     (if (fourth node) (progn (compile-expr (third node)) (em :get-prop))
+         (em :get-prop-c (second (third node)))))
+    (:ocall
+     (compile-chain-base (second node) short)
+     (em :dup) (em :nullish-short short)
+     ;; optional call: callee on stack; call with this=undefined
+     (compile-call-on-stack (third node)))
+    (:member
+     (compile-chain-base (second node) short)
+     (if (fourth node) (progn (compile-expr (third node)) (em :get-prop))
+         (em :get-prop-c (second (third node)))))
+    (:call
+     ;; a normal call inside an optional chain (e.g. a?.b())
+     (let ((callee (second node)))
+       (if (member (car callee) '(:member :omember))
+           (progn (compile-chain-base (second callee) short)
+                  (when (eq (car callee) :omember) (em :dup) (em :nullish-short short))
+                  (em :dup)
+                  (if (fourth callee) (progn (compile-expr (third callee)) (em :get-prop))
+                      (em :get-prop-c (second (third callee))))
+                  (mapc #'compile-expr (third node)) (em :call (length (third node))))
+           (progn (compile-chain-base callee short) (em :const *undefined*) (em :swap)
+                  (mapc #'compile-expr (third node)) (em :call (length (third node)))))))))
+
+(defun compile-chain-base (node short)
+  "Compile a sub-expression that is part of the optional chain (recurse) or a
+   plain expression (leaf)."
+  (if (optional-chain-p node)
+      (compile-chain-link node short)
+      (compile-expr node)))
+
+(defun compile-call-on-stack (args)
+  "Callee is on top of stack; call it with this=undefined and ARGS."
+  (em :const *undefined*) (em :swap)          ; -> undefined callee
+  (mapc #'compile-expr args) (em :call (length args)))
 
 (defun compile-call (callee args)
   (if (eq (car callee) :member)            ; method call: `this` is the object
@@ -185,8 +425,23 @@
              (if (fourth callee) (progn (compile-expr (third callee)) (em :get-prop))
                  (em :get-prop-c (second (third callee)))))
       (progn (em :const *undefined*) (compile-expr callee)))   ; plain call: this = undefined
-  (mapc #'compile-expr args)
-  (em :call (length args)))
+  ;; stack now: thisv callee
+  (if (some (lambda (a) (and (consp a) (eq (car a) :spread))) args)
+      (progn (compile-arg-array args) (em :call-spread))       ; thisv callee argsArray -> result
+      (progn (mapc #'compile-expr args) (em :call (length args)))))
+
+(defun compile-arg-array (args)
+  "Build an array of argument values, flattening spreads. Leaves it on the stack."
+  (let ((arr (string (gensym "CA"))) (idx (string (gensym "CI"))))
+    (em :new-array) (em :declare-var arr)
+    (em :const 0d0) (em :declare-var idx)
+    (dolist (a args)
+      (if (and (consp a) (eq (car a) :spread))
+          (progn (em :get-var arr) (em :get-var idx) (compile-expr (second a))
+                 (em :array-spread) (em :set-var idx) (em :pop))
+          (progn (em :get-var arr) (em :get-var idx) (compile-expr a) (em :set-prop) (em :pop)
+                 (em :get-var idx) (em :const 1d0) (em :bin "+") (em :set-var idx) (em :pop))))
+    (em :get-var arr)))
 
 (defun logical-assign-op (op)
   "For &&= ||= ??= return the short-circuit op string; else nil."

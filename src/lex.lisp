@@ -27,6 +27,50 @@
             ((and (char= c #\/) (char= (peek 1) #\*))
              (incf i 2) (loop until (or (>= i n) (and (char= (char src i) #\*) (char= (peek 1) #\/))) do (incf i))
              (incf i 2))
+            ;; template literal  `...${expr}...`
+            ((char= c #\`)
+             (incf i)                          ; past opening backtick
+             (let ((parts '()))                ; reversed list of (:str cooked raw) / (:expr toks)
+               (loop
+                 (let ((cooked (make-string-output-stream))
+                       (raw (make-string-output-stream)))
+                   ;; scan a string chunk until ` , ${ , or EOF
+                   (loop
+                     (when (>= i n) (js-throw (make-native-error "SyntaxError" "Unterminated template")))
+                     (let ((ch (char src i)))
+                       (cond
+                         ((char= ch #\`) (return))
+                         ((and (char= ch #\$) (< (1+ i) n) (char= (char src (1+ i)) #\{)) (return))
+                         ((char= ch #\\)
+                          (write-char ch raw)
+                          (when (< (1+ i) n) (write-char (char src (1+ i)) raw))
+                          (let ((e (and (< (1+ i) n) (char src (1+ i)))))
+                            (incf i)            ; on the escape char
+                            (case e
+                              (#\n (write-char #\Newline cooked)) (#\t (write-char #\Tab cooked))
+                              (#\r (write-char #\Return cooked))  (#\b (write-char #\Backspace cooked))
+                              (#\f (write-char #\Page cooked))    (#\v (write-char (code-char 11) cooked))
+                              (#\` (write-char #\` cooked)) (#\$ (write-char #\$ cooked))
+                              (#\\ (write-char #\\ cooked))
+                              ((#\Newline) nil)
+                              (t (when e (write-char e cooked)))))
+                          (incf i))
+                         (t (write-char ch cooked) (write-char ch raw) (incf i)))))
+                   (push (list :str (get-output-stream-string cooked) (get-output-stream-string raw)) parts))
+                 (cond
+                   ((char= (char src i) #\`) (incf i) (return))     ; end of template
+                   (t ;; ${ expr }
+                    (incf i 2)                  ; past ${
+                    (let ((depth 1) (start i))
+                      (loop
+                        (when (>= i n) (js-throw (make-native-error "SyntaxError" "Unterminated template expr")))
+                        (let ((ch (char src i)))
+                          (cond ((char= ch #\{) (incf depth) (incf i))
+                                ((char= ch #\}) (decf depth) (when (zerop depth) (return)) (incf i))
+                                (t (incf i)))))
+                      (push (list :expr (tokenize (subseq src start i))) parts)
+                      (incf i)))))              ; past closing }
+               (emit :template (nreverse parts))))
             ;; string
             ((or (char= c #\") (char= c #\'))
              (let ((q c) (out (make-string-output-stream))) (incf i)
