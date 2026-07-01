@@ -760,11 +760,15 @@
                (make-array-object (nreverse out)))))))
 
 (defun make-string-iterator (realm s)
+  ;; %StringIteratorPrototype%: iterate by CODE POINT — a surrogate pair yields a
+  ;; single 2-unit substring; a lone surrogate yields its 1-unit substring.
   (let ((i 0) (it (make-object :proto (realm-object-proto realm) :class "String Iterator")))
     (def-method realm it "next" 0 (this args)
       (let ((res (make-object :proto (realm-object-proto realm))))
         (if (< i (length s))
-            (progn (put res "value" (string (char s i))) (put res "done" *false*) (incf i))
+            (multiple-value-bind (cp units) (code-point-at s i)
+              (declare (ignore cp))
+              (put res "value" (subseq s i (+ i units))) (put res "done" *false*) (incf i units))
             (progn (put res "value" *undefined*) (put res "done" *true*)))
         res))
     (when *symbol-iterator*

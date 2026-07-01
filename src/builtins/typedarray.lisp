@@ -8,8 +8,9 @@
 ;;; Element-type descriptors
 ;;; ===========================================================================
 (defstruct (ta-type (:constructor make-ta-type))
-  name size signed float clamped
-  ;; encode: (double) -> unsigned integer of SIZE bytes ; decode: (uint) -> double
+  name size signed float clamped bigint
+  ;; encode: (element-value) -> unsigned integer of SIZE bytes ; decode: (uint) -> element-value
+  ;; For number types the element value is a JS double; for bigint types it is a CL integer.
   encode decode)
 
 (defun clamp-to-uint8 (x)
@@ -74,7 +75,15 @@
      :decode (lambda (u) (bits-float32 u)))
    (make-ta-type :name "Float64Array" :size 8 :float t
      :encode (lambda (x) (float64-bits x))
-     :decode (lambda (u) (bits-float64 u)))))
+     :decode (lambda (u) (bits-float64 u)))
+   ;; ---- 64-bit BigInt element types (elements are CL integers, i.e. bigints) ----
+   (make-ta-type :name "BigInt64Array" :size 8 :signed t :bigint t
+     ;; encode: a bigint -> its 64-bit two's-complement bit pattern (uint64)
+     :encode (lambda (x) (ldb (byte 64 0) x))
+     :decode (lambda (u) (if (>= u #x8000000000000000) (- u #x10000000000000000) u)))
+   (make-ta-type :name "BigUint64Array" :size 8 :bigint t
+     :encode (lambda (x) (ldb (byte 64 0) x))
+     :decode (lambda (u) u))))
 
 ;;; ===========================================================================
 ;;; TypedArray instance internals (stored in the :internal plist)
@@ -114,6 +123,17 @@
     (dotimes (b size)
       (setf (aref bytes (+ base b)) (logand (ash u (* -8 b)) #xFF)))
     val))
+
+(defun ta-coerce-element (o val)
+  "Coerce a JS value to the element type of typed array O: ToBigInt for the
+   bigint element types (throws TypeError on a Number), ToNumber otherwise (which
+   itself throws TypeError on a BigInt). Returns the coerced element value."
+  (if (ta-type-bigint (ta-type-of o)) (to-bigint val) (to-number val)))
+
+(defun ta-coerce-element-ty (ty val)
+  "Like TA-COERCE-ELEMENT but keyed on a ta-type directly (used at construction
+   time before the instance exists)."
+  (if (ta-type-bigint ty) (to-bigint val) (to-number val)))
 
 ;;; ---- canonical numeric index detection ----
 (defun canonical-numeric-index (key)
@@ -165,8 +185,9 @@
   (let ((idx (canonical-numeric-index key)))
     (cond
       ((and idx (or (null receiver) (eq o receiver)))
-       ;; ToNumber runs even for out-of-bounds (observable side effects)
-       (let ((num (to-number v)))
+       ;; ToNumber/ToBigInt runs even for out-of-bounds (observable side effects,
+       ;; and the wrong primitive type throws TypeError before any range check).
+       (let ((num (ta-coerce-element o v)))
          (when (ta-valid-index-p o idx) (ta-write o (truncate idx) num)))
        *true*)
       (idx
@@ -224,10 +245,10 @@
               ((getf desc :accessor) nil)
               ((and (present-p desc :writable) (not (getf desc :writable))) nil)
               (t (when (present-p desc :value)
-                   ;; ToNumber may detach; re-validate before writing (write is a
-                   ;; no-op if the buffer is now detached / index invalid), but the
-                   ;; define still succeeds.
-                   (let ((num (to-number (getf desc :value))))
+                   ;; ToNumber/ToBigInt may detach; re-validate before writing
+                   ;; (write is a no-op if the buffer is now detached / index
+                   ;; invalid), but the define still succeeds.
+                   (let ((num (ta-coerce-element o (getf desc :value))))
                      (when (ta-valid-index-p o idx) (ta-write o (truncate idx) num))))
                  t))
         (js-define-own-property-ordinary o (prop-key key) desc))))
@@ -310,6 +331,12 @@
 (defun ta-from-typedarray (ty src proto)
   (when (ta-detached-p src)
     (js-throw (make-native-error "TypeError" "source is detached")))
+  ;; The content types must match: a bigint array can only be built from a bigint
+  ;; array, and a number array from a number array (spec InitializeTypedArrayFromTypedArray).
+  (unless (eq (and (ta-type-bigint ty) t)
+              (and (ta-type-bigint (ta-type-of src)) t))
+    (js-throw (make-native-error "TypeError"
+               "Cannot mix BigInt and non-BigInt typed arrays")))
   (let* ((len (ta-elt-length src))
          (o (ta-from-length ty len proto)))
     (dotimes (i len) (ta-write o i (ta-read src i)))
@@ -319,7 +346,7 @@
   (let* ((len (to-int-index (js-get src "length")))
          (o (ta-from-length ty len proto)))
     (dotimes (i len)
-      (ta-write o i (to-number (js-get src (princ-to-string i)))))
+      (ta-write o i (ta-coerce-element-ty ty (js-get src (princ-to-string i)))))
     o))
 
 (defun ta-from-iterable (ty src proto)
@@ -336,7 +363,7 @@
                 (push (js-get r "value") vals)))
         (let* ((lst (nreverse vals)) (len (length lst))
                (o (ta-from-length ty len proto)) (i 0))
-          (dolist (v lst) (ta-write o i (to-number v)) (incf i))
+          (dolist (v lst) (ta-write o i (ta-coerce-element-ty ty v)) (incf i))
           o))
       (ta-from-arraylike ty src proto)))
 
@@ -469,7 +496,7 @@
     (def-method realm tp "fill" 1 (this args)
       (with-ta-v (o this)
         (let* ((l (len o))
-               (v (to-number (arg 0 args)))
+               (v (ta-coerce-element o (arg 0 args)))
                (start (clamp-idx (arg 1 args) l 0))
                (end (if (js-undefined-p (arg 2 args)) l (clamp-idx (arg 2 args) l l))))
           (when (ta-detached-p o) (js-throw (make-native-error "TypeError" "detached")))
@@ -573,7 +600,7 @@
         (with-ta-v (o this)
           (let* ((f (cb "not callable")) (ta (arg 1 args)) (l (len o))
                  (out (ta-from-length (ta-type-of o) l (ta-species-proto o nil))))
-            (dotimes (i l) (ta-write out i (to-number (js-call f ta (list (ta-read-or-undef o i) (float i 1d0) o)))))
+            (dotimes (i l) (ta-write out i (ta-coerce-element out (js-call f ta (list (ta-read-or-undef o i) (float i 1d0) o)))))
             out)))
       (def-method realm tp "filter" 1 (this args)
         (with-ta-v (o this)
@@ -582,7 +609,9 @@
               (let ((v (ta-read-or-undef o i)))
                 (when (js-truthy (js-call f ta (list v (float i 1d0) o))) (push v kept))))
             (let* ((vals (nreverse kept)) (out (ta-from-length (ta-type-of o) (length vals) (ta-species-proto o nil))) (i 0))
-              (dolist (v vals) (ta-write out i (to-number v)) (incf i))
+              ;; VALS are already element values read from O (same type as OUT);
+              ;; no re-coercion needed (and ToNumber would reject bigints).
+              (dolist (v vals) (ta-write out i v) (incf i))
               out))))
       (def-method realm tp "some" 1 (this args)
         (with-ta-v (o this)
@@ -671,6 +700,11 @@
                 (progn
                   (when (ta-detached-p src)
                     (js-throw (make-native-error "TypeError" "source is backed by a detached ArrayBuffer")))
+                  ;; Content types must match (SetTypedArrayFromTypedArray).
+                  (unless (eq (and (ta-type-bigint (ta-type-of o)) t)
+                              (and (ta-type-bigint (ta-type-of src)) t))
+                    (js-throw (make-native-error "TypeError"
+                               "Cannot mix BigInt and non-BigInt typed arrays")))
                   (let ((slen (ta-elt-length src)))
                     ;; offset can be +Infinity here: any positive slen overflows the target.
                     (when (or (= offset *inf*) (> (+ offset slen) targetlen))
@@ -687,7 +721,7 @@
                     (js-throw (make-native-error "RangeError" "source array is too large")))
                   (let ((off (truncate offset)))
                     (dotimes (i slen)
-                      (let ((num (to-number (js-get src (princ-to-string i)))))
+                      (let ((num (ta-coerce-element o (js-get src (princ-to-string i)))))
                         (when (ta-valid-index-p o (float (+ off i) 1d0))
                           (ta-write o (+ off i) num))))))))
           *undefined*)))
@@ -733,8 +767,8 @@
                         ((= rel *-inf*) -1)        ; guaranteed out of range
                         ((>= rel 0) (truncate rel))
                         (t (+ l (truncate rel)))))
-               ;; ToNumber(value) runs BEFORE the final validity check (spec 23.2.3.36).
-               (v (to-number (arg 1 args))))
+               ;; ToNumber/ToBigInt(value) runs BEFORE the final validity check (spec 23.2.3.36).
+               (v (ta-coerce-element o (arg 1 args))))
           ;; IsValidIntegerIndex is evaluated against the CURRENT length.
           (when (or (< k 0) (>= k (ta-length-checked o)))
             (js-throw (make-native-error "RangeError" "index out of range")))
@@ -771,8 +805,12 @@
              :enumerable nil :writable t :configurable t)))))
 
 (defun ta-default-less (a b)
-  "Default TypedArray numeric sort comparator (ascending; NaN last; -0 before +0)."
-  (cond ((and (js-nan-p a) (js-nan-p b)) nil)
+  "Default TypedArray numeric sort comparator (ascending; NaN last; -0 before +0).
+   A and B are element values: JS doubles for the Number arrays, or CL integers
+   (bigints) for the BigInt arrays. Bigints have no NaN / no signed zero, so plain
+   ascending order applies."
+  (cond ((and (integerp a) (integerp b)) (< a b))     ; bigint elements
+        ((and (js-nan-p a) (js-nan-p b)) nil)
         ((js-nan-p a) nil) ((js-nan-p b) t)
         ((and (zerop a) (zerop b)) (and (js-negative-zero-p a) (not (js-negative-zero-p b))))
         (t (< a b))))

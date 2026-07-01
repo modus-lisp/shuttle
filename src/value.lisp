@@ -167,6 +167,38 @@
             ((js-bigint-p v) (or (getf (realm-intrinsics r) :bigint-proto) *null*))
             (t *null*)))))
 
+;;; ---- UTF-16 code-unit string helpers -------------------------------------
+;;; A JS string is a CL string whose every character is a UTF-16 code UNIT
+;;; (0x0000..0xFFFF, lone surrogates allowed). An astral scalar value (> 0xFFFF)
+;;; is stored as a surrogate PAIR of two CL chars. These are the ENCODE/DECODE
+;;; boundary helpers; use them wherever a string is built from, or read back to,
+;;; Unicode code points.
+(defun utf16-encode-cp (cp)
+  "A CL string of the UTF-16 code unit(s) encoding scalar value CP: one char for
+   a BMP scalar (incl. lone surrogate values), a surrogate pair for astral."
+  (if (<= cp #xFFFF)
+      (string (code-char cp))
+      (let ((v (- cp #x10000)) (s (make-string 2)))
+        (setf (char s 0) (code-char (+ #xD800 (ash v -10)))
+              (char s 1) (code-char (+ #xDC00 (logand v #x3FF))))
+        s)))
+
+(defun string-from-code-points (cps)
+  "Concatenate the UTF-16 encodings of a list of scalar values CPS."
+  (let ((out (make-string-output-stream)))
+    (dolist (cp cps) (write-string (utf16-encode-cp cp) out))
+    (get-output-stream-string out)))
+
+(defun code-point-at (str i)
+  "Decode the code point beginning at code-unit index I of STR. Returns
+   (values code-point units-consumed): a high surrogate at I followed by a low
+   surrogate combines to an astral scalar (2 units); otherwise the lone unit."
+  (let ((cc (char-code (char str i))))
+    (if (and (<= #xD800 cc #xDBFF) (< (1+ i) (length str))
+             (<= #xDC00 (char-code (char str (1+ i))) #xDFFF))
+        (values (+ #x10000 (ash (- cc #xD800) 10) (- (char-code (char str (1+ i))) #xDC00)) 2)
+        (values cc 1))))
+
 (defun js-array-p (o) (and (js-object-p o) (string= (js-object-class o) "Array")))
 (defun to-uint32 (v)
   (let ((n (to-number v)))

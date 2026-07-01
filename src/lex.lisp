@@ -10,6 +10,14 @@
     "+=" "-=" "*=" "/=" "%=" "&=" "|=" "^=" "<<" ">>"
     "+" "-" "*" "/" "%" "<" ">" "=" "(" ")" "{" "}" "[" "]" ";" "," "." ":" "!" "?" "&" "|" "~" "^"))
 
+(defun write-str-char (ch out)
+  "Write a single source/literal character CH to the string-output-stream OUT as
+   UTF-16 code units: an astral char (code > #xFFFF) — which SBCL read from the
+   UTF-8 file as one UCS-4 char — is split into its surrogate pair. A BMP char
+   (incl. a lone surrogate) is written verbatim."
+  (let ((cc (char-code ch)))
+    (if (> cc #xFFFF) (write-string (utf16-encode-cp cc) out) (write-char ch out))))
+
 (defun id-start-p (c) (or (alpha-char-p c) (char= c #\_) (char= c #\$)))
 (defun id-part-p  (c) (or (alphanumericp c) (char= c #\_) (char= c #\$)))
 
@@ -55,11 +63,22 @@
           ((char= c #\]) (setf in-class nil) (incf j))
           ((and (char= c #\/) (not in-class)) (return))  ; end of body
           (t (incf j)))))
-    (let ((pattern (subseq src (1+ i) j)))
+    ;; The pattern is source text: an astral char must become its UTF-16
+    ;; surrogate pair so the pattern string is code units like every JS string
+    ;; (keeps group names / RegExp.source consistent with code-unit replacement
+    ;; strings, and lets the matcher advance by code unit).
+    (let ((pattern (source->code-units src (1+ i) j)))
       (incf j)                                          ; past closing /
       (let ((fstart j))
         (loop while (and (< j n) (id-part-p (char src j))) do (incf j))
         (values pattern (subseq src fstart j) j)))))
+
+(defun source->code-units (src start end)
+  "SUBSEQ of SRC[START:END] with each astral source char split into its UTF-16
+   surrogate pair (BMP chars, incl. lone surrogates, pass through)."
+  (let ((out (make-string-output-stream)))
+    (loop for k from start below end do (write-str-char (char src k) out))
+    (get-output-stream-string out)))
 
 (defun tokenize (src)
   (let ((i 0) (n (length src)) (toks (make-array 0 :adjustable t :fill-pointer 0)))
@@ -109,10 +128,31 @@
                               (#\f (write-char #\Page cooked))    (#\v (write-char (code-char 11) cooked))
                               (#\` (write-char #\` cooked)) (#\$ (write-char #\$ cooked))
                               (#\\ (write-char #\\ cooked))
+                              (#\x                       ; \xHH -> one code unit
+                               (let ((v 0) (ok t))
+                                 (dotimes (_ 2)
+                                   (let ((d (and (< (1+ i) n) (digit-char-p (char src (1+ i)) 16))))
+                                     (if d (progn (setf v (+ (* v 16) d)) (incf i) (write-char (char src i) raw))
+                                         (setf ok nil))))
+                                 (write-char (if ok (code-char v) #\x) cooked)))
+                              (#\u                       ; \uHHHH or \u{XXXXXX}
+                               (if (and (< (1+ i) n) (char= (char src (1+ i)) #\{))
+                                   (let ((v 0)) (incf i) (write-char #\{ raw)   ; skip {
+                                     (loop for d = (and (< (1+ i) n) (digit-char-p (char src (1+ i)) 16))
+                                           while d do (setf v (+ (* v 16) d)) (incf i) (write-char (char src i) raw))
+                                     (when (and (< (1+ i) n) (char= (char src (1+ i)) #\}))
+                                       (incf i) (write-char #\} raw))
+                                     (write-string (utf16-encode-cp (min v #x10FFFF)) cooked))
+                                   (let ((v 0) (ok t))
+                                     (dotimes (_ 4)
+                                       (let ((d (and (< (1+ i) n) (digit-char-p (char src (1+ i)) 16))))
+                                         (if d (progn (setf v (+ (* v 16) d)) (incf i) (write-char (char src i) raw))
+                                             (setf ok nil))))
+                                     (write-char (if ok (code-char v) #\u) cooked))))
                               ((#\Newline) nil)
-                              (t (when e (write-char e cooked)))))
+                              (t (when e (write-str-char e cooked)))))
                           (incf i))
-                         (t (write-char ch cooked) (write-char ch raw) (incf i)))))
+                         (t (write-str-char ch cooked) (write-str-char ch raw) (incf i)))))
                    (push (list :str (get-output-stream-string cooked) (get-output-stream-string raw)) parts))
                  (cond
                    ((char= (char src i) #\`) (incf i) (return))     ; end of template
@@ -155,12 +195,14 @@
                                         (loop for d = (and (< (1+ i) n) (digit-char-p (char src (1+ i)) 16))
                                               while d do (setf v (+ (* v 16) d)) (incf i))
                                         (when (and (< (1+ i) n) (char= (char src (1+ i)) #\})) (incf i))
-                                        (write-char (code-char (min v #x10FFFF)) out))
+                                        ;; \u{XXXXXX}: astral scalar -> surrogate pair
+                                        (write-string (utf16-encode-cp (min v #x10FFFF)) out))
+                                      ;; \uXXXX: one code unit verbatim (may be a lone surrogate)
                                       (let ((v (hexn 4))) (write-char (code-char (or v (char-code #\u))) out))))
                              ((#\Newline) nil)   ; line continuation: emit nothing
                              (#\Return (when (and (< (1+ i) n) (char= (char src (1+ i)) #\Newline)) (incf i)))
-                             (t (write-char e out))))
-                         (write-char ch out))
+                             (t (write-str-char e out))))
+                         (write-str-char ch out))
                      (incf i))))
                (incf i) (emit :str (get-output-stream-string out))))
             ;; number (decimal / float / exponent; radix 0x/0o/0b) + BigInt `n` suffix
