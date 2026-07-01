@@ -25,9 +25,28 @@
 
 (defun compile-fn (name params body &optional toplevel)
   (let ((*out* '()))
+    ;; hoist: pre-declare all `var` names (as undefined) so forward reads don't
+    ;; ReferenceError. Function declarations are hoisted by :func handling below.
+    (dolist (v (collect-var-names body))
+      (unless (member v params :test #'string=)
+        (em :const *undefined*) (em :declare-var v)))
     (compile-stmt body)
     (unless toplevel (em :const *undefined*) (em :ret))   ; functions default-return undefined
     (make-code :name name :params params :instrs (assemble *out*))))
+
+(defun collect-var-names (node &optional acc)
+  "Collect `var`-declared names in NODE, NOT descending into nested functions."
+  (when (consp node)
+    (case (car node)
+      ((:func :arrow) acc)               ; nested function scope: stop
+      (:var (dolist (d (third node)) (pushnew (car d) acc :test #'string=)) acc)
+      (:for-in (setf acc (collect-var-names (fourth node) (collect-var-names (second node) acc))))
+      (:for-of (setf acc (collect-var-names (fourth node) (collect-var-names (second node) acc))))
+      (t (dolist (x (cdr node))
+           (cond ((and (consp x) (keywordp (car x))) (setf acc (collect-var-names x acc)))
+                 ((and (consp x) (consp (car x)))   ; a list of statements/cases
+                  (dolist (y x) (when (consp y) (setf acc (collect-var-names y acc)))))))
+         acc))))
 
 ;;; ---- statements ----
 (defun compile-stmt (node)
@@ -58,6 +77,8 @@
               (em :label cont)
               (when update (compile-expr update) (em :pop))
               (em :jmp top) (em :label end))))
+    (:for-in (compile-for-in node))
+    (:for-of (compile-for-of node))
     (:break (if *break-target* (em :jmp *break-target*) (js-throw "illegal break")))
     (:continue (if *continue-target* (em :jmp *continue-target*) (js-throw "illegal continue")))
     (:switch (destructuring-bind (disc cases default) (cdr node)
@@ -80,6 +101,41 @@
                 (compile-stmt blk))
             (when fin (compile-stmt fin))))))   ; v0: finally runs on the normal/caught path
 
+(defun for-head-assign (head)
+  "Bind the value currently on top of the stack to the loop target (consumes it)."
+  (cond ((eq (car head) :var) (em :declare-var (car (first (third head)))))
+        ((eq (car head) :ident) (em :set-var (second head)) (em :pop))
+        (t (js-throw "unsupported for-in/of target"))))
+
+(defun compile-for-in (node)
+  (destructuring-bind (head obj body) (cdr node)
+    (let ((keys (string (gensym "KS"))) (idx (string (gensym "I"))) (len (string (gensym "N")))
+          (top (lbl)) (cont (lbl)) (end (lbl)))
+      (compile-expr obj) (em :for-in-keys) (em :declare-var keys)  ; array of enumerable keys
+      (em :const 0d0) (em :declare-var idx)
+      (em :get-var keys) (em :get-prop-c "length") (em :declare-var len)
+      (em :label top)
+      (em :get-var idx) (em :get-var len) (em :bin "<") (em :jmp-if-false end)
+      (em :get-var keys) (em :get-var idx) (em :get-prop)     ; the key string
+      (for-head-assign head)
+      (let ((*break-target* end) (*continue-target* cont)) (compile-stmt body))
+      (em :label cont)
+      (em :get-var idx) (em :const 1d0) (em :bin "+") (em :set-var idx) (em :pop)
+      (em :jmp top) (em :label end))))
+
+(defun compile-for-of (node)
+  (destructuring-bind (head obj body) (cdr node)
+    (let ((it (string (gensym "IT"))) (res (string (gensym "R")))
+          (top (lbl)) (cont (lbl)) (end (lbl)))
+      (compile-expr obj) (em :get-iterator) (em :declare-var it)
+      (em :label top)
+      (em :get-var it) (em :iter-next) (em :declare-var res)     ; {value,done}
+      (em :get-var res) (em :get-prop-c "done") (em :jmp-if-true end)
+      (em :get-var res) (em :get-prop-c "value")
+      (for-head-assign head)
+      (let ((*break-target* end) (*continue-target* cont)) (compile-stmt body))
+      (em :label cont) (em :jmp top) (em :label end))))
+
 ;;; ---- expressions (each leaves exactly one value on the stack) ----
 (defun compile-expr (node)
   (ecase (car node)
@@ -91,7 +147,15 @@
     (:this (em :get-this))
     (:ident (em :get-var (second node)))
     (:bin (compile-expr (third node)) (compile-expr (fourth node)) (em :bin (second node)))
-    (:unary (compile-expr (third node)) (em :unary (second node)))
+    (:unary (if (and (string= (second node) "typeof") (eq (car (third node)) :ident))
+                (em :typeof-var (second (third node)))     ; typeof of a NAME never throws
+                (progn (compile-expr (third node)) (em :unary (second node)))))
+    (:delete (let ((tgt (second node)))
+               (if (eq (car tgt) :member)
+                   (progn (compile-expr (second tgt))
+                          (if (fourth tgt) (compile-expr (third tgt)) (em :const (second (third tgt))))
+                          (em :del-prop))
+                   (em :const *true*))))   ; delete of a non-reference is true (sloppy)
     (:logical (let ((end (lbl)))
                 (compile-expr (third node))
                 (em (if (string= (second node) "&&") :and-jmp :or-jmp) end)
@@ -128,17 +192,29 @@
       (:ident (if base (progn (em :get-var (second target)) (compile-expr value) (em :bin base))
                   (compile-expr value))
               (em :set-var (second target)))
-      (:member (when base (js-throw "compound assignment to member not yet supported"))
-               (compile-expr (second target))                  ; obj
-               (if (fourth target) (compile-expr (third target)) (em :const (second (third target)))) ; key
-               (compile-expr value)
-               (em :set-prop)))))
+      (:member
+       (compile-expr (second target))                                       ; obj
+       (if (fourth target) (compile-expr (third target)) (em :const (second (third target)))) ; key
+       (if base
+           ;; obj key -> [obj key obj-key-get] -> bin -> set-prop  (dup obj+key first)
+           (progn (em :dup2)               ; stack: obj key obj key
+                  (em :get-prop)           ; stack: obj key old
+                  (compile-expr value) (em :bin base))  ; stack: obj key new
+           (compile-expr value))
+       (em :set-prop)))))
 
 (defun compile-update (op prefix target)
-  ;; ++/-- on an identifier (member targets: TODO)
-  (unless (eq (car target) :ident) (js-throw "update on non-identifier not yet supported"))
-  (let ((name (second target)) (binop (if (string= op "++") "+" "-")))
-    (em :get-var name) (em :to-num)
-    (if prefix
-        (progn (em :const 1d0) (em :bin binop) (em :set-var name))
-        (progn (em :dup) (em :const 1d0) (em :bin binop) (em :set-var name) (em :pop)))))
+  (let ((binop (if (string= op "++") "+" "-")))
+    (ecase (car target)
+      (:ident
+       (let ((name (second target)))
+         (em :get-var name) (em :to-num)
+         (if prefix
+             (progn (em :const 1d0) (em :bin binop) (em :set-var name))
+             (progn (em :dup) (em :const 1d0) (em :bin binop) (em :set-var name) (em :pop)))))
+      (:member
+       (compile-expr (second target))
+       (if (fourth target) (compile-expr (third target)) (em :const (second (third target))))
+       ;; stack: obj key ; VM op reads obj[key], applies +/-1, writes back,
+       ;; and pushes the new (prefix) or old (postfix) numeric value.
+       (em :update-prop (if (string= op "++") 1d0 -1d0) prefix)))))

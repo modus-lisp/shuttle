@@ -12,4 +12,8 @@
    ;; abstract operations (spec coercions)
    #:to-boolean #:to-number #:to-string #:to-primitive #:js-typeof
    #:js-truthy #:js-equal #:js-strict-equal
+   #:to-object #:to-length #:to-integer-or-infinity #:require-object-coercible
+   #:to-property-key #:same-value #:same-value-zero
+   #:js-define-own-property #:js-get-own-property #:put #:put-accessor
+   #:js-symbol #:make-js-symbol #:js-symbol-p #:js-symbol-desc
    #:shuttle-error #:js-throw))

@@ -63,9 +63,30 @@
 
 (defun parse-for ()
   (adv) (eat "(")
-  (let ((init (cond ((punct? ";") nil)
-                    ((or (kw? "var") (kw? "let") (kw? "const")) (parse-var-decl))
-                    (t (list :expr (parse-expr 1))))))
+  ;; detect for-in / for-of: parse the head, then look for `in`/`of`
+  (let ((decl-kind nil) (init nil))
+    (cond ((punct? ";") (setf init nil))
+          ((or (kw? "var") (kw? "let") (kw? "const"))
+           (setf decl-kind (cur-val)) (adv)
+           (let ((name (cur-val))) (adv)
+             (cond ((or (kw? "in") (kw? "of"))
+                    (let ((kind (cur-val))) (adv)
+                      (let ((obj (parse-expr 1))) (eat ")")
+                        (return-from parse-for
+                          (list (if (string= kind "in") :for-in :for-of)
+                                (list :var decl-kind (list (cons name nil))) obj (parse-stmt))))))
+                   (t (let ((decls (list (cons name (when (opt "=") (parse-expr 2))))))
+                        (loop while (opt ",")
+                              do (let ((n2 (cur-val))) (adv)
+                                   (push (cons n2 (when (opt "=") (parse-expr 2))) decls)))
+                        (setf init (list :var decl-kind (nreverse decls))))))))
+          (t (let ((e (parse-expr 1)))
+               (cond ((or (kw? "in") (kw? "of"))
+                      (let ((kind (cur-val))) (adv)
+                        (let ((obj (parse-expr 1))) (eat ")")
+                          (return-from parse-for
+                            (list (if (string= kind "in") :for-in :for-of) e obj (parse-stmt))))))
+                     (t (setf init (list :expr e)))))))
     (eat ";")
     (let ((test (unless (punct? ";") (parse-expr 1)))) (eat ";")
       (let ((update (unless (punct? ")") (parse-expr 1)))) (eat ")")
@@ -131,6 +152,8 @@
     (cond
       ((and (eq tt :punct) (member tv '("!" "-" "+" "~") :test #'string=)) (adv) (list :unary tv (parse-unary)))
       ((kw? "typeof") (adv) (list :unary "typeof" (parse-unary)))
+      ((kw? "void") (adv) (list :unary "void" (parse-unary)))
+      ((kw? "delete") (adv) (list :delete (parse-unary)))
       ((kw? "new") (adv) (let ((callee (parse-member (parse-primary) nil))) ; member, but NOT the call
                            (list :new callee (if (punct? "(") (parse-args) '()))))
       ((or (punct? "++") (punct? "--")) (let ((op tv)) (adv) (list :update op t (parse-unary))))
