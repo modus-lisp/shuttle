@@ -380,7 +380,18 @@
 ;;; ===========================================================================
 (defstruct (mctx (:constructor make-mctx))
   input len captures
-  ignore-case multiline dot-all unicode)
+  ignore-case multiline dot-all unicode
+  (steps 0 :type fixnum))
+
+;; Bound total backtracking work per exec: a pathological pattern (nested
+;; quantifiers, catastrophic backtracking) would otherwise recurse the CL
+;; control stack to a FATAL, uncatchable exhaustion. On exceed we THROW
+;; 'regex-overflow, caught in regex-exec -> treat as no match.
+(defparameter *regex-max-steps* 1500000)
+(declaim (inline regex-step))
+(defun regex-step (mc)
+  (when (> (the fixnum (incf (the fixnum (mctx-steps mc)))) (the fixnum *regex-max-steps*))
+    (throw 'regex-overflow nil)))
 
 (defun rx-char-eq (mc a b)
   (if (mctx-ignore-case mc)
@@ -528,10 +539,12 @@
     (let ((m (compile-node body)))
       (lambda (mc pos k)
         (labels ((match-min (n pos)
+                   (regex-step mc)
                    (if (zerop n)
                        (match-optional (if mx (- mx mn) nil) pos)
                        (funcall m mc pos (lambda (p2) (match-min (1- n) p2)))))
                  (match-optional (remaining pos)
+                   (regex-step mc)
                    (if (and remaining (<= remaining 0))
                        (funcall k pos)
                        (if lazy
@@ -625,6 +638,7 @@
          (sticky (compiled-regex-sticky cre))
          (matcher (compiled-regex-matcher cre)))
     (when (> start len) (return-from regex-exec nil))
+    (catch 'regex-overflow
     (loop for pos from start to len do
       (let* ((caps (make-array (1+ n) :initial-element nil))
              (mc (make-mctx :input input :len len :captures caps
@@ -637,4 +651,4 @@
           (setf (aref caps 0) (cons pos end))
           (return-from regex-exec (values end caps)))
         (when sticky (return-from regex-exec nil))))
-    nil))
+    nil)))
