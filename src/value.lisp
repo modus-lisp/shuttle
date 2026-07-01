@@ -127,6 +127,35 @@
             ((js-symbol-p v) (realm-symbol-proto r))
             (t *null*)))))
 
+(defun js-array-p (o) (and (js-object-p o) (string= (js-object-class o) "Array")))
+(defun to-uint32 (v)
+  (let ((n (to-number v)))
+    (if (or (js-nan-p n) (= n *inf*) (= n *-inf*)) 0 (mod (truncate n) #x100000000))))
+(defun array-length (o)
+  (let ((ld (gethash "length" (js-object-props o)))) (if ld (truncate (prop-value ld)) 0)))
+
+(defun array-set-length (o v)
+  "Array exotic [[Set]] \"length\": coerce to uint32 (RangeError on mismatch);
+   when shrinking, delete indices >= new length (highest first, honoring
+   non-configurable), then store the new length."
+  (let* ((num (to-number v)) (newlen (to-uint32 v)))
+    (unless (= newlen num) (js-throw (make-native-error "RangeError" "Invalid array length")))
+    (let ((ld (gethash "length" (js-object-props o))))
+      (when (and ld (not (prop-writable ld))) (return-from array-set-length *false*))
+      (let ((oldlen (if ld (truncate (prop-value ld)) 0)))
+        (when (< newlen oldlen)
+          (loop for i from (1- oldlen) downto newlen
+                for k = (princ-to-string i)
+                for d = (gethash k (js-object-props o))
+                when d do
+                  (if (prop-configurable d)
+                      (progn (remhash k (js-object-props o)) (%key-forget o k))
+                      (progn (when ld (setf (prop-value ld) (float (1+ i) 1d0)))
+                             (return-from array-set-length *false*)))))
+        (if ld (setf (prop-value ld) (float newlen 1d0))
+            (put o "length" (float newlen 1d0) :enumerable nil))
+        *true*))))
+
 (defun ordinary-set (o key v &optional receiver)
   ;; OrdinarySet with the receiver walk: an own data prop on RECEIVER is written;
   ;; an inherited accessor's setter is called with RECEIVER as this.
@@ -137,6 +166,20 @@
     ;; setting on a primitive: walk its proto for an inherited setter, else no-op
     (let ((proto (primitive-proto o)))
       (return-from ordinary-set (if (js-object-p proto) (js-set proto key v o) *false*))))
+  ;; ---- Array exotic [[Set]]: length maintenance ----
+  (when (and (js-array-p o) (eq o receiver))
+    (let ((k (prop-key key)))
+      (when (stringp k)
+        (cond ((string= k "length") (return-from ordinary-set (array-set-length o v)))
+              ((array-index-string-p k)
+               (let* ((idx (parse-integer k)) (len (array-length o))
+                      (ld (gethash "length" (js-object-props o))))
+                 (when (and ld (not (prop-writable ld)) (>= idx len))
+                   (return-from ordinary-set *false*))
+                 (let ((res (%create-data-on-receiver o k v)))
+                   (when (and (eq res *true*) ld (>= idx len))
+                     (setf (prop-value ld) (float (1+ idx) 1d0)))
+                   (return-from ordinary-set res))))))))
   (let* ((k (prop-key key)) (d (gethash k (js-object-props o))))
     (cond
       ((and d (prop-accessor d))
