@@ -454,6 +454,7 @@
 (defun compile-expr (node)
   (ecase (car node)
     (:num (em :const (second node)))
+    (:bigint (em :const (second node)))
     (:str (em :const (second node)))
     (:regex (em :get-var "RegExp") (em :const (second node)) (em :const (third node)) (em :new 2))
     (:bool (em :const (if (second node) *true* *false*)))
@@ -843,11 +844,12 @@
   (let ((binop (if (string= op "++") "+" "-")))
     (ecase (car target)
       (:ident
-       (let ((name (second target)))
-         (em :get-var name) (em :to-num)
+       (let ((name (second target)) (delta (if (string= op "++") 1 -1)))
+         (declare (ignore binop))
+         (em :get-var name) (em :to-numeric)
          (if prefix
-             (progn (em :const 1d0) (em :bin binop) (em :set-var name))
-             (progn (em :dup) (em :const 1d0) (em :bin binop) (em :set-var name) (em :pop)))))
+             (progn (em :num-step delta) (em :set-var name))
+             (progn (em :dup) (em :num-step delta) (em :set-var name) (em :pop)))))
       (:member
        (compile-expr (second target))
        (if (fourth target) (compile-expr (third target)) (em :const (second (third target))))

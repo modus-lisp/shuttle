@@ -26,7 +26,7 @@
   (if (zerop (fill-pointer toks)) t
       (let* ((tok (aref toks (1- (fill-pointer toks)))) (type (car tok)) (val (cdr tok)))
         (case type
-          ((:num :str :template :regex) nil)     ; these produce a value -> division
+          ((:num :bigint :str :template :regex) nil)     ; these produce a value -> division
           (:ident (cond ((member val *regex-not-after-keywords* :test #'string=) nil)
                         ;; a reserved word that is NOT a value keyword: regex allowed
                         ;; (return, typeof, delete, in, of, case, do, else, yield, void, new, ...)
@@ -163,28 +163,67 @@
                          (write-char ch out))
                      (incf i))))
                (incf i) (emit :str (get-output-stream-string out))))
-            ;; number (decimal / float / exponent; hex 0x)
+            ;; number (decimal / float / exponent; radix 0x/0o/0b) + BigInt `n` suffix
             ((or (digit-char-p c) (and (char= c #\.) (digit-char-p (peek 1))))
-             (let ((start i))
-               (if (and (char= c #\0) (member (peek 1) '(#\x #\X)))
-                   (progn (incf i 2) (loop while (and (< i n) (digit-char-p (char src i) 16)) do (incf i)))
-                   (progn (loop while (and (< i n) (digit-char-p (char src i))) do (incf i))
-                          (when (and (< i n) (char= (char src i) #\.))
-                            (incf i) (loop while (and (< i n) (digit-char-p (char src i))) do (incf i)))
-                          (when (and (< i n) (member (char src i) '(#\e #\E)))
-                            (incf i) (when (member (peek) '(#\+ #\-)) (incf i))
-                            (loop while (and (< i n) (digit-char-p (char src i))) do (incf i)))))
-               (let ((text (subseq src start i)))
-                 (emit :num (if (and (> (length text) 1) (char-equal (char text 1) #\x))
-                                (float (parse-integer text :start 2 :radix 16) 1d0)
-                                (let ((*read-default-float-format* 'double-float))
+             (let ((start i)
+                   (radix nil)        ; 16/8/2 for a 0x/0o/0b literal, else nil
+                   (has-dot nil) (has-exp nil))
+               (cond
+                 ((and (char= c #\0) (member (peek 1) '(#\x #\X)))
+                  (setf radix 16) (incf i 2)
+                  (loop while (and (< i n) (digit-char-p (char src i) 16)) do (incf i)))
+                 ((and (char= c #\0) (member (peek 1) '(#\o #\O)))
+                  (setf radix 8) (incf i 2)
+                  (loop while (and (< i n) (digit-char-p (char src i) 8)) do (incf i)))
+                 ((and (char= c #\0) (member (peek 1) '(#\b #\B)))
+                  (setf radix 2) (incf i 2)
+                  (loop while (and (< i n) (digit-char-p (char src i) 2)) do (incf i)))
+                 (t
+                  (loop while (and (< i n) (digit-char-p (char src i))) do (incf i))
+                  (when (and (< i n) (char= (char src i) #\.))
+                    (setf has-dot t) (incf i)
+                    (loop while (and (< i n) (digit-char-p (char src i))) do (incf i)))
+                  (when (and (< i n) (member (char src i) '(#\e #\E)))
+                    (setf has-exp t) (incf i) (when (member (peek) '(#\+ #\-)) (incf i))
+                    (loop while (and (< i n) (digit-char-p (char src i))) do (incf i)))))
+               ;; A radix prefix with no digits (0x / 0o / 0b) is malformed.
+               (when (and radix (= i (+ start 2)))
+                 (js-throw (make-native-error "SyntaxError" "Missing digits after radix prefix")))
+               ;; BigInt literal: a trailing `n`. Only on integer syntax
+               ;; (no `.`/exponent, no legacy-octal like 0123n) — else SyntaxError.
+               (let ((bigint (and (< i n) (char= (char src i) #\n)))
+                     (text (subseq src start i)))
+                 (if bigint
+                     (progn
+                       (incf i)
+                       (when (or has-dot has-exp)
+                         (js-throw (make-native-error "SyntaxError" "Invalid BigInt literal")))
+                       ;; legacy non-radix leading-zero (0123) is disallowed with `n`
+                       (when (and (null radix) (> (length text) 1) (char= (char text 0) #\0))
+                         (js-throw (make-native-error "SyntaxError" "Invalid BigInt literal"))))
+                     nil)
+                 ;; A numeric literal may not be immediately followed by an
+                 ;; IdentifierStart or DecimalDigit (e.g. 0b2n, 3in, 1.2.3).
+                 (when (and (< i n)
+                            (let ((nc (char src i))) (or (id-start-p nc) (digit-char-p nc))))
+                   (js-throw (make-native-error "SyntaxError" "Unexpected character after numeric literal")))
+                 (if bigint
+                     (emit :bigint
+                           (if radix (parse-integer text :start 2 :radix radix)
+                               (parse-integer text)))
+                     (emit :num
+                           (cond
+                             ((eql radix 16) (float (parse-integer text :start 2 :radix 16) 1d0))
+                             ((eql radix 8)  (float (parse-integer text :start 2 :radix 8) 1d0))
+                             ((eql radix 2)  (float (parse-integer text :start 2 :radix 2) 1d0))
+                             (t (let ((*read-default-float-format* 'double-float))
                                   ;; An overflowing numeric literal (e.g. 1E+309) is
                                   ;; Infinity per spec, not a reader error.
                                   (with-js-floats
                                     (handler-case (float (read-from-string text) 1d0)
                                       (floating-point-overflow () *inf*)
                                       (reader-error () *inf*)
-                                      (arithmetic-error () *inf*)))))))))
+                                      (arithmetic-error () *inf*)))))))))))
             ;; identifier / keyword  (also #private-name as a lexeme)
             ((or (id-start-p c) (and (char= c #\#) (< (1+ i) n) (id-start-p (char src (1+ i)))))
              (let ((start i)) (when (char= c #\#) (incf i))

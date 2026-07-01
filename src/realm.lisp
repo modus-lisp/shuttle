@@ -593,11 +593,11 @@
 (defun install-number (realm np)
   (let ((ctor (native-function realm "Number"
                 (lambda (this args) (declare (ignore this))
-                  (if args (to-number (arg 0 args)) 0d0)) 1)))
+                  (if args (number-arg-value (arg 0 args)) 0d0)) 1)))
     (setf (js-object-construct ctor)
           (lambda (args nt) (declare (ignore nt))
             (let ((o (make-object :proto np :class "Number")))
-              (setf (js-object-primitive o) (if args (to-number (arg 0 args)) 0d0)) o)))
+              (setf (js-object-primitive o) (if args (number-arg-value (arg 0 args)) 0d0)) o)))
     (def-value ctor "prototype" np :writable nil :configurable nil)
     (def-value np "constructor" ctor)
     (def-value ctor "MAX_SAFE_INTEGER" 9007199254740991d0 :writable nil :configurable nil)
@@ -630,6 +630,12 @@
         (if (js-nan-p n) "NaN"
             (with-js-floats (format nil "~,vf" digits n)))))
     (define-global realm "Number" ctor)))
+(defun number-arg-value (v)
+  "Number(v): ToNumeric, then a BigInt is converted to its Number value (unlike
+   implicit ToNumber, which throws). Objects coerce via ToPrimitive(number)."
+  (let ((p (if (js-object-p v) (to-primitive v :number) v)))
+    (if (js-bigint-p p) (float p 1d0) (to-number p))))
+
 (defun this-number (this)
   (cond ((floatp this) this)
         ((and (js-object-p this) (floatp (js-object-primitive this))) (js-object-primitive this))

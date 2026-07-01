@@ -30,8 +30,11 @@
 (defparameter *inf*  sb-ext:double-float-positive-infinity)
 (defparameter *-inf* sb-ext:double-float-negative-infinity)
 (defparameter *nan*  (with-js-floats (- *inf* *inf*)))
-(declaim (inline js-nan-p))
+(declaim (inline js-nan-p js-bigint-p))
 (defun js-nan-p (x) (and (floatp x) (/= x x)))
+;;; A JS BigInt value is represented as a CL INTEGER (Numbers are always
+;;; double-float, so an integer is unambiguously a BigInt).
+(defun js-bigint-p (x) (integerp x))
 
 ;;; ---- symbols (a distinct primitive value type) ----
 (defstruct (js-symbol (:constructor %make-js-symbol) (:print-object (lambda (o s) (format s "#<js Symbol ~a>" (js-symbol-desc o)))))
@@ -161,6 +164,7 @@
             ((floatp v) (realm-number-proto r))
             ((or (eq v *true*) (eq v *false*)) (realm-boolean-proto r))
             ((js-symbol-p v) (realm-symbol-proto r))
+            ((js-bigint-p v) (or (getf (realm-intrinsics r) :bigint-proto) *null*))
             (t *null*)))))
 
 (defun js-array-p (o) (and (js-object-p o) (string= (js-object-class o) "Array")))
@@ -471,6 +475,7 @@
   (cond ((eq v *true*) t) ((member v (list *false* *undefined* *null*)) nil)
         ((stringp v) (plusp (length v)))
         ((floatp v) (not (or (zerop v) (js-nan-p v))))
+        ((js-bigint-p v) (not (zerop v)))
         (t t)))
 (defun to-boolean (v) (js-bool (js-truthy v)))
 
@@ -501,6 +506,7 @@
         ((eq v *true*) 1d0) ((eq v *false*) 0d0)
         ((eq v *null*) 0d0) ((eq v *undefined*) *nan*)
         ((stringp v) (string-to-number v))
+        ((js-bigint-p v) (js-throw (make-native-error "TypeError" "Cannot convert a BigInt value to a number")))
         ((js-symbol-p v) (js-throw (make-native-error "TypeError" "Cannot convert a Symbol value to a number")))
         ((js-object-p v) (to-number (to-primitive v :number)))
         (t *nan*)))
@@ -629,6 +635,7 @@
 
 (defun to-string (v)
   (cond ((stringp v) v) ((floatp v) (number-to-string v))
+        ((js-bigint-p v) (bigint-to-string v))
         ((eq v *undefined*) "undefined") ((eq v *null*) "null")
         ((eq v *true*) "true") ((eq v *false*) "false")
         ((js-symbol-p v) (js-throw (make-native-error "TypeError" "Cannot convert a Symbol value to a string")))
@@ -639,15 +646,77 @@
   (cond ((eq v *undefined*) "undefined")
         ((or (eq v *true*) (eq v *false*)) "boolean")
         ((floatp v) "number") ((stringp v) "string")
+        ((js-bigint-p v) "bigint")
         ((js-symbol-p v) "symbol")
         ((eq v *null*) "object")
         ((js-callable-p v) "function")
         ((js-object-p v) "object") (t "object")))
 
+;;; ---- BigInt conversions (a BigInt value is a CL integer) ----
+(defun bigint-to-string (b &optional (radix 10))
+  "BigInt::toString — decimal (or RADIX 2..36), lowercase digits."
+  (if (= radix 10) (princ-to-string b)
+      (let ((s (string-downcase (write-to-string (abs b) :base radix))))
+        (if (minusp b) (concatenate 'string "-" s) s))))
+
+(defun string-to-bigint (s)
+  "StringToBigInt: trim JS whitespace; empty/ws -> 0n; integer syntax incl
+   0x/0o/0b (no sign on radix forms); a decimal may carry a leading +/-.
+   Invalid -> :syntax-error (caller raises SyntaxError). No fractional/exponent."
+  (let ((s (string-trim +js-ws+ s)))
+    (cond
+      ((string= s "") 0)
+      ((and (>= (length s) 2) (char= (char s 0) #\0) (member (char s 1) '(#\x #\X)))
+       (or (and (> (length s) 2) (every (lambda (c) (digit-char-p c 16)) (subseq s 2))
+                (parse-integer s :start 2 :radix 16))
+           :syntax-error))
+      ((and (>= (length s) 2) (char= (char s 0) #\0) (member (char s 1) '(#\o #\O)))
+       (or (and (> (length s) 2) (every (lambda (c) (digit-char-p c 8)) (subseq s 2))
+                (parse-integer s :start 2 :radix 8))
+           :syntax-error))
+      ((and (>= (length s) 2) (char= (char s 0) #\0) (member (char s 1) '(#\b #\B)))
+       (or (and (> (length s) 2) (every (lambda (c) (digit-char-p c 2)) (subseq s 2))
+                (parse-integer s :start 2 :radix 2))
+           :syntax-error))
+      (t
+       (let* ((neg (char= (char s 0) #\-))
+              (body (if (member (char s 0) '(#\+ #\-)) (subseq s 1) s)))
+         (if (and (plusp (length body)) (every #'digit-char-p body))
+             (let ((v (parse-integer body))) (if neg (- v) v))
+             :syntax-error))))))
+
+(defun to-bigint (v)
+  "ToBigInt(v). boolean->1/0; string->StringToBigInt (SyntaxError on invalid);
+   bigint->itself; number/undefined/null/symbol->TypeError; object->
+   ToPrimitive(number) then ToBigInt."
+  (cond
+    ((js-bigint-p v) v)
+    ((eq v *true*) 1) ((eq v *false*) 0)
+    ((stringp v)
+     (let ((r (string-to-bigint v)))
+       (if (eq r :syntax-error)
+           (js-throw (make-native-error "SyntaxError"
+                       (format nil "Cannot convert ~a to a BigInt" v)))
+           r)))
+    ((floatp v) (js-throw (make-native-error "TypeError" "Cannot convert a Number to a BigInt")))
+    ((js-null-or-undef v)
+     (js-throw (make-native-error "TypeError"
+                 (format nil "Cannot convert ~a to a BigInt" (if (eq v *null*) "null" "undefined")))))
+    ((js-symbol-p v) (js-throw (make-native-error "TypeError" "Cannot convert a Symbol value to a BigInt")))
+    ((js-object-p v) (to-bigint (to-primitive v :number)))
+    (t (js-throw (make-native-error "TypeError" "Cannot convert value to a BigInt")))))
+
 (defun js-strict-equal (a b)
   (cond ((and (floatp a) (floatp b)) (and (not (js-nan-p a)) (not (js-nan-p b)) (= a b)))
         ((and (stringp a) (stringp b)) (string= a b))
+        ((and (js-bigint-p a) (js-bigint-p b)) (= a b))   ; same type required; mixed -> not covered here
         (t (eq a b))))
+
+(defun bigint-number-equal (bi num)
+  "Mathematically-exact BigInt == Number (no rounding). NaN/Inf -> not equal."
+  (and (floatp num) (not (js-nan-p num)) (/= num *inf*) (/= num *-inf*)
+       (= num (with-js-floats (ftruncate num)))   ; a non-integer number can't equal a bigint
+       (= bi (truncate num))))
 
 (defun js-equal (a b)             ; loose == (the common cases)
   (cond ((or (js-null-or-undef a) (js-null-or-undef b))   ; null/undefined only equal each other
@@ -655,6 +724,14 @@
         ((js-strict-equal a b) t)
         ((and (floatp a) (stringp b)) (js-strict-equal a (to-number b)))
         ((and (stringp a) (floatp b)) (js-strict-equal (to-number a) b))
+        ;; BigInt <-> Number: exact mathematical comparison
+        ((and (js-bigint-p a) (floatp b)) (bigint-number-equal a b))
+        ((and (floatp a) (js-bigint-p b)) (bigint-number-equal b a))
+        ;; BigInt <-> String: parse the string as a BigInt (invalid -> false)
+        ((and (js-bigint-p a) (stringp b))
+         (let ((r (string-to-bigint b))) (and (integerp r) (= a r))))
+        ((and (stringp a) (js-bigint-p b))
+         (let ((r (string-to-bigint a))) (and (integerp r) (= r b))))
         ((or (eq a *true*) (eq a *false*)) (js-equal (to-number a) b))
         ((or (eq b *true*) (eq b *false*)) (js-equal a (to-number b)))
         ((and (js-object-p a) (not (js-object-p b)) (not (js-null-or-undef b))) (js-equal (to-primitive a) b))
@@ -664,9 +741,16 @@
 
 (defun js-add (a b)
   (let ((pa (to-primitive a)) (pb (to-primitive b)))
-    (if (or (stringp pa) (stringp pb))
-        (concatenate 'string (to-string pa) (to-string pb))
-        (with-js-floats (+ (to-number pa) (to-number pb))))))
+    (cond
+      ;; if either primitive is a String -> string concatenation
+      ((or (stringp pa) (stringp pb))
+       (concatenate 'string (to-string pa) (to-string pb)))
+      ;; both BigInt -> integer addition
+      ((and (js-bigint-p pa) (js-bigint-p pb)) (+ pa pb))
+      ;; mixing BigInt with a non-string, non-bigint numeric -> TypeError
+      ((or (js-bigint-p pa) (js-bigint-p pb))
+       (js-throw (make-native-error "TypeError" "Cannot mix BigInt and other types, use explicit conversions")))
+      (t (with-js-floats (+ (to-number pa) (to-number pb)))))))
 
 ;;; ===========================================================================
 ;;; More abstract operations (the kernel the built-in library builds on)
@@ -681,6 +765,7 @@
                ((and (zerop a) (zerop b)) (eq (js-negative-zero-p a) (js-negative-zero-p b)))
                (t (= a b))))
         ((and (stringp a) (stringp b)) (string= a b))
+        ((and (js-bigint-p a) (js-bigint-p b)) (= a b))
         (t (eq a b))))
 
 (defun same-value-zero (a b)
@@ -688,6 +773,7 @@
   (cond ((and (floatp a) (floatp b))
          (cond ((and (js-nan-p a) (js-nan-p b)) t) (t (= a b))))
         ((and (stringp a) (stringp b)) (string= a b))
+        ((and (js-bigint-p a) (js-bigint-p b)) (= a b))
         (t (eq a b))))
 
 (defun to-symbol-string (sym)

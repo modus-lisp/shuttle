@@ -38,6 +38,10 @@
       ((js-symbol-p v)
        (let ((o (make-object :proto (realm-symbol-proto r) :class "Symbol")))
          (setf (js-object-primitive o) v) o))
+      ((js-bigint-p v)
+       (let ((o (make-object :proto (or (getf (realm-intrinsics r) :bigint-proto) (%obj-proto))
+                             :class "BigInt")))
+         (setf (js-object-primitive o) v) o))
       (t (js-throw "Cannot box value")))))
 
 ;;; ---- environments ----
@@ -995,37 +999,119 @@
       (cond ((or (js-nan-p x) (js-nan-p y) (zerop y) (= (abs x) *inf*)) *nan*)
             ((= (abs y) *inf*) x) ((zerop x) x) (t (rem x y))))))
 
+(defun to-numeric (v)
+  "ToNumeric: ToPrimitive(number) then, if a BigInt, keep it; else ToNumber."
+  (let ((p (to-primitive v :number)))
+    (if (js-bigint-p p) p (to-number p))))
+
+(defun bigint-number-lessp (x y)
+  "Mathematically-exact x < y where one is a BigInt integer and the other a Number.
+   Returns :nan if the Number is NaN (relational -> undefined/false), else T/NIL."
+  (let ((bi (if (integerp x) x y)) (num (if (floatp x) x y)) (bi-first (integerp x)))
+    (cond
+      ((js-nan-p num) :nan)
+      ((= num *inf*) (if bi-first t nil))       ; bi < +Inf ; +Inf < bi -> nil
+      ((= num *-inf*) (if bi-first nil t))      ; bi < -Inf -> nil ; -Inf < bi -> t
+      (t (let ((rn (rationalize num)))
+           (if bi-first (< bi rn) (< rn bi)))))))
+
 (defun js-relational (op a b)
   (let ((pa (to-primitive a :number)) (pb (to-primitive b :number)))
-    (if (and (stringp pa) (stringp pb))
-        (js-bool (funcall (cond ((string= op "<") #'string<) ((string= op ">") #'string>)
-                                ((string= op "<=") #'string<=) (t #'string>=)) pa pb))
-        (let ((x (to-number pa)) (y (to-number pb)))
-          (if (or (js-nan-p x) (js-nan-p y)) *false*
-              (js-bool (funcall (cond ((string= op "<") #'<) ((string= op ">") #'>)
-                                      ((string= op "<=") #'<=) (t #'>=)) x y)))))))
+    (cond
+      ((and (stringp pa) (stringp pb))
+       (js-bool (funcall (cond ((string= op "<") #'string<) ((string= op ">") #'string>)
+                               ((string= op "<=") #'string<=) (t #'string>=)) pa pb)))
+      ;; both BigInt
+      ((and (js-bigint-p pa) (js-bigint-p pb))
+       (js-bool (funcall (cond ((string= op "<") #'<) ((string= op ">") #'>)
+                               ((string= op "<=") #'<=) (t #'>=)) pa pb)))
+      ;; BigInt vs String: parse the string as a BigInt; unparseable -> undefined (false)
+      ((or (and (js-bigint-p pa) (stringp pb)) (and (stringp pa) (js-bigint-p pb)))
+       (let* ((sv (if (stringp pa) pa pb))
+              (bi (if (stringp pa) pb pa))
+              (parsed (string-to-bigint sv)))
+         (if (not (integerp parsed)) *false*
+             (let ((x (if (stringp pa) parsed bi)) (y (if (stringp pa) bi parsed)))
+               (js-bool (funcall (cond ((string= op "<") #'<) ((string= op ">") #'>)
+                                       ((string= op "<=") #'<=) (t #'>=)) x y))))))
+      (t
+       ;; General numeric relational: ToNumeric both. If exactly one is a BigInt,
+       ;; compare mathematically (exact); otherwise both are Numbers.
+       (let ((x (to-numeric pa)) (y (to-numeric pb)))
+         (cond
+           ((and (js-bigint-p x) (js-bigint-p y))
+            (js-bool (funcall (cond ((string= op "<") #'<) ((string= op ">") #'>)
+                                    ((string= op "<=") #'<=) (t #'>=)) x y)))
+           ((or (js-bigint-p x) (js-bigint-p y))
+            (flet ((lt (u w) (bigint-number-lessp u w)))
+              (js-bool (cond
+                         ((string= op "<")  (let ((r (lt x y))) (and (not (eq r :nan)) r)))
+                         ((string= op ">")  (let ((r (lt y x))) (and (not (eq r :nan)) r)))
+                         ((string= op "<=") (let ((r (lt y x))) (and (not (eq r :nan)) (not r))))
+                         (t                 (let ((r (lt x y))) (and (not (eq r :nan)) (not r))))))))
+           (t
+            (if (or (js-nan-p x) (js-nan-p y)) *false*
+                (js-bool (funcall (cond ((string= op "<") #'<) ((string= op ">") #'>)
+                                        ((string= op "<=") #'<=) (t #'>=)) x y))))))))))
+
+(defun bigint-mix-error ()
+  (js-throw (make-native-error "TypeError" "Cannot mix BigInt and other types, use explicit conversions")))
+
+(defun bigint-binop (op x y)
+  "A numeric binary op where at least one operand (after ToNumeric) is a BigInt.
+   Both must be BigInt; otherwise TypeError. >>> on BigInt -> TypeError."
+  (unless (and (js-bigint-p x) (js-bigint-p y)) (bigint-mix-error))
+  (cond
+    ((string= op "-") (- x y))
+    ((string= op "*") (* x y))
+    ((string= op "/") (if (zerop y) (js-throw (make-native-error "RangeError" "Division by zero"))
+                          (truncate x y)))
+    ((string= op "%") (if (zerop y) (js-throw (make-native-error "RangeError" "Division by zero"))
+                          (rem x y)))
+    ((string= op "**") (if (minusp y) (js-throw (make-native-error "RangeError" "Exponent must be non-negative"))
+                           (expt x y)))
+    ((string= op "&") (logand x y))
+    ((string= op "|") (logior x y))
+    ((string= op "^") (logxor x y))
+    ((string= op "<<") (ash x y))
+    ((string= op ">>") (ash x (- y)))
+    ((string= op ">>>") (js-throw (make-native-error "TypeError" "BigInts have no unsigned right shift, use >> instead")))
+    (t (js-throw (format nil "operator ~a not supported for BigInt" op)))))
+
+(defun js-numeric-binop (op a b)
+  "Arithmetic/bitwise binary op with ToNumeric coercion: dispatches to the BigInt
+   path if either coerced operand is a BigInt (else the Number path)."
+  (let ((x (to-numeric a)) (y (to-numeric b)))
+    (if (or (js-bigint-p x) (js-bigint-p y))
+        (bigint-binop op x y)
+        ;; both Number
+        (with-js-floats
+          (cond
+            ((string= op "-") (- x y))
+            ((string= op "*") (* x y))
+            ((string= op "/") (/ x y))
+            ((string= op "%") (js-mod x y))
+            ((string= op "**") (js-pow x y))
+            ((string= op "<<") (let ((m (mod (logand (to-int32 x) #xFFFFFFFF) #x100000000))
+                                     (s (logand (to-int32 y) 31)))
+                                 (let ((r (mod (ash m s) #x100000000)))
+                                   (float (if (>= r #x80000000) (- r #x100000000) r) 1d0))))
+            ((string= op ">>") (float (ash (to-int32 x) (- (logand (to-int32 y) 31))) 1d0))
+            ((string= op ">>>") (float (ash (to-uint32 x) (- (logand (to-int32 y) 31))) 1d0))
+            ((string= op "&") (float (logand (to-int32 x) (to-int32 y)) 1d0))
+            ((string= op "|") (float (logior (to-int32 x) (to-int32 y)) 1d0))
+            ((string= op "^") (float (logxor (to-int32 x) (to-int32 y)) 1d0))
+            (t (js-throw (format nil "operator ~a not supported" op))))))))
 
 (defun js-binop (op a b)
   (cond ((string= op "+") (js-add a b))
-        ((string= op "-") (with-js-floats (- (to-number a) (to-number b))))
-        ((string= op "*") (with-js-floats (* (to-number a) (to-number b))))
-        ((string= op "/") (with-js-floats (/ (to-number a) (to-number b))))
-        ((string= op "%") (js-mod a b))
-        ((string= op "**") (with-js-floats (js-pow (to-number a) (to-number b))))
-        ((string= op "<<") (let ((m (mod (logand (to-int32 a) #xFFFFFFFF) #x100000000))
-                                 (s (logand (to-int32 b) 31)))
-                             (let ((r (mod (ash m s) #x100000000)))
-                               (float (if (>= r #x80000000) (- r #x100000000) r) 1d0))))
-        ((string= op ">>") (float (ash (to-int32 a) (- (logand (to-int32 b) 31))) 1d0))
-        ((string= op ">>>") (float (ash (to-uint32 a) (- (logand (to-int32 b) 31))) 1d0))
+        ((member op '("-" "*" "/" "%" "**" "<<" ">>" ">>>" "&" "|" "^") :test #'string=)
+         (js-numeric-binop op a b))
         ((string= op "===") (js-bool (js-strict-equal a b)))
         ((string= op "!==") (js-bool (not (js-strict-equal a b))))
         ((string= op "==") (js-bool (js-equal a b)))
         ((string= op "!=") (js-bool (not (js-equal a b))))
         ((member op '("<" ">" "<=" ">=") :test #'string=) (js-relational op a b))
-        ((string= op "&") (float (logand (to-int32 a) (to-int32 b)) 1d0))
-        ((string= op "|") (float (logior (to-int32 a) (to-int32 b)) 1d0))
-        ((string= op "^") (float (logxor (to-int32 a) (to-int32 b)) 1d0))
         ((string= op "instanceof") (js-bool (js-instanceof a b)))
         ((string= op "in") (js-bool (and (js-object-p b) (js-has b (prop-key a)))))
         (t (js-throw (format nil "operator ~a not supported" op)))))
@@ -1039,9 +1125,14 @@
 
 (defun js-unop (op v)
   (cond ((string= op "!") (js-bool (not (js-truthy v))))
-        ((string= op "-") (with-js-floats (- (to-number v))))
-        ((string= op "+") (to-number v))
-        ((string= op "~") (float (lognot (to-int32 v)) 1d0))
+        ((string= op "-") (let ((n (to-numeric v))) (if (js-bigint-p n) (- n) (with-js-floats (- n)))))
+        ((string= op "+")                    ; unary + on a BigInt -> TypeError
+         (let ((p (to-primitive v :number)))
+           (if (js-bigint-p p)
+               (js-throw (make-native-error "TypeError" "Cannot convert a BigInt value to a number"))
+               (to-number p))))
+        ((string= op "~") (let ((n (to-numeric v)))
+                            (if (js-bigint-p n) (lognot n) (float (lognot (to-int32 n)) 1d0))))
         ((string= op "void") *undefined*)
         ((string= op "typeof") (js-typeof v))
         (t (js-throw (format nil "unary ~a not supported" op)))))
@@ -1105,6 +1196,9 @@
                      (let ((x (aref stack (- n 2))) (y (aref stack (- n 1))))
                        (push! x) (push! y))))
             (:to-num (push! (to-number (pop!))))
+            (:to-numeric (push! (to-numeric (pop!))))
+            (:num-step (let ((v (pop!)) (d (first a)))     ; v already ToNumeric'd
+                         (push! (if (js-bigint-p v) (+ v d) (with-js-floats (+ v (float d 1d0)))))))
             (:to-str (push! (to-string (pop!))))
             (:swap (let ((n (fill-pointer stack)))
                      (rotatef (aref stack (- n 1)) (aref stack (- n 2)))))
@@ -1125,8 +1219,10 @@
                          (push! (if (js-object-p o) (js-delete o k) *true*))))
             (:update-prop (let* ((delta (first a)) (prefix (second a))
                                  (k (pop!)) (o (pop!))
-                                 (old (to-number (js-get o k)))
-                                 (new (with-js-floats (+ old delta))))
+                                 (old (to-numeric (js-get o k)))
+                                 (new (if (js-bigint-p old)
+                                          (+ old (truncate delta))
+                                          (with-js-floats (+ old delta)))))
                             (js-set o k new)
                             (push! (if prefix new old))))
             (:for-in-keys (push! (for-in-key-array (pop!))))

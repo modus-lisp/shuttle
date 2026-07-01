@@ -255,6 +255,7 @@
     ((punct? "[") (adv) (let ((e (parse-expr 2))) (eat "]") (list :computed e)))
     ((eq (cur-type) :str) (list :lit (prog1 (cur-val) (adv))))
     ((eq (cur-type) :num) (list :lit (number-to-string (prog1 (cur-val) (adv)))))
+    ((eq (cur-type) :bigint) (list :lit (bigint-to-string (prog1 (cur-val) (adv)))))
     ((eq (cur-type) :ident) (list :lit (prog1 (cur-val) (adv))))
     (t (js-throw (make-native-error "SyntaxError" "Unexpected token in class member")))))
 
@@ -409,6 +410,7 @@
   (let ((tt (cur-type)) (tv (cur-val)))
     (cond
       ((eq tt :num) (adv) (list :num tv))
+      ((eq tt :bigint) (adv) (list :bigint tv))
       ((eq tt :str) (adv) (list :str tv))
       ((eq tt :regex) (adv) (list :regex (car tv) (cdr tv)))   ; (:regex pattern flags)
       ((eq tt :template) (parse-template-node))
@@ -530,6 +532,7 @@
     ((punct? "[") (adv) (let ((e (parse-expr 2))) (eat "]") (list :computed e)))
     ((eq (cur-type) :str) (list :lit (prog1 (cur-val) (adv))))
     ((eq (cur-type) :num) (list :lit (number-to-string (prog1 (cur-val) (adv)))))
+    ((eq (cur-type) :bigint) (list :lit (bigint-to-string (prog1 (cur-val) (adv)))))
     ((eq (cur-type) :ident) (list :lit (prog1 (cur-val) (adv))))
     (t (js-throw (make-native-error "SyntaxError" "Unexpected token in object literal")))))
 
