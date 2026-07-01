@@ -2,3 +2,5 @@
 *.png
 /tmp/
 /test262/
+test262-full/
+test262-detail.tsv
