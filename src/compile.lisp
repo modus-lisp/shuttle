@@ -4,7 +4,10 @@
 ;;;; (indexed locals + scope analysis = a later optimization).
 (in-package #:shuttle)
 
-(defstruct code name params instrs inst-instrs)   ; inst-instrs: split instantiation code (generators/async)
+(defstruct code name params instrs inst-instrs
+  (this-mode :normal)     ; :normal = OrdinaryCallBindThis (sloppy: undefined/null -> globalThis, primitive -> boxed);
+                          ; :lexical = arrow (inherit caller's this, no rebind)
+  (constructable t))      ; NIL for arrows and concise/accessor methods (new'ing them is a TypeError)
 (defvar *out*)
 (defvar *break-target* nil) (defvar *continue-target* nil)
 (defvar *scope-depth* 0)                 ; current lexical block-env nesting within the fn
@@ -57,7 +60,22 @@
     ((eq (car tgt) :rest) (target-names (second tgt) acc))
     (t acc)))
 
-(defun compile-fn (name params body &optional toplevel)
+(defun directive-prologue-strict-p (body)
+  "True iff BODY (a :block) opens with a Directive Prologue containing the exact
+   \"use strict\" directive — a leading run of bare string-literal statements."
+  (when (and (consp body) (eq (car body) :block))
+    (dolist (s (second body) nil)
+      (if (and (consp s) (eq (car s) :expr)
+               (consp (second s)) (eq (car (second s)) :str))
+          (when (string= (second (second s)) "use strict") (return t))
+          (return nil)))))          ; first non-string-literal stmt ends the prologue
+
+(defun compile-fn (name params body &optional toplevel (this-mode :normal) (constructable t))
+  ;; A function whose body opens with "use strict" is strict: its `this` is NOT
+  ;; substituted (undefined stays undefined). We otherwise can't track strict mode,
+  ;; so sloppy substitution is the default. (Arrows keep :lexical regardless.)
+  (when (and (eq this-mode :normal) (directive-prologue-strict-p body))
+    (setf this-mode :strict))
   (let ((*out* '()) (pnames (param-names params)))
     ;; bind parameters from incoming call args
     (compile-params params)
@@ -72,9 +90,10 @@
       (dolist (fn (block-lexical-fns stmts)) (compile-expr fn) (em :init-let (second fn)))
       (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s))))
     (unless toplevel (em :const *undefined*) (em :ret))   ; functions default-return undefined
-    (make-code :name name :params params :instrs (assemble *out*))))
+    (make-code :name name :params params :instrs (assemble *out*)
+               :this-mode this-mode :constructable constructable)))
 
-(defun compile-fn-split (name params body)
+(defun compile-fn-split (name params body &optional (this-mode :normal))
   "Compile a generator/async/async-generator: split FunctionDeclarationInstantiation
    (param binding + var/lexical/fn hoisting — run synchronously at the call) from the
    deferred body. Returns a CODE whose INST-INSTRS is the instantiation stream and
@@ -94,7 +113,8 @@
       (let ((stmts (if (eq (car body) :block) (second body) (list body))))
         (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s))))
       (em :const *undefined*) (em :ret)
-      (make-code :name name :params params :instrs (assemble *out*) :inst-instrs inst))))
+      (make-code :name name :params params :instrs (assemble *out*) :inst-instrs inst
+                 :this-mode this-mode))))
 
 (defun compile-array-destructure (pat)
   "Value on stack is the iterable. Destructure per (:apat ELEMS)."
@@ -225,7 +245,7 @@
   "Collect `var`-declared names in NODE, NOT descending into nested functions."
   (when (consp node)
     (case (car node)
-      ((:func :arrow :genfunc :class :asyncfunc :asyncgenfunc :async-arrow) acc)  ; nested function/class scope: stop
+      ((:func :method-func :arrow :genfunc :class :asyncfunc :asyncgenfunc :async-arrow) acc)  ; nested function/class scope: stop
       (:var (if (string= (second node) "var")   ; only `var` hoists to function scope
                 (progn (dolist (d (third node)) (setf acc (target-names (car d) acc))) acc)
                 acc))
@@ -474,11 +494,13 @@
     (:array (compile-array-literal (second node)))
     (:object (compile-object-literal (second node)))
     (:func (em :closure (compile-fn (second node) (third node) (fourth node))))
+    ;; concise/accessor method: ordinary this-mode (sloppy substitution) but not constructable
+    (:method-func (em :closure (compile-fn (second node) (third node) (fourth node) nil :normal nil)))
     (:genfunc (em :genclosure (compile-fn-split (second node) (third node) (fourth node))))
     (:asyncfunc (em :asyncclosure (compile-fn-split (second node) (third node) (fourth node))))
     (:asyncgenfunc (em :asyncgenclosure (compile-fn-split (second node) (third node) (fourth node))))
-    (:arrow (em :closure (compile-fn nil (second node) (third node))))
-    (:async-arrow (em :asyncclosure (compile-fn-split nil (second node) (third node))))
+    (:arrow (em :closure (compile-fn nil (second node) (third node) nil :lexical nil)))
+    (:async-arrow (em :asyncclosure (compile-fn-split nil (second node) (third node) :lexical)))
     (:await (compile-expr (second node)) (em :await))
     (:class (compile-class node))
     (:yield (if (second node) (compile-expr (second node)) (em :const *undefined*))

@@ -159,26 +159,46 @@
 (defun fn-super-ctor (fn) (getf (js-object-internal fn) :super-ctor))
 (defun (setf fn-super-ctor) (v fn) (setf (getf (js-object-internal fn) :super-ctor) v))
 
-(defun make-js-function (code env &key kind)
+(defun ordinary-bind-this (this)
+  "OrdinaryCallBindThis for a NON-strict ordinary (:normal this-mode) function:
+   undefined/null -> the realm global object; a primitive -> ToObject (boxed);
+   an object passes through. (We don't track strict mode; sloppy is the default,
+   matching the majority of non-strict test262 tests.)"
+  (cond ((js-null-or-undef this)
+         (if (boundp '*current-realm*) (realm-global (symbol-value '*current-realm*)) this))
+        ((js-object-p this) this)
+        (t (to-object this))))          ; box a primitive receiver
+
+(defun make-js-function (code env &key kind lexical-this)
   "KIND: nil = ordinary function; :method = has [[HomeObject]] (super),
-   :generator = a generator function; :class-base / :class-derived = a class ctor."
+   :generator = a generator function; :class-base / :class-derived = a class ctor.
+   LEXICAL-THIS: for an arrow (:lexical this-mode), the `this` captured at the
+   arrow's DEFINITION site — the arrow ignores its caller's `this` and uses it."
   (let ((fn (make-object :proto (%fn-proto) :class "Function")))
     (put fn "length" (float (fn-declared-length (code-params code)) 1d0) :enumerable nil :writable nil)
     (put fn "name" (or (code-name code) "") :enumerable nil :writable nil :configurable t)
     (setf (js-object-call fn)
-          (case kind
-            (:generator (lambda (this args) (make-generator-object code env this args fn)))
-            (:async (lambda (this args)
-                      (handler-case (make-async-function-object code env this args fn)
-                        (shuttle-error (e)
-                          ;; a synchronous throw before the first await -> rejected promise
-                          (let ((p (make-promise)))
-                            (promise-settle p :rejected (shuttle-error-value e)) p)))))
-            (:async-generator (lambda (this args) (make-async-generator-object code env this args fn)))
-            (t (lambda (this args)
-                 (let ((fenv (new-env env)))
-                   (env-declare fenv "arguments" (make-arguments-object args))
-                   (run code fenv this args fn))))))
+          ;; OrdinaryCallBindThis: :normal (ordinary/method) functions substitute
+          ;; undefined/null -> globalThis and box a primitive receiver; :lexical
+          ;; (arrow) functions use the this captured at their definition site.
+          (macrolet ((bind (this) `(case (code-this-mode code)
+                                     (:lexical lexical-this)          ; arrow: captured this
+                                     (:strict ,this)                  ; strict: no substitution (undefined stays)
+                                     (t (ordinary-bind-this ,this))))) ; sloppy: undefined/null -> global, primitive -> boxed
+            (case kind
+              (:generator (lambda (this args) (make-generator-object code env (bind this) args fn)))
+              (:async (lambda (this args)
+                        (let ((this (bind this)))
+                          (handler-case (make-async-function-object code env this args fn)
+                            (shuttle-error (e)
+                              ;; a synchronous throw before the first await -> rejected promise
+                              (let ((p (make-promise)))
+                                (promise-settle p :rejected (shuttle-error-value e)) p))))))
+              (:async-generator (lambda (this args) (make-async-generator-object code env (bind this) args fn)))
+              (t (lambda (this args)
+                   (let ((fenv (new-env env)))
+                     (env-declare fenv "arguments" (make-arguments-object args))
+                     (run code fenv (bind this) args fn)))))))
     ;; class constructors: only callable via `new`; the [[Construct]] initializes
     ;; the instance (derived ctors require super() to run the base first).
     (cond
@@ -201,6 +221,9 @@
                           (format nil "Class constructor ~a cannot be invoked without 'new'"
                                   (or (code-name code) "")))))))
       ((member kind '(:async :async-generator)) nil)   ; async fns are not constructable
+      ;; arrows and concise/accessor methods are not constructable: `new (()=>{})`
+      ;; and `new ({m(){}}.m)` throw TypeError (no [[Construct]] / no .prototype).
+      ((not (code-constructable code)) nil)
       (t
        (setf (js-object-construct fn)
              (lambda (args new-target) (declare (ignore new-target))
@@ -208,8 +231,8 @@
                       (obj (make-object :proto (if (js-object-p pp) pp (%obj-proto)))))
                  (let ((r (funcall (js-object-call fn) obj args))) (if (js-object-p r) r obj)))))))
     ;; a fresh .prototype so `new` works and methods can be attached.
-    ;; async (non-generator) functions and arrows/methods don't get one.
-    (unless (member kind '(:method :async))
+    ;; async (non-generator) functions and non-constructable fns (arrows/methods) don't get one.
+    (unless (or (member kind '(:method :async)) (not (code-constructable code)))
       (let ((proto (make-object :proto (case kind
                                          (:generator (generator-prototype))
                                          (:async-generator (async-generator-prototype))
@@ -1011,7 +1034,7 @@
   (unless (js-callable-p b) (js-throw "Right-hand side of 'instanceof' is not callable"))
   (let ((proto (js-get b "prototype")))
     (and (js-object-p a)
-         (loop for p = (js-object-proto a) then (js-object-proto p)
+         (loop for p = (js-get-proto a) then (js-get-proto p)
                while (js-object-p p) thereis (eq p proto)))))
 
 (defun js-unop (op v)
@@ -1125,10 +1148,12 @@
                             (push! (js-call callee thisv (array-object-to-list argsarr)))))
             (:new-spread (let* ((argsarr (pop!)) (callee (pop!)))
                            (push! (js-construct callee (array-object-to-list argsarr)))))
-            (:closure (push! (make-js-function (first a) env)))
-            (:genclosure (push! (make-js-function (first a) env :kind :generator)))
-            (:asyncclosure (push! (make-js-function (first a) env :kind :async)))
-            (:asyncgenclosure (push! (make-js-function (first a) env :kind :async-generator)))
+            ;; LEXICAL-THIS = the enclosing frame's `this`, captured so an arrow
+            ;; (:lexical this-mode) resolves `this` to its definition site.
+            (:closure (push! (make-js-function (first a) env :lexical-this this)))
+            (:genclosure (push! (make-js-function (first a) env :kind :generator :lexical-this this)))
+            (:asyncclosure (push! (make-js-function (first a) env :kind :async :lexical-this this)))
+            (:asyncgenclosure (push! (make-js-function (first a) env :kind :async-generator :lexical-this this)))
             (:yield (push! (gen-yield (pop!))))
             (:yield-star (push! (yield-star-delegate (pop!))))
             (:await (push! (async-await (pop!))))

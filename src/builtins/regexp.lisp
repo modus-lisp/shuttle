@@ -114,10 +114,18 @@
     (put arr "input" s)
     ;; groups object (named captures)
     (if has-groups
-        (let ((g (make-object :proto *null*)))
+        (let ((g (make-object :proto *null*))
+              (seen '()))
+          ;; A name may map to several (duplicate-named) group indices; expose it
+          ;; once, preferring whichever index actually captured.
           (dolist (nm (compiled-regex-group-names cre))
-            (let* ((idx (cdr nm)) (cap (aref caps idx)))
-              (put g (car nm) (if (null cap) *undefined* (subseq s (car cap) (cdr cap))))))
+            (let* ((name (car nm)) (idx (cdr nm)) (cap (aref caps idx)))
+              (cond
+                ((not (member name seen :test #'string=))
+                 (push name seen)
+                 (put g name (if (null cap) *undefined* (subseq s (car cap) (cdr cap)))))
+                (cap
+                 (put g name (subseq s (car cap) (cdr cap)))))))
           (put arr "groups" g))
         (put arr "groups" *undefined*))
     ;; hasIndices -> 'indices' array of [start,end] pairs
@@ -130,12 +138,16 @@
                  (if (null cap) *undefined*
                      (make-array-object (list (float (car cap) 1d0) (float (cdr cap) 1d0)))))))
         (if has-groups
-            (let ((g (make-object :proto *null*)))
+            (let ((g (make-object :proto *null*))
+                  (seen '()))
               (dolist (nm (compiled-regex-group-names cre))
-                (let* ((idx (cdr nm)) (cap (aref caps idx)))
-                  (put g (car nm)
-                       (if (null cap) *undefined*
-                           (make-array-object (list (float (car cap) 1d0) (float (cdr cap) 1d0)))))))
+                (let* ((name (car nm)) (idx (cdr nm)) (cap (aref caps idx)))
+                  (flet ((pair () (make-array-object (list (float (car cap) 1d0) (float (cdr cap) 1d0)))))
+                    (cond
+                      ((not (member name seen :test #'string=))
+                       (push name seen)
+                       (put g name (if (null cap) *undefined* (pair))))
+                      (cap (put g name (pair)))))))
               (put ind "groups" g))
             (put ind "groups" *undefined*))
         (put arr "indices" ind)))
@@ -168,12 +180,15 @@
 
 (defun symbol-match-impl (realm re args)
   (let* ((s (to-string (arg 0 args)))
-         (global (js-truthy (js-get re "global"))))
+         ;; Spec: read the flags STRING once (Get(rx,"flags")); derive
+         ;; global/unicode from it rather than reading separate getters.
+         (flags (to-string (js-get re "flags")))
+         (global (and (find #\g flags) t)))
     (if (not global)
         (regexp-exec-abstract realm re s)
         (progn
           (js-set re "lastIndex" 0d0)
-          (let ((results '()) (unicode (regexp-unicode-p re)))
+          (let ((results '()) (unicode (and (or (find #\u flags) (find #\v flags)) t)))
             (loop
               (let ((r (regexp-exec-abstract realm re s)))
                 (when (eq r *null*) (return))
@@ -302,8 +317,10 @@
          (replace-value (arg 1 args))
          (functional (js-callable-p replace-value))
          (rep-str (unless functional (to-string replace-value)))
-         (global (js-truthy (js-get re "global")))
-         (unicode (regexp-unicode-p re)))
+         ;; Spec: read the flags STRING once; derive global/unicode from it.
+         (flags (to-string (js-get re "flags")))
+         (global (and (find #\g flags) t))
+         (unicode (and (or (find #\u flags) (find #\v flags)) t)))
     (when global (js-set re "lastIndex" 0d0))
     (let ((results '()))
       ;; collect all matches
@@ -385,6 +402,54 @@
     it))
 
 ;;; ---------------------------------------------------------------------------
+;;; RegExp.escape  (ES2025 EncodeForRegExpEscape)
+;;; ---------------------------------------------------------------------------
+(defparameter +regex-syntax-chars+
+  '(#\^ #\$ #\\ #\. #\* #\+ #\? #\( #\) #\[ #\] #\{ #\} #\| #\/))
+;; "other punctuators" the spec always hex-escapes so the result stays inert.
+(defparameter +regex-escape-punctuators+
+  ",-=<>#&!%:;@~'`\"")
+
+(defun regex-escape-hex (code)
+  "Return \\xHH for code <= 0xFF, else \\uHHHH, with lowercase hex digits."
+  (if (<= code #xFF)
+      (format nil "\\x~(~2,'0x~)" code)
+      (format nil "\\u~(~4,'0x~)" code)))
+
+(defun regex-escapable-p (c)
+  "T if code point C must be hex-escaped by RegExp.escape (whitespace, C0/C1
+   control, lone surrogate, or a listed punctuator)."
+  (let ((code (char-code c)))
+    (or (find c +regex-escape-punctuators+)
+        (rx-space-p c)                  ; WhiteSpace + LineTerminator set
+        (<= code #x1F) (<= #x7F code #x9F)
+        (<= #xD800 code #xDFFF))))       ; lone surrogate code unit
+
+(defun regexp-escape-string (v)
+  "RegExp.escape(S): throw TypeError unless S is a String; return an escaped
+   copy safe to embed literally in a pattern."
+  (unless (stringp v)
+    (js-throw (make-native-error "TypeError" "RegExp.escape argument must be a string")))
+  (with-output-to-string (out)
+    (loop for i from 0 below (length v)
+          for c = (char v i) do
+      (cond
+        ;; First code point that is ASCII alnum: hex-escape so the escaped string
+        ;; can never merge with a preceding token or begin an identifier-ish run.
+        ((and (= i 0)
+              (or (char<= #\0 c #\9) (char<= #\a c #\z) (char<= #\A c #\Z)))
+         (write-string (regex-escape-hex (char-code c)) out))
+        ((member c +regex-syntax-chars+)
+         (write-char #\\ out) (write-char c out))
+        ((char= c #\Tab) (write-string "\\t" out))
+        ((char= c #\Newline) (write-string "\\n" out))
+        ((char= c (code-char 11)) (write-string "\\v" out))
+        ((char= c #\Page) (write-string "\\f" out))
+        ((char= c #\Return) (write-string "\\r" out))
+        ((regex-escapable-p c) (write-string (regex-escape-hex (char-code c)) out))
+        (t (write-char c out))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Install
 ;;; ---------------------------------------------------------------------------
 (defun install-regexp (realm)
@@ -430,6 +495,12 @@
                       :get (native-function realm "get [Symbol.species]"
                              (lambda (this args) (declare (ignore args)) this) 0)
                       :enumerable nil :configurable t))
+      ;; RegExp.escape (ES2025): escape a string for literal use in a pattern.
+      (def-value ctor "escape"
+                 (native-function realm "escape"
+                   (lambda (this args) (declare (ignore this))
+                     (regexp-escape-string (arg 0 args))) 1)
+                 :writable t :configurable t)
       (install-regexp-proto realm proto)
       (define-global realm "RegExp" ctor))))
 
@@ -516,6 +587,7 @@
     (flag-getter "dotAll" #\s)
     (flag-getter "sticky" #\y)
     (flag-getter "unicode" #\u)
+    (flag-getter "unicodeSets" #\v)
     (flag-getter "hasIndices" #\d))
   (def-getter realm proto "source"
     (lambda (this args) (declare (ignore args))
@@ -533,6 +605,7 @@
         (when (js-truthy (js-get this "multiline")) (write-char #\m out))
         (when (js-truthy (js-get this "dotAll")) (write-char #\s out))
         (when (js-truthy (js-get this "unicode")) (write-char #\u out))
+        (when (js-truthy (js-get this "unicodeSets")) (write-char #\v out))
         (when (js-truthy (js-get this "sticky")) (write-char #\y out)))))
   ;; --- @@ symbol methods ---
   (put proto *symbol-match*

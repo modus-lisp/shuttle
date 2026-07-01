@@ -554,7 +554,10 @@
         ((eq gen :async-gen) (list :asyncgenfunc name-string params body))
         ((eq gen :async) (list :asyncfunc name-string params body))
         (generatorp (list :genfunc name-string params body))
-        (t (list :func name-string params body))))))
+        ;; concise method / accessor: same shape as :func but NOT constructable
+        ;; (new'ing it is a TypeError) — a distinct node so hoisting never treats it
+        ;; as a function declaration.
+        (t (list :method-func name-string params body))))))
 
 (defun parse-object-literal ()
   (eat "{")

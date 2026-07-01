@@ -85,6 +85,41 @@
   (defop js-delete :delete ordinary-delete (key))
   (defop js-own-keys :own-keys ordinary-own-keys ()))
 
+;;; ---- [[GetPrototypeOf]] / [[SetPrototypeOf]] / [[IsExtensible]] /
+;;;      [[PreventExtensions]] : honor a host/Proxy INTERNAL override, else the
+;;;      ordinary struct-slot behavior. Callers (Reflect/Object/instanceof) must
+;;;      route through these so Proxy traps actually fire.
+(defun js-get-proto (o)
+  "[[GetPrototypeOf]]: internal :get-proto trap, else the struct slot."
+  (if (js-object-p o)
+      (let ((tr (and (js-object-internal o) (getf (js-object-internal o) :get-proto))))
+        (if tr (funcall tr o) (js-object-proto o)))
+      *null*))
+
+(defun js-set-proto (o v)
+  "[[SetPrototypeOf]]: internal :set-proto trap, else set the slot. Returns T/NIL."
+  (if (js-object-p o)
+      (let ((tr (and (js-object-internal o) (getf (js-object-internal o) :set-proto))))
+        (if tr (and (funcall tr o v) t)
+            (progn (setf (js-object-proto o) v) t)))
+      nil))
+
+(defun js-extensible-p (o)
+  "[[IsExtensible]]: internal :is-extensible trap, else the struct slot. Returns T/NIL."
+  (if (js-object-p o)
+      (let ((tr (and (js-object-internal o) (getf (js-object-internal o) :is-extensible))))
+        (if tr (and (funcall tr o) t) (and (js-object-extensible o) t)))
+      nil))
+
+(defun js-prevent-extensions (o)
+  "[[PreventExtensions]]: internal :prevent-extensions trap, else clear the slot.
+   Returns T/NIL."
+  (if (js-object-p o)
+      (let ((tr (and (js-object-internal o) (getf (js-object-internal o) :prevent-extensions))))
+        (if tr (and (funcall tr o) t)
+            (progn (setf (js-object-extensible o) nil) t)))
+      nil))
+
 (defun ordinary-get (o key &optional receiver)
   (unless receiver (setf receiver o))
   (cond
@@ -443,10 +478,13 @@
 (defun to-primitive (v &optional hint)
   (if (js-object-p v)
       (progn
-        ;; @@toPrimitive exotic hook, if present
+        ;; @@toPrimitive via GetMethod: undefined OR null -> absent (fall through
+        ;; to OrdinaryToPrimitive); present-but-not-callable -> TypeError.
         (when *symbol-to-primitive*
           (let ((exotic (js-get v *symbol-to-primitive*)))
-            (when (js-callable-p exotic)
+            (unless (js-null-or-undef exotic)
+              (unless (js-callable-p exotic)
+                (js-throw (make-native-error "TypeError" "Symbol.toPrimitive is not a function")))
               (let ((r (js-call exotic v (list (case hint (:string "string") (:number "number") (t "default"))))))
                 (if (js-object-p r)
                     (js-throw (make-native-error "TypeError" "Cannot convert object to primitive value"))
@@ -467,7 +505,18 @@
         ((js-object-p v) (to-number (to-primitive v :number)))
         (t *nan*)))
 
-(defparameter +js-ws+ '(#\Space #\Tab #\Newline #\Return #\Page #\Vt #\No-Break_Space #\Line_Separator #\Paragraph_Separator #\U+FEFF))
+(defparameter +js-ws+
+  (list #\Space #\Tab #\Newline #\Return #\Page #\Vt          ; TAB VT FF SP + LF CR
+        #\No-Break_Space                                       ; U+00A0
+        #\Line_Separator #\Paragraph_Separator                 ; U+2028 U+2029
+        #\U+FEFF                                                ; ZWNBSP (BOM)
+        (code-char #x1680)                                     ; OGHAM SPACE MARK
+        (code-char #x2000) (code-char #x2001) (code-char #x2002) (code-char #x2003)
+        (code-char #x2004) (code-char #x2005) (code-char #x2006) (code-char #x2007)
+        (code-char #x2008) (code-char #x2009) (code-char #x200A) ; EN QUAD .. HAIR SPACE
+        (code-char #x202F)                                     ; NARROW NO-BREAK SPACE
+        (code-char #x205F)                                     ; MEDIUM MATHEMATICAL SPACE
+        (code-char #x3000)))                                   ; IDEOGRAPHIC SPACE
 (defun string-to-number (s)
   (let ((s (string-trim +js-ws+ s)))
     (cond ((string= s "") 0d0)
@@ -504,18 +553,28 @@
             (unless exp-digit (return-from parse-js-decimal nil))))
         (unless (= i n) (return-from parse-js-decimal nil))
         (let ((*read-default-float-format* 'double-float))
-          (ignore-errors
-            (with-js-floats
-              (* sign (float (let ((body (subseq s (if (char= (char s 0) #\+) 1 (if (char= (char s 0) #\-) 1 0)))))
-                               (read-from-string (if (char= (char body 0) #\.) (concatenate 'string "0" body) body)))
-                             1d0)))))))))
+          (with-js-floats
+            ;; The literal was already syntax-validated above, so a reader /
+            ;; overflow error here means the magnitude overflowed a double ->
+            ;; +/-Infinity per spec (StringNumericLiteral), not NaN.
+            (handler-case
+                (* sign (float (let ((body (subseq s (if (char= (char s 0) #\+) 1 (if (char= (char s 0) #\-) 1 0)))))
+                                 (read-from-string (if (char= (char body 0) #\.) (concatenate 'string "0" body) body)))
+                               1d0))
+              (floating-point-overflow () (* sign *inf*))
+              (reader-error () (* sign *inf*))
+              (arithmetic-error () (* sign *inf*)))))))))
 
 (defun number-to-string (n)
   (cond ((js-nan-p n) "NaN") ((= n *inf*) "Infinity") ((= n *-inf*) "-Infinity")
         ((zerop n) "0")                                    ; both +0 and -0 -> "0"
         ((minusp n) (concatenate 'string "-" (number-to-string (- n))))
         ((= n (with-js-floats (ftruncate n)))
-         (if (< n 1d21) (format nil "~d" (truncate n)) (dtoa-exponential n)))
+         ;; Integer-valued double: route through the shortest round-tripping
+         ;; path so e.g. 1000000000000000128 -> "1000000000000000100" (the
+         ;; shortest decimal that reads back to the same double), rather than
+         ;; the full exact integer. >=1e21 uses exponential per spec.
+         (if (< n 1d21) (dtoa n) (dtoa-exponential n)))
         (t (dtoa n))))
 
 (defun dtoa (n)

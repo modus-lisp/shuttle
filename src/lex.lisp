@@ -178,7 +178,13 @@
                  (emit :num (if (and (> (length text) 1) (char-equal (char text 1) #\x))
                                 (float (parse-integer text :start 2 :radix 16) 1d0)
                                 (let ((*read-default-float-format* 'double-float))
-                                  (float (read-from-string text) 1d0)))))))
+                                  ;; An overflowing numeric literal (e.g. 1E+309) is
+                                  ;; Infinity per spec, not a reader error.
+                                  (with-js-floats
+                                    (handler-case (float (read-from-string text) 1d0)
+                                      (floating-point-overflow () *inf*)
+                                      (reader-error () *inf*)
+                                      (arithmetic-error () *inf*)))))))))
             ;; identifier / keyword  (also #private-name as a lexeme)
             ((or (id-start-p c) (and (char= c #\#) (< (1+ i) n) (id-start-p (char src (1+ i)))))
              (let ((start i)) (when (char= c #\#) (incf i))

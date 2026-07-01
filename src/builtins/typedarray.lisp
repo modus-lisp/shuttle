@@ -389,16 +389,20 @@
         (setf (js-object-construct ctor)
               (let ((ty ty) (proto proto))
                 (lambda (args nt)
-                  (let ((rproto (proto-from-newtarget nt proto))
-                        (a0 (arg 0 args)))
+                  (let ((a0 (arg 0 args)))
                     (cond
                       ((not (js-object-p a0))    ; length or undefined
-                       (ta-from-length ty (if (js-undefined-p a0) 0 (to-index a0)) rproto))
+                       ;; ToIndex(length) is observable (throws TypeError on a Symbol)
+                       ;; and per test262 runs BEFORE GetPrototypeFromConstructor reads
+                       ;; NewTarget.prototype, so coerce the length first.
+                       (let ((len (if (js-undefined-p a0) 0 (to-index a0))))
+                         (ta-from-length ty len (proto-from-newtarget nt proto))))
                       ((array-buffer-p a0)
-                       (ta-from-buffer ty a0 (arg 1 args) (arg 2 args) rproto))
+                       (ta-from-buffer ty a0 (arg 1 args) (arg 2 args)
+                                       (proto-from-newtarget nt proto)))
                       ((typed-array-p a0)
-                       (ta-from-typedarray ty a0 rproto))
-                      (t (ta-from-iterable ty a0 rproto)))))))
+                       (ta-from-typedarray ty a0 (proto-from-newtarget nt proto)))
+                      (t (ta-from-iterable ty a0 (proto-from-newtarget nt proto))))))))
         (def-value ctor "prototype" proto :writable nil :configurable nil)
         (def-value proto "constructor" ctor)
         (def-value ctor "BYTES_PER_ELEMENT" (float size 1d0) :writable nil :configurable nil)
@@ -638,16 +642,21 @@
             (js-throw (make-native-error "TypeError" "detached")))
           (dotimes (i count) (ta-write out i (ta-read o (+ start i))))
           out)))
-    ;; subarray(begin, end) — shares the SAME buffer
+    ;; subarray(begin, end) — shares the SAME buffer.
+    ;; srcLength is the CURRENT length (0 if the buffer is detached); both begin
+    ;; and end are coerced (observably) against it. The new view is constructed
+    ;; through the buffer path, which re-checks detachment and throws TypeError.
     (def-method realm tp "subarray" 2 (this args)
       (with-ta (o this)
-        (let* ((l (ta-elt-length o)) (start (clamp-idx (arg 0 args) l 0))
+        (let* ((l (ta-length-checked o))
+               (start (clamp-idx (arg 0 args) l 0))
                (end (if (js-undefined-p (arg 1 args)) l (clamp-idx (arg 1 args) l l)))
                (count (max 0 (- end start)))
-               (size (ta-type-size (ta-type-of o))))
-          (make-typed-array (ta-type-of o) (ta-buffer o)
-                            (+ (ta-byte-offset o) (* start size)) count
-                            (ta-species-proto o nil)))))
+               (size (ta-type-size (ta-type-of o)))
+               (byte-offset (+ (ta-byte-offset o) (* start size))))
+          (ta-from-buffer (ta-type-of o) (ta-buffer o)
+                          (float byte-offset 1d0) (float count 1d0)
+                          (ta-species-proto o nil)))))
     ;; set(source, offset)
     (def-method realm tp "set" 1 (this args)
       (with-ta (o this)

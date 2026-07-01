@@ -32,7 +32,7 @@
 ;;; ===========================================================================
 (defstruct (compiled-regex (:constructor %make-compiled-regex))
   source flags
-  global ignore-case multiline dot-all sticky unicode has-indices
+  global ignore-case multiline dot-all sticky unicode unicode-sets has-indices
   matcher                               ; node matcher for the whole pattern
   n-captures                            ; number of capturing groups
   group-names)                          ; alist name->index (1-based)
@@ -195,6 +195,17 @@
                   (body (parse-disjunction p ngroups names)))
               (unless (rp-eat p #\)) (regex-syntax-error "unterminated group"))
               (list :group idx name body))))
+         ;; Pattern modifiers (ES2025): (?ims-ims: ... ) / (?ims: ...) / (?-ims: ...)
+         ;; Enabled/disabled flags are drawn from {i,m,s}; each may appear on at
+         ;; most one side, and the group must actually toggle something.
+         ((and (eql (rp-peek p) #\?)
+               (member (rp-peek p 1) '(#\i #\m #\s #\-)))
+          (rp-next p)                   ; consume '?'
+          (multiple-value-bind (add rem) (parse-modifier-flags p)
+            (unless (rp-eat p #\:) (regex-syntax-error "invalid modifier group"))
+            (let ((body (parse-disjunction p ngroups names)))
+              (unless (rp-eat p #\)) (regex-syntax-error "unterminated group"))
+              (list :modifier add rem body))))
          ((eql (rp-peek p) #\?)
           (regex-syntax-error "invalid group"))
          (t
@@ -213,6 +224,25 @@
       ((and (char= c #\?) (rx-parser-unicode p)) (regex-syntax-error "nothing to repeat"))
       (t (rp-next p) (list :char c)))))
 
+(defun parse-modifier-flags (p)
+  "Parse a RegularExpressionModifiers sequence: added flags, optional '-' then
+   removed flags, from {i,m,s}. Returns (values add-list rem-list). Errors on a
+   duplicate/overlapping/empty specification."
+  (let ((add '()) (rem '()))
+    (loop for c = (rp-peek p) while (member c '(#\i #\m #\s)) do
+      (when (member c add) (regex-syntax-error "duplicate modifier flag"))
+      (push c add) (rp-next p))
+    ;; A trailing '-' with no removed flags is valid: (?i-:...) toggles nothing on
+    ;; the remove side. But (?-:...) with nothing on either side is a SyntaxError.
+    (let ((had-dash (rp-eat p #\-)))
+      (when had-dash
+        (loop for c = (rp-peek p) while (member c '(#\i #\m #\s)) do
+          (when (or (member c rem) (member c add))
+            (regex-syntax-error "duplicate/overlapping modifier flag"))
+          (push c rem) (rp-next p)))
+      (when (and (null add) (null rem)) (regex-syntax-error "empty modifier group")))
+    (values (nreverse add) (nreverse rem))))
+
 (defun parse-group-name (p)
   (let ((start (rx-parser-pos p)))
     (loop for c = (rp-peek p) while (and c (not (char= c #\>))) do (rp-next p))
@@ -229,16 +259,26 @@
       ((member c '(#\d #\D #\w #\W #\s #\S))
        (rp-next p) (list :class-escape c))
       ((char= c #\k)
-       (rp-next p)
-       (if (eql (rp-peek p) #\<)
-           (progn (rp-next p)
-                  (let ((name (parse-group-name p)))
-                    (let ((idx (cdr (assoc name names :test #'string=))))
-                      (unless idx (regex-syntax-error (format nil "no group named ~a" name)))
-                      (list :backref idx))))
-           (if (rx-parser-unicode p)
-               (regex-syntax-error "\\k must be followed by <name>")
-               (list :char #\k))))
+       ;; \k is a named backreference only when the pattern actually declares
+       ;; named groups (or /u forces the strict grammar). Otherwise (Annex B,
+       ;; non-/u, no named groups) it is the literal identity escape 'k'.
+       (if (or (rx-parser-unicode p) names)
+           (progn
+             (rp-next p)
+             (if (eql (rp-peek p) #\<)
+                 (progn (rp-next p)
+                        (let ((name (parse-group-name p)))
+                          ;; Duplicate group names (ES2025) mean a name can map to
+                          ;; several indices; \k<name> references whichever such
+                          ;; group is currently captured.
+                          (let ((idxs (loop for (nm . idx) in names
+                                            when (string= nm name) collect idx)))
+                            (unless idxs (regex-syntax-error (format nil "no group named ~a" name)))
+                            (list :named-backref idxs))))
+                 (if (rx-parser-unicode p)
+                     (regex-syntax-error "\\k must be followed by <name>")
+                     (list :char #\k))))
+           (progn (rp-next p) (list :char #\k))))
       ((and (digit-char-p c) (not (char= c #\0)))
        (let ((start (rx-parser-pos p)) (n 0))
          (loop for d = (rp-peek p) while (and d (digit-char-p d))
@@ -468,9 +508,50 @@
     (:char-class (compile-char-class (cadr node) (caddr node)))
     (:group (compile-group (cadr node) (cadddr node)))
     (:backref (compile-backref (cadr node)))
+    (:named-backref (compile-named-backref (cadr node)))
     (:repeat (compile-repeat node))
     (:lookahead (compile-lookahead (cadr node) (caddr node)))
-    (:lookbehind (compile-lookbehind (cadr node) (caddr node)))))
+    (:lookbehind (compile-lookbehind (cadr node) (caddr node)))
+    (:modifier (compile-modifier (cadr node) (caddr node) (cadddr node)))))
+
+(defun compile-modifier (add rem body)
+  "Match BODY with the i/m/s flags in ADD forced on and those in REM forced off,
+   for the duration of the enclosed group. Flags are restored on the way out
+   (including via the continuation, so backtracking sees the outer flags)."
+  (let ((m (compile-node body))
+        (add-i (and (member #\i add) t)) (rem-i (and (member #\i rem) t))
+        (add-m (and (member #\m add) t)) (rem-m (and (member #\m rem) t))
+        (add-s (and (member #\s add) t)) (rem-s (and (member #\s rem) t)))
+    (lambda (mc pos k)
+      (let ((old-i (mctx-ignore-case mc))
+            (old-m (mctx-multiline mc))
+            (old-s (mctx-dot-all mc)))
+        (flet ((restore () (setf (mctx-ignore-case mc) old-i
+                                 (mctx-multiline mc) old-m
+                                 (mctx-dot-all mc) old-s)))
+          (when add-i (setf (mctx-ignore-case mc) t))
+          (when rem-i (setf (mctx-ignore-case mc) nil))
+          (when add-m (setf (mctx-multiline mc) t))
+          (when rem-m (setf (mctx-multiline mc) nil))
+          (when add-s (setf (mctx-dot-all mc) t))
+          (when rem-s (setf (mctx-dot-all mc) nil))
+          ;; The continuation K runs the *rest* of the pattern, which is outside
+          ;; this group and must see the outer flags — so restore before calling K
+          ;; and re-apply if K fails and the body backtracks into us.
+          (prog1
+              (funcall m mc pos
+                       (lambda (p2)
+                         (restore)
+                         (or (funcall k p2)
+                             (progn  ; re-enter group scope for further backtracking
+                               (when add-i (setf (mctx-ignore-case mc) t))
+                               (when rem-i (setf (mctx-ignore-case mc) nil))
+                               (when add-m (setf (mctx-multiline mc) t))
+                               (when rem-m (setf (mctx-multiline mc) nil))
+                               (when add-s (setf (mctx-dot-all mc) t))
+                               (when rem-s (setf (mctx-dot-all mc) nil))
+                               nil))))
+            (restore)))))))
 
 (defun compile-seq (nodes)
   (if (null nodes)
@@ -583,46 +664,91 @@
                 (progn (setf (aref (mctx-captures mc) idx) saved) nil))))
         m)))
 
+(defun match-backref-cap (mc cap pos k)
+  "Try to match the captured span CAP (a (start . end) cons or NIL) at POS,
+   calling K on success. An unset capture matches the empty string."
+  (if (null cap)
+      (funcall k pos)
+      (let* ((cs (car cap)) (ce (cdr cap)) (clen (- ce cs)))
+        (if (> (+ pos clen) (mctx-len mc))
+            nil
+            (let ((ok t))
+              (dotimes (i clen)
+                (unless (rx-char-eq mc (char (mctx-input mc) (+ pos i))
+                                    (char (mctx-input mc) (+ cs i)))
+                  (setf ok nil) (return)))
+              (and ok (funcall k (+ pos clen))))))))
+
 (defun compile-backref (idx)
   (lambda (mc pos k)
-    (let ((cap (aref (mctx-captures mc) idx)))
-      (if (null cap)
-          (funcall k pos)
-          (let* ((cs (car cap)) (ce (cdr cap)) (clen (- ce cs)))
-            (if (> (+ pos clen) (mctx-len mc))
-                nil
-                (let ((ok t))
-                  (dotimes (i clen)
-                    (unless (rx-char-eq mc (char (mctx-input mc) (+ pos i))
-                                        (char (mctx-input mc) (+ cs i)))
-                      (setf ok nil) (return)))
-                  (and ok (funcall k (+ pos clen))))))))))
+    (match-backref-cap mc (aref (mctx-captures mc) idx) pos k)))
+
+(defun compile-named-backref (idxs)
+  "\\k<name> where NAME may map to several (duplicate-named) group indices: use
+   whichever one is currently captured, else match the empty string."
+  (if (null (cdr idxs))
+      (compile-backref (car idxs))
+      (lambda (mc pos k)
+        (let ((cap (loop for i in idxs
+                         for c = (aref (mctx-captures mc) i)
+                         when c return c)))
+          (match-backref-cap mc cap pos k)))))
 
 ;;; ---- quantifiers ----
+(defun collect-capture-indices (node)
+  "The set of capturing-group indices that appear anywhere inside NODE (used to
+   reset them per quantifier iteration, per the spec's RepeatMatcher)."
+  (let ((acc '()))
+    (labels ((walk (n)
+               (when (consp n)
+                 (case (car n)
+                   (:group (when (cadr n) (push (cadr n) acc)) (walk (cadddr n)))
+                   ((:seq :alt) (mapc #'walk (cdr n)))
+                   (:repeat (walk (car (last n))))
+                   ((:lookahead :lookbehind) (walk (caddr n)))
+                   (:modifier (walk (cadddr n)))))))
+      (walk node))
+    (nreverse acc)))
+
 (defun compile-repeat (node)
   (destructuring-bind (mn mx lazy body) (cdr node)
-    (let ((m (compile-node body)))
+    (let ((m (compile-node body))
+          ;; Captures inside the body are cleared before each iteration so that,
+          ;; e.g., a group that failed to match on the current pass reads as
+          ;; undefined rather than leaking a value from a previous iteration.
+          (body-caps (collect-capture-indices body)))
       (lambda (mc pos k)
-        (labels ((match-min (n pos)
+        (labels ((try-iteration (pos body-k)
+                   ;; Clear this body's captures, run the body, and on failure of
+                   ;; the whole continuation restore them — so a speculative
+                   ;; extra iteration that ultimately fails doesn't wipe the
+                   ;; captures the last *successful* iteration produced.
+                   (let ((saved (when body-caps
+                                  (mapcar (lambda (i) (aref (mctx-captures mc) i)) body-caps))))
+                     (dolist (i body-caps) (setf (aref (mctx-captures mc) i) nil))
+                     (or (funcall m mc pos body-k)
+                         (progn
+                           (when body-caps
+                             (loop for i in body-caps for v in saved
+                                   do (setf (aref (mctx-captures mc) i) v)))
+                           nil))))
+                 (match-min (n pos)
                    (regex-step mc)
                    (if (zerop n)
                        (match-optional (if mx (- mx mn) nil) pos)
-                       (funcall m mc pos (lambda (p2) (match-min (1- n) p2)))))
+                       (try-iteration pos (lambda (p2) (match-min (1- n) p2)))))
                  (match-optional (remaining pos)
                    (regex-step mc)
                    (if (and remaining (<= remaining 0))
                        (funcall k pos)
-                       (if lazy
-                           (or (funcall k pos)
-                               (funcall m mc pos
-                                        (lambda (p2)
-                                          (if (= p2 pos) nil
-                                              (match-optional (and remaining (1- remaining)) p2)))))
-                           (or (funcall m mc pos
-                                        (lambda (p2)
-                                          (if (= p2 pos) nil
-                                              (match-optional (and remaining (1- remaining)) p2))))
-                               (funcall k pos))))))
+                       (flet ((more (p)
+                                (try-iteration p
+                                 (lambda (p2)
+                                   (if (= p2 p) nil
+                                       (match-optional (and remaining (1- remaining)) p2))))))
+                         (if lazy
+                             (or (funcall k pos) (more pos))
+                             (or (more pos) (funcall k pos)))))))
           (match-min mn pos))))))
 
 ;;; ---- lookaround ----
@@ -667,18 +793,25 @@
 (defun validate-flags (flags)
   (let ((seen '()))
     (loop for c across flags do
-      (unless (member c '(#\g #\i #\m #\s #\u #\y #\d))
+      (unless (member c '(#\g #\i #\m #\s #\u #\y #\d #\v))
         (regex-syntax-error (format nil "invalid flag '~a'" c)))
       (when (member c seen)
         (regex-syntax-error (format nil "duplicate flag '~a'" c)))
       (push c seen)))
+  ;; u and v are mutually exclusive.
+  (when (and (find #\u flags) (find #\v flags))
+    (regex-syntax-error "the 'u' and 'v' flags cannot both be set"))
   flags)
 
 (defun regex-compile (source flags)
   "Compile a JS RegExp SOURCE string + FLAGS string into a compiled-regex.
    Throws a JS SyntaxError on invalid pattern/flags."
   (validate-flags flags)
-  (let* ((unicode (flag-set-p flags #\u)))
+  (let* ((unicode-sets (flag-set-p flags #\v))
+         ;; Under either u or v the engine parses in "unicode mode" and advances
+         ;; by whole code points. (Full v-flag set notation is not implemented;
+         ;; a pattern that uses it will raise a SyntaxError.)
+         (unicode (or (flag-set-p flags #\u) unicode-sets)))
     (multiple-value-bind (ast ngroups names) (regex-parse source unicode)
       (let ((matcher (compile-node ast)))
         (%make-compiled-regex
@@ -689,6 +822,7 @@
          :dot-all (flag-set-p flags #\s)
          :sticky (flag-set-p flags #\y)
          :unicode unicode
+         :unicode-sets unicode-sets
          :has-indices (flag-set-p flags #\d)
          :matcher matcher
          :n-captures ngroups
