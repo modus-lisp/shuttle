@@ -189,7 +189,7 @@
     ((null tgt) (em :pop))                  ; hole: discard
     ((eq (car tgt) :apat) (compile-array-destructure tgt))
     ((eq (car tgt) :opat) (compile-object-destructure tgt))
-    (t (js-throw "bad binding target"))))
+    (t (js-throw (make-native-error "SyntaxError" "bad binding target")))))
 
 ;;; ---- destructuring ASSIGNMENT (LHS is expression-form: :ident/:member/:array/:object) ----
 (defun assign-to-target (tgt)
@@ -341,9 +341,9 @@
     (:for-of (compile-scoped-loop node #'compile-for-of))
     (:for-await-of (compile-scoped-loop node #'compile-for-await-of))
     (:break (if *break-target* (progn (pop-envs (- *scope-depth* *break-depth*)) (em :jmp *break-target*))
-                (js-throw "illegal break")))
+                (js-throw (make-native-error "SyntaxError" "illegal break"))))
     (:continue (if *continue-target* (progn (pop-envs (- *scope-depth* *continue-depth*)) (em :jmp *continue-target*))
-                   (js-throw "illegal continue")))
+                   (js-throw (make-native-error "SyntaxError" "illegal continue"))))
     (:switch (destructuring-bind (disc cases default) (cdr node)
                (let ((dv (string (gensym "SW"))) (end (lbl)) (deflabel (lbl))
                      (clabels (mapcar (lambda (c) (cons c (lbl))) cases)))
@@ -410,7 +410,7 @@
          (compile-assign-pattern head) (em :pop))
         ((member (car head) '(:array :object))     ; destructuring assignment target
          (compile-assign-pattern head) (em :pop))
-        (t (js-throw "unsupported for-in/of target"))))
+        (t (js-throw (make-native-error "SyntaxError" "unsupported for-in/of target")))))
 
 (defun compile-for-in (node)
   (destructuring-bind (head obj body) (cdr node)
@@ -764,6 +764,17 @@
       (progn (mapc #'compile-expr args) (em :super-call (length args)))))
 
 (defun compile-call (callee args)
+  ;; Direct eval: a call whose callee is the *identifier* `eval` (not a member
+  ;; access, not a computed reference). We resolve the binding at runtime and,
+  ;; iff it is the realm's %eval% intrinsic and the first arg is a string, run
+  ;; the code in THIS lexical environment / `this` / strict context. Any other
+  ;; binding (shadowed eval, non-string arg) falls through to an ordinary call.
+  (when (and (consp callee) (eq (car callee) :ident) (string= (second callee) "eval")
+             (not (some (lambda (a) (and (consp a) (eq (car a) :spread))) args)))
+    (em :get-var "eval")                ; the (possibly shadowed) eval binding
+    (mapc #'compile-expr args)
+    (em :eval-direct (length args))
+    (return-from compile-call nil))
   ;; super.m(...) : method call on the super prototype, this = current this
   (when (eq (car callee) :super-member)
     (destructuring-bind (key computed) (cdr callee)

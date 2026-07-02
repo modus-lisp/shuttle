@@ -257,7 +257,22 @@
 ;;; RECEIVER (the proxy) as `this`; a data write lands via the proxy's
 ;;; [[DefineOwnProperty]] (which delegates to the target), matching the spec's
 ;;; Receiver.[[DefineOwnProperty]] path.
+(defun %proxy-object-p (o)
+  "True iff O is itself a Proxy exotic object (its INTERNAL plist carries a
+   :set trap closure — every proxy installs one, ordinary objects never do)."
+  (and (js-object-p o)
+       (functionp (getf (js-object-internal o) :set))))
+
 (defun %proxy-default-set (target key v receiver proxy)
+  ;; Spec [[Set]] with an absent trap = `Return target.[[Set]](P, V, Receiver)`.
+  ;; When TARGET is itself a Proxy (or any object with an exotic [[Set]]), that
+  ;; call must dispatch through the target's own internal method — its set trap
+  ;; must fire — so delegate straight to js-set. We only spell OrdinarySet out
+  ;; below (rather than always delegating) because core's %create-data-on-receiver
+  ;; would bypass the PROXY receiver's traps on the final data write; that only
+  ;; matters when the target is an ordinary object.
+  (when (%proxy-object-p target)
+    (return-from %proxy-default-set (js-bool (js-truthy (js-set target key v receiver)))))
   ;; Step 1: resolve ownDesc, walking the target's prototype chain if absent.
   ;; We must NOT delegate the whole set to a parent (its ordinary-set would write
   ;; to the proxy receiver via %create-data-on-receiver, bypassing the traps);

@@ -277,6 +277,6 @@
                                                             (< (+ i 2) n) (digit-char-p (char src (+ i 2)))))))
                                  *punctuators*)))
                  (if p (progn (emit :punct p) (incf i (length p)))
-                     (js-throw (format nil "Unexpected character ~s" c)))))))))
+                     (js-throw (make-native-error "SyntaxError" (format nil "Unexpected character ~s" c))))))))))
     (vector-push-extend (cons :eof nil) toks)
     toks))

@@ -1005,8 +1005,23 @@
     (def-method realm console "warn" 0 (this args)
       (format t "~&~{~a~^ ~}~%" (mapcar (lambda (v) (ignore-errors (to-string v))) args)) *undefined*)
     (define-global realm "console" console))
-  (define-global realm "eval"
-    (native-function realm "eval"
-      (lambda (this args) (declare (ignore this))
-        (let ((s (arg 0 args)))
-          (if (stringp s) (run (compile-toplevel s) (realm-global-env realm) (realm-global realm)) s))) 1)))
+  ;; %eval%: the global eval function. A CALL through this binding is *indirect*
+  ;; eval — it always evaluates in the global environment (never the caller's).
+  ;; A *direct* eval (source-level `eval(x)` where `eval` is unshadowed) is
+  ;; recognized by the compiler and handled by the VM's :eval-direct opcode,
+  ;; which shares the caller's env/this; it only reaches this function object
+  ;; for the identity check. Non-string input is returned unchanged.
+  (let ((eval-fn
+          (native-function realm "eval"
+            (lambda (this args) (declare (ignore this))
+              (let ((s (arg 0 args)))
+                (if (stringp s)
+                    (let ((code (handler-case (compile-toplevel s)
+                                  (shuttle-error (e) (error e))
+                                  (error (e)
+                                    (js-throw (make-native-error "SyntaxError"
+                                                (format nil "~a" (ignore-errors (princ-to-string e)))))))))
+                      (with-js-floats (run code (realm-global-env realm) (realm-global realm))))
+                    s))) 1)))
+    (setf (getf (realm-intrinsics realm) :eval) eval-fn)
+    (define-global realm "eval" eval-fn)))

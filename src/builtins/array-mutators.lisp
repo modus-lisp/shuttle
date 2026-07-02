@@ -274,8 +274,9 @@
                   (let ((i 0))
                     (dolist (v sorted) (js-set this (k i) v) (incf i))
                     (dotimes (j undef-count) (js-set this (k i) *undefined*) (incf i))
-                    (dotimes (j hole-count) (js-delete this (k i)) (incf i))))))
-            this))
+                    (dotimes (j hole-count) (js-delete this (k i)) (incf i)))))
+              ;; Return the (ToObject-coerced) receiver, not the raw primitive.
+              this)))
         ))))
 
 (register-builtin-installer 'install-array-mutators)

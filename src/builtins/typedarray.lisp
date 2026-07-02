@@ -245,16 +245,21 @@
       (t (js-bool (js-define-own-property receiver k (list :value v)))))))
 
 (defun ta-internal-has (o key)
+  ;; The :has trap contract is a CL boolean (like ORDINARY-HAS), NOT a JS boolean:
+  ;; the `in` operator wraps the result in JS-BOOL, and *false* is non-nil in CL.
   (let ((idx (canonical-numeric-index key)))
     (if idx
-        (js-bool (ta-valid-index-p o idx))
+        (and (ta-valid-index-p o idx) t)
         ;; OrdinaryHasProperty: own prop or (robustly) walk the prototype chain.
         (let ((k (prop-key key)))
-          (js-bool (or (nth-value 1 (gethash k (js-object-props o)))
-                       (let ((p (js-object-proto o)))
-                         (and (js-object-p p) (js-truthy* (js-has p k))))))))))
+          (and (or (nth-value 1 (gethash k (js-object-props o)))
+                   (let ((p (js-object-proto o)))
+                     (and (js-object-p p) (js-truthy* (js-has p k)))))
+               t)))))
 
 (defun ta-internal-delete (o key)
+  ;; :delete trap returns a JS boolean (the `delete` opcode pushes it as the
+  ;; expression value; ORDINARY-DELETE likewise returns *true*/*false*).
   (let ((idx (canonical-numeric-index key)))
     (if idx (js-bool (not (ta-valid-index-p o idx))) (ordinary-delete o key))))
 
@@ -366,8 +371,10 @@
             (make-typed-array ty buffer offset newlen proto))))))
 
 (defun ta-from-typedarray (ty src proto)
-  (when (ta-detached-p src)
-    (js-throw (make-native-error "TypeError" "source is detached")))
+  ;; A source that is detached OR a fixed-length view over a shrunk resizable
+  ;; buffer (now out of bounds) throws TypeError.
+  (when (ta-out-of-bounds-p src)
+    (js-throw (make-native-error "TypeError" "source is out of bounds or detached")))
   ;; The content types must match: a bigint array can only be built from a bigint
   ;; array, and a number array from a number array (spec InitializeTypedArrayFromTypedArray).
   (unless (eq (and (ta-type-bigint ty) t)
@@ -528,8 +535,11 @@
     (def-method realm tp "at" 1 (this args)
       (with-ta-v (o this)
         (let* ((l (len o)) (rel (to-integer-or-infinity (arg 0 args)))
-               (k (if (>= rel 0) (truncate rel) (+ l (truncate rel)))))
-          (if (and (>= k 0) (< k l)) (ta-read o k) *undefined*))))
+               (k (cond ((= rel *inf*) l) ((= rel *-inf*) -1)
+                        ((>= rel 0) (truncate rel)) (t (+ l (truncate rel))))))
+          ;; ToIntegerOrInfinity may have resized/detached: read via [[Get]] so an
+          ;; index now invalid (view shrank/out of bounds) yields undefined.
+          (if (and (>= k 0) (< k l)) (ta-read-or-undef o k) *undefined*))))
     ;; fill(value, start, end)
     (def-method realm tp "fill" 1 (this args)
       (with-ta-v (o this)
@@ -656,9 +666,12 @@
               (let ((v (ta-read-or-undef o i)))
                 (when (js-truthy (js-call f ta (list v (float i 1d0) o))) (push v kept))))
             (let* ((vals (nreverse kept)) (out (ta-from-length (ta-type-of o) (length vals) (ta-species-proto o nil))) (i 0))
-              ;; VALS are already element values read from O (same type as OUT);
-              ;; no re-coercion needed (and ToNumber would reject bigints).
-              (dolist (v vals) (ta-write out i v) (incf i))
+              ;; Values are read from O via [[Get]] (same element type as OUT), but a
+              ;; resizable-buffer shrink mid-iteration can yield undefined for an
+              ;; out-of-bounds index; coerce so those become NaN/0 rather than crash.
+              (dolist (v vals)
+                (ta-write out i (if (js-undefined-p v) (ta-coerce-element out v) v))
+                (incf i))
               out))))
       (def-method realm tp "some" 1 (this args)
         (with-ta-v (o this)
@@ -714,9 +727,16 @@
                (end (if (js-undefined-p (arg 1 args)) l (clamp-idx (arg 1 args) l l)))
                (count (max 0 (- end start)))
                (out (ta-from-length (ta-type-of o) count (ta-species-proto o nil))))
-          (when (and (> count 0) (ta-detached-p o))
-            (js-throw (make-native-error "TypeError" "detached")))
-          (dotimes (i count) (ta-write out i (ta-read o (+ start i))))
+          (when (> count 0)
+            ;; The index coercions may have detached/shrunk the buffer.
+            (when (ta-out-of-bounds-p o)
+              (js-throw (make-native-error "TypeError" "TypedArray is out of bounds or backed by a detached ArrayBuffer")))
+            ;; A length-tracking view may have shrunk: copy only the elements that
+            ;; still exist; the remaining OUT elements stay zero-filled.
+            (let ((cur (len o)))
+              (dotimes (i count)
+                (when (< (+ start i) cur)
+                  (ta-write out i (ta-read o (+ start i)))))))
           out)))
     ;; subarray(begin, end) — shares the SAME buffer.
     ;; srcLength is the CURRENT length (0 if the buffer is detached); both begin
@@ -724,15 +744,24 @@
     ;; through the buffer path, which re-checks detachment and throws TypeError.
     (def-method realm tp "subarray" 2 (this args)
       (with-ta (o this)
-        (let* ((l (ta-length-checked o))
+        ;; srcLength is the CURRENT element length (0 when the view is out of bounds).
+        ;; startIndex/endIndex are clamped against it; beginByteOffset is computed
+        ;; from the RAW stored byteOffset (spec step 13), NOT the OOB-adjusted one.
+        (let* ((l (ta-elt-length o))
                (start (clamp-idx (arg 0 args) l 0))
-               (end (if (js-undefined-p (arg 1 args)) l (clamp-idx (arg 1 args) l l)))
-               (count (max 0 (- end start)))
+               (end-arg (arg 1 args))
                (size (ta-type-size (ta-type-of o)))
-               (byte-offset (+ (ta-byte-offset o) (* start size))))
-          (ta-from-buffer (ta-type-of o) (ta-buffer o)
-                          (float byte-offset 1d0) (float count 1d0)
-                          (ta-species-proto o nil)))))
+               (byte-offset (+ (ta-raw-offset o) (* start size))))
+          (if (and (ta-track-p o) (js-undefined-p end-arg))
+              ;; auto-length source + end undefined → result is length-tracking too.
+              (ta-from-buffer (ta-type-of o) (ta-buffer o)
+                              (float byte-offset 1d0) *undefined*
+                              (ta-species-proto o nil))
+              (let* ((end (if (js-undefined-p end-arg) l (clamp-idx end-arg l l)))
+                     (count (max 0 (- end start))))
+                (ta-from-buffer (ta-type-of o) (ta-buffer o)
+                                (float byte-offset 1d0) (float count 1d0)
+                                (ta-species-proto o nil)))))))
     ;; set(source, offset)
     (def-method realm tp "set" 1 (this args)
       (with-ta (o this)
@@ -740,13 +769,18 @@
                ;; ToIntegerOrInfinity(offset) may run user code that detaches O.
                (offset (to-integer-or-infinity (arg 1 args))))
           (when (< offset 0) (js-throw (make-native-error "RangeError" "offset out of range")))
-          ;; Re-validate O after coercion side effects.
-          (when (ta-detached-p o) (js-throw (make-native-error "TypeError" "TypedArray is backed by a detached ArrayBuffer")))
+          ;; Re-validate O after coercion side effects: a detached buffer OR a
+          ;; fixed-length view now out of bounds (resizable buffer shrank) throws
+          ;; BEFORE the source's length/element getters are touched.
+          (when (ta-out-of-bounds-p o)
+            (js-throw (make-native-error "TypeError" "TypedArray is out of bounds or backed by a detached ArrayBuffer")))
           (let ((targetlen (ta-elt-length o)))
             (if (typed-array-p src)
                 (progn
-                  (when (ta-detached-p src)
-                    (js-throw (make-native-error "TypeError" "source is backed by a detached ArrayBuffer")))
+                  ;; The source's out-of-bounds state (detached OR a fixed-length
+                  ;; view over a shrunk resizable buffer) throws TypeError.
+                  (when (ta-out-of-bounds-p src)
+                    (js-throw (make-native-error "TypeError" "source is out of bounds or backed by a detached ArrayBuffer")))
                   ;; Content types must match (SetTypedArrayFromTypedArray).
                   (unless (eq (and (ta-type-bigint (ta-type-of o)) t)
                               (and (ta-type-bigint (ta-type-of src)) t))
@@ -833,7 +867,9 @@
         (let ((l (len o)))
           (with-output-to-string (s)
             (dotimes (i l) (when (plusp i) (write-string "," s))
-              (let ((v (ta-read o i)))
+              ;; A user toLocaleString may shrink the buffer mid-loop; read via
+              ;; [[Get]] so a now-out-of-bounds index yields undefined.
+              (let ((v (ta-read-or-undef o i)))
                 (unless (js-null-or-undef v)
                   ;; spec: call each element's toLocaleString and ToString the result
                   (let ((f (js-get v "toLocaleString")))
@@ -873,17 +909,26 @@
 (defun make-ta-iterator (realm o kind)
   ;; TypedArray iterators are Array Iterators — they share %ArrayIteratorPrototype%
   ;; (which carries next/@@iterator/@@toStringTag).
-  (let ((i 0) (it (make-object :proto (or *array-iterator-prototype* (realm-object-proto realm))
-                               :class "Array Iterator")))
+  (let ((i 0) (done nil)
+        (it (make-object :proto (or *array-iterator-prototype* (realm-object-proto realm))
+                         :class "Array Iterator")))
     (def-method realm it "next" 0 (this args)
-      (let ((res (make-object :proto (realm-object-proto realm)))
-            (l (ta-length-checked o)))
-        (if (< i l)
-            (progn (put res "value"
-                        (ecase kind (:key (float i 1d0)) (:value (ta-read o i))
-                          (:entry (make-array-object (list (float i 1d0) (ta-read o i))))))
-                   (put res "done" *false*) (incf i))
-            (progn (put res "value" *undefined*) (put res "done" *true*)))
+      (let ((res (make-object :proto (realm-object-proto realm))))
+        ;; Once exhausted the iterator stays exhausted, even if the backing
+        ;; resizable buffer later grows the typed array back in-bounds.
+        (when (not done)
+          ;; A fixed-length view that has gone out of bounds (buffer shrank) makes
+          ;; the iterator step throw a TypeError.
+          (when (ta-out-of-bounds-p o)
+            (js-throw (make-native-error "TypeError"
+                       "TypedArray is out of bounds or backed by a detached ArrayBuffer"))))
+        (let ((l (ta-length-checked o)))
+          (if (and (not done) (< i l))
+              (progn (put res "value"
+                          (ecase kind (:key (float i 1d0)) (:value (ta-read o i))
+                            (:entry (make-array-object (list (float i 1d0) (ta-read o i))))))
+                     (put res "done" *false*) (incf i))
+              (progn (setf done t) (put res "value" *undefined*) (put res "done" *true*))))
         res))
     (unless *array-iterator-prototype*
       (when *symbol-iterator*

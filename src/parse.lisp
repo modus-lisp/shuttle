@@ -10,7 +10,7 @@
 (defun adv () (prog1 (cur) (incf *pos*)))
 (defun punct? (v) (and (eq (cur-type) :punct) (string= (cur-val) v)))
 (defun kw? (v) (and (eq (cur-type) :ident) (string= (cur-val) v)))
-(defun eat (v) (if (punct? v) (adv) (js-throw (format nil "Expected '~a'" v))))
+(defun eat (v) (if (punct? v) (adv) (js-throw (make-native-error "SyntaxError" (format nil "Expected '~a'" v)))))
 (defun opt (v) (when (punct? v) (adv) t))
 
 (defparameter *binops*
@@ -115,7 +115,7 @@
                           (nreverse s))))
           (cond ((kw? "case") (adv) (let ((e (parse-expr 1))) (eat ":") (push (cons e (body)) cases)))
                 ((kw? "default") (adv) (eat ":") (setf default (body)))
-                (t (js-throw "malformed switch")))))
+                (t (js-throw (make-native-error "SyntaxError" "malformed switch"))))))
       (eat "}") (list :switch disc (nreverse cases) default))))
 
 (defun parse-try ()
@@ -438,7 +438,7 @@
        (adv) (if (punct? "=>")                  ; id => body  (arrow)
                  (progn (adv) (list :arrow (list tv) (parse-arrow-body)))
                  (list :ident tv)))
-      (t (js-throw (format nil "Unexpected token ~a ~s" tt tv))))))
+      (t (js-throw (make-native-error "SyntaxError" (format nil "Unexpected token ~a ~s" tt tv)))))))
 
 (defun async-arrow-follows-p ()
   "At `async`: is this an async arrow head — `async IDENT =>` or `async (`

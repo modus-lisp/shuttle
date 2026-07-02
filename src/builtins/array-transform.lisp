@@ -181,6 +181,81 @@
       (def-method realm ap "entries" 0 (this args)
         (make-array-iterator-kind realm (to-object this) :entry))
 
+      ;; ---- Array.from override (kernel version ignores mapFn validation,
+      ;; the this-constructor, string primitives, and @@iterator on boxed
+      ;; primitives).  Spec: Array.from ( items [ , mapfn [ , thisArg ] ] ).
+      (let ((actor (ignore-errors (js-get (realm-global realm) "Array"))))
+        (when (and actor (js-object-p actor))
+          (labels ((create-data (o k v)
+                     ;; CreateDataProperty(O, P, V): DefineOwnProperty with a full
+                     ;; data descriptor.  Returns T/NIL (caller throws on NIL).
+                     (js-define-own-property o (prop-key k)
+                                             (list :value v :writable t
+                                                   :enumerable t :configurable t)))
+                   (iter-close-quiet (it)
+                     ;; IteratorClose on abrupt completion: call return() for side
+                     ;; effects, swallow any throw it produces.
+                     (let ((ret (and (js-object-p it) (js-get it "return"))))
+                       (when (and ret (not (js-null-or-undef ret)) (js-callable-p ret))
+                         (handler-case (js-call ret it '()) (shuttle-error () nil)))))
+                   (make-result (c len)
+                     ;; C = this value.  If C is a constructor, Construct(C[,len]);
+                     ;; else ArrayCreate(len).
+                     (if (and (js-object-p c) (js-object-construct c))
+                         (js-construct c (if len (list (float len 1d0)) '()))
+                         (let ((a (make-object :proto (realm-array-proto realm) :class "Array")))
+                           (put a "length" (float (or len 0) 1d0)
+                                :enumerable nil :writable t :configurable nil)
+                           a))))
+            (def-method realm actor "from" 1 (this args)
+              (let* ((items (arg 0 args))
+                     (mapf (arg 1 args))
+                     (thisarg (arg 2 args))
+                     (mapping (not (js-undefined-p mapf))))
+                (when (and mapping (not (js-callable-p mapf)))
+                  (js-throw (make-native-error "TypeError" "Array.from mapfn is not a function")))
+                (let ((usingit (and *symbol-iterator*
+                                    (let ((m (js-get (to-object items) *symbol-iterator*)))
+                                      (cond ((js-null-or-undef m) nil)
+                                            ((js-callable-p m) m)
+                                            (t (js-throw (make-native-error "TypeError"
+                                                          "@@iterator is not callable"))))))))
+                  (if usingit
+                      ;; Iterator path.
+                      (let* ((a (make-result this nil))
+                             (it (js-call usingit (to-object items) '()))
+                             (k 0))
+                        (unless (js-object-p it)
+                          (js-throw (make-native-error "TypeError" "iterator is not an object")))
+                        (loop
+                          (let ((r (iterator-step it)))
+                            (when (js-truthy (js-get r "done"))
+                              (js-set a "length" (float k 1d0) a)
+                              (return a))
+                            (let ((v (js-get r "value")))
+                              (handler-case
+                                  (let ((mapped (if mapping
+                                                    (js-call mapf thisarg (list v (float k 1d0)))
+                                                    v)))
+                                    (unless (create-data a (princ-to-string k) mapped)
+                                      (js-throw (make-native-error "TypeError"
+                                                 "cannot create result element"))))
+                                (shuttle-error (e) (iter-close-quiet it) (error e)))
+                              (incf k)))))
+                      ;; Array-like path.
+                      (let* ((o (to-object items))
+                             (len (truncate (to-length (js-get o "length"))))
+                             (a (make-result this len))
+                             (k 0))
+                        (dotimes (i len)
+                          (let* ((v (js-get o (princ-to-string i)))
+                                 (mapped (if mapping (js-call mapf thisarg (list v (float i 1d0))) v)))
+                            (unless (create-data a (princ-to-string k) mapped)
+                              (js-throw (make-native-error "TypeError" "cannot create result element"))))
+                          (incf k))
+                        (js-set a "length" (float len 1d0) a)
+                        a))))))))
+
       (def-method realm ap "toLocaleString" 0 (this args)
         (let* ((o (to-object this))
                (l (truncate (to-length (js-get o "length")))))

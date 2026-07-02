@@ -1154,6 +1154,30 @@
 
 (defvar *run-depth* 0)    ; 0 = top-level script run; drain microtasks when it unwinds
 
+(defun realm-eval-intrinsic (realm)
+  "The realm's %eval% function object (the value bound to the global `eval`),
+   stashed under :eval in the intrinsics plist at install time. Used to tell a
+   direct-eval call (`eval(x)` where eval is unshadowed) from an ordinary call."
+  (getf (realm-intrinsics realm) :eval))
+
+(defun perform-direct-eval (source env this strictp)
+  "PerformEval for a *direct* eval call. Compile SOURCE and run it sharing the
+   caller's variable environment (so `var`/function declarations hoist into the
+   caller in sloppy mode, and outer bindings are visible), the caller's `this`,
+   and — when the calling context is strict OR the eval code has its own
+   \"use strict\" — a fresh child env so declarations don't leak (strict eval).
+   A SyntaxError in the eval source is thrown as a JS SyntaxError."
+  (let* ((code (handler-case (compile-toplevel source)
+                 (shuttle-error (e) (error e))
+                 (error (e)
+                   (js-throw (make-native-error "SyntaxError"
+                               (format nil "~a" (ignore-errors (princ-to-string e))))))))
+         ;; strict eval (caller strict, or the code's own prologue) evaluates in
+         ;; its own declaration scope; sloppy direct eval shares the caller env.
+         (own-strict (code-strict code))
+         (run-env (if (or strictp own-strict) (new-env env) env)))
+    (with-js-floats (run code run-env this))))
+
 (defun run (code env this &optional call-args fn-obj)
   (if (zerop *run-depth*)
       ;; outermost run of a script: run the body, then drain the microtask queue so
@@ -1261,6 +1285,17 @@
                           (push! (make-array-object (nreverse out)))))
             (:object-rest (let ((src (pop!)) (taken (first a)))
                             (push! (object-rest-copy src taken))))
+            (:eval-direct
+             ;; Direct eval: stack has [evalFn arg0 arg1 ...]. If evalFn is the
+             ;; realm's %eval% intrinsic and arg0 is a string, run the code in
+             ;; THIS lexical env / this / strict context. Otherwise ordinary call.
+             (let* ((args (nreverse (loop repeat (first a) collect (pop!))))
+                    (evalfn (pop!)))
+               (if (and (boundp '*current-realm*)
+                        (eq evalfn (realm-eval-intrinsic *current-realm*))
+                        (stringp (first args)))
+                   (push! (perform-direct-eval (first args) env this strictp))
+                   (push! (js-call evalfn *undefined* args)))))
             (:call (let* ((args (loop repeat (first a) collect (pop!)))
                           (callee (pop!)) (thisv (pop!)))
                      (push! (js-call callee thisv (nreverse args)))))

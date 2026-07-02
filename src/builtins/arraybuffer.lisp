@@ -130,11 +130,11 @@
     (def-method realm proto "resize" 1 (this args)
       (unless (ab-resizable-p this)
         (js-throw (make-native-error "TypeError" "ArrayBuffer is not resizable")))
-      (when (ab-detached-p this)
-        (js-throw (make-native-error "TypeError" "ArrayBuffer is detached")))
+      ;; ToIntegerOrInfinity(newLength) runs BEFORE the (single) detach check
+      ;; (spec 25.1.6.x steps 3-4); its coercion is observable even on an already
+      ;; detached buffer.
       (let ((new-len (to-integer-or-infinity (arg 0 args)))
             (maxlen (ab-max-byte-length this)))
-        ;; ToIntegerOrInfinity(newLength) may have detached the buffer.
         (when (ab-detached-p this)
           (js-throw (make-native-error "TypeError" "ArrayBuffer is detached")))
         (when (or (< new-len 0) (= new-len *inf*) (> new-len maxlen))
@@ -144,8 +144,11 @@
           (dotimes (i (min n (length old))) (setf (aref out i) (aref old i)))
           (setf (ab-bytes this) out)
           *undefined*)))
-    ;; transfer / transferToFixedLength (both produce a fixed-length copy, detach source)
-    (flet ((do-transfer (this args)
+    ;; transfer / transferToFixedLength — ArrayBufferCopyAndDetach. Both copy the
+    ;; contents and detach the source. transfer() preserves resizability (a
+    ;; resizable source yields a resizable dest with the same maxByteLength);
+    ;; transferToFixedLength always yields a fixed-length dest.
+    (flet ((do-transfer (this args preserve)
              (unless (array-buffer-p this)
                (js-throw (make-native-error "TypeError" "not an ArrayBuffer")))
              (when (ab-detached-p this)
@@ -155,7 +158,10 @@
                                  (let ((n (to-integer-or-infinity (arg 0 args))))
                                    (when (or (< n 0) (= n *inf*))
                                      (js-throw (make-native-error "RangeError" "Invalid length")))
-                                   (truncate n)))))
+                                   (truncate n))))
+                    ;; preserve resizability: a resizable source keeps its maxByteLength.
+                    (maxlen (and preserve (ab-resizable-p this) (ab-max-byte-length this))))
+               (when maxlen (guard-alloc maxlen))
                (guard-alloc new-len)
                (when (ab-detached-p this)
                  (js-throw (make-native-error "TypeError" "ArrayBuffer is detached")))
@@ -164,9 +170,9 @@
                       (out (make-byte-vector new-len)))
                  (dotimes (i copy) (setf (aref out i) (aref src i)))
                  (ab-detach this)
-                 (make-array-buffer out proto)))))
-      (def-method realm proto "transfer" 0 (this args) (do-transfer this args))
-      (def-method realm proto "transferToFixedLength" 0 (this args) (do-transfer this args)))
+                 (make-array-buffer out proto maxlen)))))
+      (def-method realm proto "transfer" 0 (this args) (do-transfer this args t))
+      (def-method realm proto "transferToFixedLength" 0 (this args) (do-transfer this args nil)))
     ;; @@toStringTag
     (put proto (symbol-tostringtag realm) "ArrayBuffer"
          :enumerable nil :writable nil :configurable t)
