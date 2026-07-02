@@ -53,8 +53,58 @@
   (class "Object")          ; loosely [[Class]] / internal kind
   (internal nil)            ; plist of internal-method overrides (host objects)
   (primitive nil)           ; [[NumberData]]/[[StringData]]/[[BooleanData]]/[[SymbolData]] for wrappers
+  (private nil)             ; PrivateName -> private-element (brand-checked #x members); nil until first use
   (call nil)                ; [[Call]]      : (this args-list) -> value
   (construct nil))          ; [[Construct]] : (args-list new-target) -> object
+
+;;; ---- private class members (#x) ----
+;;; A PRIVATE-NAME is a unique runtime identity for one `#name` within one class
+;;; (created at class-definition time). The compiler embeds it as a constant. An
+;;; object "has" a private name iff its PRIVATE table contains that identity.
+(defstruct (private-name (:constructor make-private-name (description)))
+  description)          ; "#x" (for error messages / debugging)
+;; A private element value is one of:
+;;   (:field . VALUE)         a private instance/static field
+;;   (:method . FN)           a private method (shared, brand only)
+;;   (:accessor GETTER SETTER) private get/set (either may be nil)
+(defun object-private-table (o)
+  (or (js-object-private o) (setf (js-object-private o) (make-hash-table :test 'eq))))
+(defun private-get-element (o pn)
+  (and (js-object-p o) (js-object-private o) (gethash pn (js-object-private o))))
+
+(defun private-method-name (kind pn)
+  "Function name for a private method/accessor: `#x`, `get #x`, or `set #x`."
+  (let ((d (private-name-description pn)))
+    (case kind (:get (concatenate 'string "get " d))
+               (:set (concatenate 'string "set " d))
+               (t d))))
+
+(defun private-require (o pn)
+  "The private element for PN on O, or a TypeError if O lacks the private brand."
+  (let ((el (private-get-element o pn)))
+    (unless el
+      (js-throw (make-native-error "TypeError"
+                  (format nil "Cannot read private member #~a from an object whose class did not declare it"
+                          (private-name-description pn)))))
+    el))
+
+(defun private-element-get (el receiver)
+  "Read a private element (already brand-checked)."
+  (ecase (car el)
+    (:field (cdr el))
+    (:method (cdr el))
+    (:accessor (let ((getter (second el)))
+                 (if getter (js-call getter receiver '())
+                     (js-throw (make-native-error "TypeError" "Private member was defined without a getter")))))))
+
+(defun private-element-set (el receiver v)
+  "Write a private element (already brand-checked)."
+  (ecase (car el)
+    (:field (setf (cdr el) v))
+    (:method (js-throw (make-native-error "TypeError" "Private method is not writable")))
+    (:accessor (let ((setter (third el)))
+                 (if setter (js-call setter receiver (list v))
+                     (js-throw (make-native-error "TypeError" "Private member was defined without a setter")))))))
 
 (declaim (inline %key-touch %key-forget %own-keys-in-order))
 (defun %key-touch (o k)

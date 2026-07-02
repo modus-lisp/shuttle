@@ -42,14 +42,42 @@
                                        (parse-expr 1)))) (opt ";") (list :return e)))
     ((kw? "if") (parse-if))
     ((kw? "while") (adv) (eat "(") (let ((c (parse-expr 1))) (eat ")") (list :while c (parse-stmt))))
+    ((kw? "do") (adv) (let ((body (parse-stmt)))
+                        (unless (kw? "while") (js-throw (make-native-error "SyntaxError" "Expected 'while' after do-body")))
+                        (adv) (eat "(") (let ((c (parse-expr 1))) (eat ")") (opt ";")
+                          (list :do-while c body))))
     ((kw? "for") (parse-for))
     ((kw? "switch") (parse-switch))
-    ((kw? "break") (adv) (opt ";") (list :break))
-    ((kw? "continue") (adv) (opt ";") (list :continue))
+    ((kw? "break") (adv) (let ((l (when (label-ident-follows-p) (prog1 (cur-val) (adv))))) (opt ";") (list :break l)))
+    ((kw? "continue") (adv) (let ((l (when (label-ident-follows-p) (prog1 (cur-val) (adv))))) (opt ";") (list :continue l)))
+    ((kw? "with") (adv) (eat "(") (let ((obj (parse-expr 1))) (eat ")") (list :with obj (parse-stmt))))
     ((kw? "try") (parse-try))
     ((kw? "throw") (adv) (let ((e (parse-expr 1))) (opt ";") (list :throw e)))
     ((punct? ";") (adv) (list :empty))
+    ((labeled-stmt-follows-p)
+     (let ((name (cur-val))) (adv) (adv)          ; consume IDENT and ':'
+       (list :label name (parse-stmt))))
     (t (let ((e (parse-expr 1))) (opt ";") (list :expr e)))))
+
+(defparameter *reserved-labels*
+  '("break" "case" "catch" "class" "const" "continue" "default" "delete" "do"
+    "else" "extends" "false" "finally" "for" "function" "if" "import" "in"
+    "instanceof" "new" "null" "return" "super" "switch" "this" "throw" "true"
+    "try" "typeof" "var" "void" "while" "with"))
+
+(defun labeled-stmt-follows-p ()
+  "Is the current position `IDENT :` (a labeled statement)? IDENT must not be a
+   reserved word."
+  (and (eq (cur-type) :ident)
+       (not (member (cur-val) *reserved-labels* :test #'string=))
+       (let ((nxt (aref *toks* (1+ *pos*))))
+         (and (eq (car nxt) :punct) (string= (cdr nxt) ":")))))
+
+(defun label-ident-follows-p ()
+  "After `break`/`continue`, is the current token a label identifier (not a
+   reserved word / statement terminator)?"
+  (and (eq (cur-type) :ident)
+       (not (member (cur-val) *reserved-labels* :test #'string=))))
 
 (defparameter *undefined-ast* '(:undefined))
 (defun parse-block () (eat "{") (let ((s '())) (loop until (punct? "}") do (push (parse-stmt) s)) (eat "}")
@@ -221,23 +249,29 @@
              (when (and (kw? "static") (not (member-name-terminator-p)))
                (adv) (setf static t))
              (cond
-               ((and (kw? "async") (async-method-follows-p))   ; async / async* method
-                (adv) (if (punct? "*") (progn (adv) (setf gen :async-gen)) (setf gen :async)))
-               ((punct? "*") (adv) (setf gen t))
-               ((and (kw? "get") (not (member-name-terminator-p))) (adv) (setf kind :get))
-               ((and (kw? "set") (not (member-name-terminator-p))) (adv) (setf kind :set)))
-             (let ((key (parse-class-key)))
-               (cond
-                 ((punct? "(")                   ; method / accessor / constructor
-                  (let ((fn (parse-method-tail (key-name key) gen)))
-                    (if (and (not static) (eq kind :method)
-                             (eq (car key) :lit) (string= (second key) "constructor"))
-                        (setf ctor fn)
-                        (push (list :method kind key fn static) members))))
-                 (t                              ; field: key [= init] ;
-                  (let ((init (when (opt "=") (parse-expr 2))))
-                    (opt ";")
-                    (push (list :field key init static) members)))))))))
+               ;; static initialization block: `static { ... }`
+               ((and static (punct? "{"))
+                (let ((*in-generator* nil) (*in-async* nil))
+                  (push (list :static-block (parse-block)) members)))
+               (t
+                (cond
+                  ((and (kw? "async") (async-method-follows-p))   ; async / async* method
+                   (adv) (if (punct? "*") (progn (adv) (setf gen :async-gen)) (setf gen :async)))
+                  ((punct? "*") (adv) (setf gen t))
+                  ((and (kw? "get") (not (member-name-terminator-p))) (adv) (setf kind :get))
+                  ((and (kw? "set") (not (member-name-terminator-p))) (adv) (setf kind :set)))
+                (let ((key (parse-class-key)))
+                  (cond
+                    ((punct? "(")                 ; method / accessor / constructor
+                     (let ((fn (parse-method-tail (key-name key) gen)))
+                       (if (and (not static) (eq kind :method)
+                                (eq (car key) :lit) (string= (second key) "constructor"))
+                           (setf ctor fn)
+                           (push (list :method kind key fn static) members))))
+                    (t                            ; field: key [= init] ;
+                     (let ((init (when (opt "=") (parse-expr 2))))
+                       (opt ";")
+                       (push (list :field key init static) members)))))))))))
       (eat "}")
       (list :class name super (nreverse members) ctor))))
 
@@ -256,8 +290,13 @@
     ((eq (cur-type) :str) (list :lit (prog1 (cur-val) (adv))))
     ((eq (cur-type) :num) (list :lit (number-to-string (prog1 (cur-val) (adv)))))
     ((eq (cur-type) :bigint) (list :lit (bigint-to-string (prog1 (cur-val) (adv)))))
+    ((private-name-token-p) (list :private (prog1 (cur-val) (adv))))
     ((eq (cur-type) :ident) (list :lit (prog1 (cur-val) (adv))))
     (t (js-throw (make-native-error "SyntaxError" "Unexpected token in class member")))))
+
+(defun private-name-token-p ()
+  "Is the current token a #private-name lexeme?"
+  (and (eq (cur-type) :ident) (> (length (cur-val)) 0) (char= (char (cur-val) 0) #\#)))
 
 (defun parse-lhs-expr ()
   "A left-hand-side expression (for `extends` clause): member/call chain, no
@@ -299,6 +338,7 @@
   (case (car node)
     (:ident t)
     (:member t)
+    (:private-member t)
     ((:array :object) (string= op "="))     ; destructuring only for plain assignment
     (t nil)))
 
@@ -316,11 +356,20 @@
     (loop
       (let ((tt (cur-type)) (tv (cur-val)))
         (cond
+          ;; sequence / comma operator: lowest precedence of all, only at the
+          ;; Expression level (min-bp <= 1). AssignmentExpression contexts use
+          ;; min-bp 2 (args, array elements, declarator inits, ternary branches),
+          ;; so the comma there stays a delimiter, never a sequence.
+          ((and (eq tt :punct) (string= tv ",") (<= min-bp 1))
+           (adv)
+           (let ((rest (list (parse-expr 2))))
+             (loop while (punct? ",") do (adv) (push (parse-expr 2) rest))
+             (setf left (list* :seq left (nreverse rest)))))
           ;; assignment (right-assoc), lowest
           ((and (eq tt :punct) (member tv *assignops* :test #'string=) (>= 1 (1- min-bp)))
            (unless (assignable-target-p left tv)
              (js-throw (make-native-error "SyntaxError" "Invalid left-hand side in assignment")))
-           (adv) (setf left (list :assign tv left (parse-expr 1))))
+           (adv) (setf left (list :assign tv left (parse-expr 2))))
           ;; conditional ?:
           ((and (punct? "?") (>= 2 min-bp))
            (adv) (let ((then (parse-expr 1))) (eat ":")
@@ -370,12 +419,18 @@
 
 (defun parse-member (e &optional (allow-call t))   ; . [] () ?. chains + tagged templates
   (loop
-    (cond ((punct? ".") (adv) (setf e (list :member e (list :str (cur-val)) nil)) (adv))
+    (cond ((punct? ".")
+           (adv)
+           (if (private-name-token-p)
+               (setf e (list :private-member e (prog1 (cur-val) (adv))))
+               (progn (setf e (list :member e (list :str (cur-val)) nil)) (adv))))
           ((punct? "?.")
            (adv)
            (cond ((punct? "(") (setf e (list :ocall e (parse-args))))    ; ?.( args )
                  ((punct? "[") (adv) (let ((k (parse-expr 1))) (eat "]")
                                        (setf e (list :omember e k t))))  ; ?.[ expr ]
+                 ((private-name-token-p)
+                  (setf e (list :oprivate-member e (prog1 (cur-val) (adv)))))
                  (t (setf e (list :omember e (list :str (cur-val)) nil)) (adv)))) ; ?.ident
           ((punct? "[") (adv) (let ((k (parse-expr 1))) (eat "]") (setf e (list :member e k t))))
           ((and allow-call (punct? "(")) (setf e (list :call e (parse-args))))
@@ -428,6 +483,8 @@
       ((async-function-follows-p) (adv) (parse-function t t))   ; async function expression
       ((and (kw? "async") (async-arrow-follows-p)) (parse-async-arrow))
       ((kw? "class") (parse-class t))
+      ((private-name-token-p)          ; only valid as LHS of `#x in obj`
+       (list :private-ref (prog1 (cur-val) (adv))))
       ((punct? "(") (parse-paren-or-arrow))
       ((punct? "[") (parse-array-literal))
       ((punct? "{") (parse-object-literal))
@@ -515,11 +572,8 @@
         (progn
           (setf *pos* start)
           (eat "(")
-          (let ((items '()))
-            (loop until (punct? ")") do (push (parse-expr 2) items) (unless (punct? ")") (eat ",")))
-            (eat ")")
-            (setf items (nreverse items))
-            (or (car (last items)) (js-throw (make-native-error "SyntaxError" "empty ()"))))))))
+          (when (punct? ")") (js-throw (make-native-error "SyntaxError" "empty ()")))
+          (prog1 (parse-expr 1) (eat ")"))))))
 
 (defun ident-or-keyword-name ()
   "Consume an identifier/keyword token as a plain name string (property key context)."

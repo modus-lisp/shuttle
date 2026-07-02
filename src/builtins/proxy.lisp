@@ -217,7 +217,12 @@
             (%proxy-guard revoked-cell)
             (let ((tr (%get-trap handler "setPrototypeOf")))
               (if (null tr)
-                  (js-set-proto target v)
+                  ;; default [[SetPrototypeOf]] = target.[[SetPrototypeOf]](V).
+                  ;; Core's ordinary js-set-proto lacks the OrdinarySetPrototypeOf
+                  ;; extensibility/cycle guards (see report CORE-BUG proposal), so
+                  ;; spell them out here for an ordinary target; delegate to the
+                  ;; dispatcher when the target has its own exotic [[SetPrototypeOf]].
+                  (%proxy-default-set-proto target v)
                   (let ((ok (js-truthy (js-call tr handler (list target v)))))
                     (when ok
                       (unless (js-extensible-p target)
@@ -300,6 +305,33 @@
                 (existing (js-bool (js-define-own-property proxy key (list :value v))))
                 (t (js-bool (js-define-own-property proxy key
                               (list :value v :writable t :enumerable t :configurable t))))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; default [[SetPrototypeOf]] — OrdinarySetPrototypeOf spelled out
+;;; ---------------------------------------------------------------------------
+;;; Core's js-set-proto trap-less branch just writes the slot (returns T always),
+;;; missing OrdinarySetPrototypeOf's extensibility guard (step: non-extensible
+;;; target only accepts the same proto) and cycle detection. When a proxy with an
+;;; absent setPrototypeOf trap forwards to an ORDINARY target, we must honor those
+;;; — otherwise Object.setPrototypeOf never throws for the non-extensible case.
+;;; A proxy/exotic target keeps its own [[SetPrototypeOf]]: delegate to js-set-proto.
+(defun %proxy-default-set-proto (target v)
+  (when (%proxy-object-p target)
+    (return-from %proxy-default-set-proto (js-set-proto target v)))
+  ;; SameValue(V, current) → true, no-op.
+  (let ((current (or (js-get-proto target) *null*)))
+    (when (same-value v current)
+      (return-from %proxy-default-set-proto t)))
+  ;; non-extensible target only accepts the (already-equal) current proto → false.
+  (unless (js-extensible-p target)
+    (return-from %proxy-default-set-proto nil))
+  ;; cycle detection: walk V's proto chain; abort (return true, let core write) at
+  ;; a proxy link (its [[GetPrototypeOf]] may be arbitrary); reject if we reach TARGET.
+  (loop for p = v then (js-get-proto p)
+        while (js-object-p p)
+        do (cond ((eq p target) (return-from %proxy-default-set-proto nil))
+                 ((%proxy-object-p p) (return))))
+  (js-set-proto target v))
 
 ;;; ---------------------------------------------------------------------------
 ;;; ownKeys result coercion + invariants

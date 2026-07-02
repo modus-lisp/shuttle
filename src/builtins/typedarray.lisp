@@ -171,7 +171,11 @@
    Accepts a CL double key directly (VM passes numeric indices as doubles) and a
    canonical numeric-index string (ToString(ToNumber(key)) === key)."
   (cond
-    ((floatp key) key)                   ; VM member access with a numeric key
+    ;; VM member access with a numeric key: the key is ToPropertyKey'd, i.e.
+    ;; ToString'd, before use — and ToString(-0) is "0", whose canonical numeric
+    ;; index is +0. So a raw -0 double denotes index 0, NOT the negative-zero
+    ;; canonical index (that only arises from the literal string "-0" below).
+    ((floatp key) (if (js-negative-zero-p key) 0d0 key))
     ((stringp key)
      (cond ((string= key "-0") -0d0)
            (t (let ((n (ignore-errors (string-to-number-strict key))))
@@ -323,6 +327,7 @@
 ;;; ===========================================================================
 (defvar *typedarray-proto* nil)
 (defvar *ta-proto-by-name* nil)  ; hash name -> concrete prototype
+(defvar *ta-ctor-by-name* nil)   ; hash name -> concrete constructor (default for @@species)
 
 (defun make-typed-array (ty buffer offset length proto &optional track)
   (let ((o (make-object :proto proto :class (ta-type-name ty))))
@@ -416,7 +421,8 @@
 ;;; ===========================================================================
 (defun install-typedarray (realm)
   (setf *ta-types* (build-ta-types)
-        *ta-proto-by-name* (make-hash-table :test 'equal))
+        *ta-proto-by-name* (make-hash-table :test 'equal)
+        *ta-ctor-by-name* (make-hash-table :test 'equal))
   (let* ((op (realm-object-proto realm))
          (fp (realm-function-proto realm))
          ;; %TypedArray% abstract constructor + its prototype
@@ -456,6 +462,7 @@
                                   (format nil "Constructor ~a requires 'new'" name))))
                      3)))
         (setf (gethash name *ta-proto-by-name*) proto)
+        (setf (gethash name *ta-ctor-by-name*) ctor)
         (setf (js-object-proto ctor) ta-ctor) ; Int8Array.__proto__ === %TypedArray%
         (setf (js-object-construct ctor)
               (let ((ty ty) (proto proto))
@@ -511,6 +518,44 @@
   "Prototype for a new same-type array created by slice/subarray/map/filter."
   (declare (ignore name))
   (gethash (ta-type-name (ta-type-of o)) *ta-proto-by-name*))
+
+(defun ta-default-ctor (o)
+  "The intrinsic constructor for O's element type (default for TypedArraySpeciesCreate)."
+  (gethash (ta-type-name (ta-type-of o)) *ta-ctor-by-name*))
+
+(defun ta-species-constructor (o)
+  "SpeciesConstructor(O, %TypedArray[type]%): Get(O,'constructor'); if undefined
+   use the default; else Get(C, @@species); undefined/null → default; a constructor
+   → it; otherwise TypeError."
+  (let ((default (ta-default-ctor o))
+        (c (js-get o "constructor")))
+    (cond
+      ((js-undefined-p c) default)
+      ((not (js-object-p c))
+       (js-throw (make-native-error "TypeError" "constructor is not an object")))
+      (t (let ((s (if (js-symbol-p *symbol-species*) (js-get c *symbol-species*) *undefined*)))
+           (cond
+             ((js-null-or-undef s) default)
+             ((and (js-object-p s) (js-object-construct s)) s)
+             (t (js-throw (make-native-error "TypeError" "@@species is not a constructor")))))))))
+
+(defun ta-create (ctor args)
+  "TypedArrayCreate(constructor, argumentList): Construct, ValidateTypedArray,
+   and (when argumentList is a single Number) require length >= that number."
+  (let ((a (js-construct ctor args)))
+    (unless (typed-array-p a)
+      (js-throw (make-native-error "TypeError" "Species constructor did not return a TypedArray")))
+    (when (ta-out-of-bounds-p a)
+      (js-throw (make-native-error "TypeError" "TypedArray is out of bounds or backed by a detached ArrayBuffer")))
+    (when (and (= (length args) 1) (floatp (first args))
+               (< (ta-elt-length a) (first args)))
+      (js-throw (make-native-error "TypeError" "Derived TypedArray constructor created an array which was too small")))
+    a))
+
+(defun ta-species-create (o args)
+  "TypedArraySpeciesCreate(exemplar, argumentList): construct a result via the
+   species constructor for O's element type."
+  (ta-create (ta-species-constructor o) args))
 
 (defun install-ta-proto-methods (realm tp)
   ;; ---- accessor getters ----
@@ -656,8 +701,10 @@
       (def-method realm tp "map" 1 (this args)
         (with-ta-v (o this)
           (let* ((f (cb "not callable")) (ta (arg 1 args)) (l (len o))
-                 (out (ta-from-length (ta-type-of o) l (ta-species-proto o nil))))
-            (dotimes (i l) (ta-write out i (ta-coerce-element out (js-call f ta (list (ta-read-or-undef o i) (float i 1d0) o)))))
+                 (out (ta-species-create o (list (float l 1d0)))))
+            (dotimes (i l)
+              (let ((mapped (js-call f ta (list (ta-read-or-undef o i) (float i 1d0) o))))
+                (js-set out (princ-to-string i) mapped)))
             out)))
       (def-method realm tp "filter" 1 (this args)
         (with-ta-v (o this)
@@ -665,12 +712,10 @@
             (dotimes (i l)
               (let ((v (ta-read-or-undef o i)))
                 (when (js-truthy (js-call f ta (list v (float i 1d0) o))) (push v kept))))
-            (let* ((vals (nreverse kept)) (out (ta-from-length (ta-type-of o) (length vals) (ta-species-proto o nil))) (i 0))
-              ;; Values are read from O via [[Get]] (same element type as OUT), but a
-              ;; resizable-buffer shrink mid-iteration can yield undefined for an
-              ;; out-of-bounds index; coerce so those become NaN/0 rather than crash.
+            (let* ((vals (nreverse kept)) (out (ta-species-create o (list (float (length vals) 1d0)))) (i 0))
+              ;; Set each kept value via [[Set]] (coerces to OUT's element type).
               (dolist (v vals)
-                (ta-write out i (if (js-undefined-p v) (ta-coerce-element out v) v))
+                (js-set out (princ-to-string i) v)
                 (incf i))
               out))))
       (def-method realm tp "some" 1 (this args)
@@ -726,17 +771,25 @@
         (let* ((l (len o)) (start (clamp-idx (arg 0 args) l 0))
                (end (if (js-undefined-p (arg 1 args)) l (clamp-idx (arg 1 args) l l)))
                (count (max 0 (- end start)))
-               (out (ta-from-length (ta-type-of o) count (ta-species-proto o nil))))
+               ;; TypedArraySpeciesCreate runs the (possibly user) species ctor,
+               ;; which may itself detach/resize O; re-validate below.
+               (out (ta-species-create o (list (float count 1d0)))))
           (when (> count 0)
-            ;; The index coercions may have detached/shrunk the buffer.
+            ;; The species ctor / index coercions may have detached or shrunk O.
             (when (ta-out-of-bounds-p o)
               (js-throw (make-native-error "TypeError" "TypedArray is out of bounds or backed by a detached ArrayBuffer")))
-            ;; A length-tracking view may have shrunk: copy only the elements that
-            ;; still exist; the remaining OUT elements stay zero-filled.
-            (let ((cur (len o)))
-              (dotimes (i count)
-                (when (< (+ start i) cur)
-                  (ta-write out i (ta-read o (+ start i)))))))
+            ;; Re-clamp endIndex/countBytes against the CURRENT length (spec 14c/14d):
+            ;; a resizable buffer shrunk to zero drops the copy entirely.
+            (let* ((cur (len o))
+                   (end2 (min (+ start count) cur))
+                   (n (max 0 (- end2 start))))
+              (if (eq (ta-type-of o) (ta-type-of out))
+                  ;; Same element type: copy live through the buffer (a species-
+                  ;; supplied result sharing O's buffer sees overlap effects).
+                  (dotimes (i n) (ta-write out i (ta-read o (+ start i))))
+                  ;; Different element type: element-by-element via Get/Set.
+                  (dotimes (i n)
+                    (js-set out (princ-to-string i) (ta-read-or-undef o (+ start i)))))))
           out)))
     ;; subarray(begin, end) — shares the SAME buffer.
     ;; srcLength is the CURRENT length (0 if the buffer is detached); both begin
@@ -753,15 +806,14 @@
                (size (ta-type-size (ta-type-of o)))
                (byte-offset (+ (ta-raw-offset o) (* start size))))
           (if (and (ta-track-p o) (js-undefined-p end-arg))
-              ;; auto-length source + end undefined → result is length-tracking too.
-              (ta-from-buffer (ta-type-of o) (ta-buffer o)
-                              (float byte-offset 1d0) *undefined*
-                              (ta-species-proto o nil))
+              ;; auto-length source + end undefined → result is length-tracking too:
+              ;; «buffer, beginByteOffset» (no length arg).
+              (ta-species-create o (list (ta-buffer o) (float byte-offset 1d0)))
               (let* ((end (if (js-undefined-p end-arg) l (clamp-idx end-arg l l)))
                      (count (max 0 (- end start))))
-                (ta-from-buffer (ta-type-of o) (ta-buffer o)
-                                (float byte-offset 1d0) (float count 1d0)
-                                (ta-species-proto o nil)))))))
+                (ta-species-create o (list (ta-buffer o)
+                                           (float byte-offset 1d0)
+                                           (float count 1d0))))))))
     ;; set(source, offset)
     (def-method realm tp "set" 1 (this args)
       (with-ta (o this)
@@ -943,7 +995,7 @@
   (def-method realm ta-ctor "of" 0 (this args)
     (unless (and (js-object-p this) (js-object-construct this))
       (js-throw (make-native-error "TypeError" "this is not a constructor")))
-    (let* ((len (length args)) (o (js-construct this (list (float len 1d0)))) (i 0))
+    (let* ((len (length args)) (o (ta-create this (list (float len 1d0)))) (i 0))
       (dolist (v args) (js-set o (princ-to-string i) v) (incf i))
       o))
   (def-method realm ta-ctor "from" 1 (this args)
@@ -960,7 +1012,7 @@
           (let* ((so (to-object src)) (l (to-int-index (js-get so "length"))))
             (dotimes (i l) (push (js-get so (princ-to-string i)) vals))))
       (let* ((lst (nreverse vals)) (len (length lst))
-             (o (js-construct this (list (float len 1d0)))) (i 0))
+             (o (ta-create this (list (float len 1d0)))) (i 0))
         (dolist (v lst)
           (js-set o (princ-to-string i)
                   (if (js-callable-p mapf) (js-call mapf *undefined* (list v (float i 1d0))) v))

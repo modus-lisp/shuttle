@@ -48,13 +48,24 @@
 ;;; A binding value of the TDZ sentinel means "declared but not yet initialized"
 ;;; (let/const temporal dead zone). CONSTS holds names that may not be reassigned.
 (defvar *tdz* '#:tdz)                    ; unique uninitialized marker
-(defstruct env vars parent consts)
+(defstruct env vars parent consts with-obj)
 (defun new-env (parent) (make-env :vars (make-hash-table :test 'equal) :parent parent))
+(defun new-with-env (parent obj) (make-env :vars (make-hash-table :test 'equal) :parent parent :with-obj obj))
 (defun env-root (e) (loop while (env-parent e) do (setf e (env-parent e))) e)
+(defun with-binds-p (obj name)
+  "Does the `with` object OBJ provide a binding for NAME? (HasProperty, minus any
+   name listed truthy in @@unscopables.)"
+  (and (js-object-p obj)
+       (js-truthy* (js-has obj name))
+       (let* ((usym (well-known-symbol "unscopables"))
+              (unsc (and usym (js-get obj usym))))
+         (not (and (js-object-p unsc) (js-truthy (js-get unsc name)))))))
 (defun env-get (env name)
   "Return (values VALUE BOUND-P). BOUND-P nil means the name is not declared."
   (loop for e = env then (env-parent e) while e
-        do (multiple-value-bind (v p) (gethash name (env-vars e)) (when p (return-from env-get (values v t)))))
+        do (when (and (env-with-obj e) (with-binds-p (env-with-obj e) name))
+             (return-from env-get (values (js-get (env-with-obj e) name) t)))
+           (multiple-value-bind (v p) (gethash name (env-vars e)) (when p (return-from env-get (values v t)))))
   (values *undefined* nil))
 (defun env-get-checked (env name)
   "Read a binding, throwing ReferenceError if not declared, or if still in TDZ."
@@ -79,7 +90,9 @@
           (t (js-typeof v)))))
 (defun env-set (env name val &optional strict)
   (loop for e = env then (env-parent e) while e
-        do (when (nth-value 1 (gethash name (env-vars e)))
+        do (when (and (env-with-obj e) (with-binds-p (env-with-obj e) name))
+             (js-set (env-with-obj e) name val) (return-from env-set val))
+           (when (nth-value 1 (gethash name (env-vars e)))
              (when (and (env-consts e) (member name (env-consts e) :test #'string=))
                (js-throw (make-native-error "TypeError" (format nil "Assignment to constant variable."))))
              (setf (gethash name (env-vars e)) val) (return-from env-set val)))
@@ -1215,6 +1228,8 @@
             (:declare-var (env-declare env (first a) (pop!)))
             (:push-env (setf env (new-env env)))
             (:pop-env (setf env (env-parent env)))
+            (:to-object (push! (to-object (pop!))))
+            (:push-with-env (setf env (new-with-env env (pop!))))
             (:tdz-declare (env-declare env (first a) *tdz*))
             (:init-let (env-declare env (first a) (pop!)))
             (:init-const (env-declare-const env (first a) (pop!)))
@@ -1275,6 +1290,50 @@
                                   (format nil "Cannot assign to read-only property '~a'"
                                           (if (js-symbol-p k) (to-symbol-string k) (to-string k)))))))
                             (push! (if prefix new old))))
+            ;; ---- private class members (#x) ----
+            (:private-get (let* ((pn (first a)) (o (pop!))
+                                 (el (private-require o pn)))
+                            (push! (private-element-get el o))))
+            (:private-set (let* ((pn (first a)) (v (pop!)) (o (pop!))
+                                 (el (private-require o pn)))
+                            (private-element-set el o v) (push! v)))
+            (:private-field-add (let* ((v (pop!)) (pn (pop!)) (o (pop!)))
+                                  (when (and (js-object-p o) (gethash pn (object-private-table o)))
+                                    (js-throw (make-native-error "TypeError"
+                                      (format nil "Cannot initialize #~a twice on the same object"
+                                              (private-name-description pn)))))
+                                  (setf (gethash pn (object-private-table o)) (cons :field v))))
+            (:private-method-add (let* ((fn (pop!)) (pn (pop!)) (o (pop!)) (kind (first a))
+                                        (tbl (object-private-table o))
+                                        (existing (gethash pn tbl)))
+                                   (setf (fn-home fn) o)
+                                   (put fn "name" (private-method-name kind pn) :enumerable nil :writable nil :configurable t)
+                                   (case kind
+                                     (:get (setf (gethash pn tbl)
+                                                 (list :accessor fn (and existing (fourth existing)))))
+                                     (:set (setf (gethash pn tbl)
+                                                 (list :accessor (and existing (second existing)) fn)))
+                                     (t (setf (gethash pn tbl) (cons :method fn))))))
+            (:private-in (let* ((pn (first a)) (o (pop!)))
+                           (push! (if (and (js-object-p o) (js-object-private o)
+                                           (nth-value 1 (gethash pn (js-object-private o))))
+                                      *true* *false*))))
+            (:class-private-static (let* ((fn (pop!)) (pn (pop!)) (ctor (peek!)) (kind (first a))
+                                          (tbl (object-private-table ctor))
+                                          (existing (gethash pn tbl)))
+                                     (setf (fn-home fn) ctor)
+                                     (put fn "name" (private-method-name kind pn) :enumerable nil :writable nil :configurable t)
+                                     (case kind
+                                       (:get (setf (gethash pn tbl)
+                                                   (list :accessor fn (and existing (fourth existing)))))
+                                       (:set (setf (gethash pn tbl)
+                                                   (list :accessor (and existing (second existing)) fn)))
+                                       (t (setf (gethash pn tbl) (cons :method fn))))))
+            (:class-private-static-field (let* ((v (pop!)) (pn (pop!)) (ctor (peek!)))
+                                           (setf (gethash pn (object-private-table ctor)) (cons :field v))))
+            (:run-static-block (let ((fn (pop!)) (ctor (peek!)))
+                                 (setf (fn-home fn) ctor)   ; super refers to the class
+                                 (js-call fn ctor '())))
             (:for-in-keys (push! (for-in-key-array (pop!))))
             (:get-iterator (push! (get-iterator (pop!))))
             (:iter-next (push! (iterator-step (pop!))))

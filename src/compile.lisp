@@ -13,6 +13,8 @@
 (defvar *strict* nil)     ; compile-time: are we lexically inside strict code? (inherited by nested fns)
 (defvar *out*)
 (defvar *break-target* nil) (defvar *continue-target* nil)
+(defvar *labels* '())          ; ((NAME break-lbl continue-lbl-or-nil scope-depth) ...)
+(defvar *pending-labels* '())  ; label names attached to the next loop/iteration stmt
 (defvar *scope-depth* 0)                 ; current lexical block-env nesting within the fn
 (defvar *break-depth* 0) (defvar *continue-depth* 0)  ; scope depth at the loop/switch target
 (defun em (op &rest args) (push (cons op args) *out*))
@@ -31,6 +33,30 @@
 (defun compile-toplevel (src)
   ;; top-level falls off the end so RUN returns the completion value (eval semantics)
   (compile-fn nil '() (parse-program src) t))
+
+(defun check-no-duplicate-params (params)
+  "Strict-mode early error: a duplicate binding name in a parameter list is a
+   SyntaxError. (In sloppy mode duplicates are allowed for plain-ident params.)"
+  (let ((seen '()))
+    (labels ((names (tgt)
+               (cond ((stringp tgt) (list tgt))
+                     ((null tgt) '())
+                     ((eq (car tgt) :apat)
+                      (loop for e in (second tgt) append
+                            (cond ((null e) '())
+                                  ((and (consp e) (member (car e) '(:rest :default))) (names (second e)))
+                                  (t (names e)))))
+                     ((eq (car tgt) :opat)
+                      (loop for pr in (second tgt) append
+                            (if (eq (car pr) :rest) (list (second pr)) (names (second pr)))))
+                     ((member (car tgt) '(:default :rest)) (names (second tgt)))
+                     (t '()))))
+      (dolist (p params)
+        (dolist (n (names (param-target p)))
+          (when (member n seen :test #'string=)
+            (js-throw (make-native-error "SyntaxError"
+                        (format nil "Duplicate parameter name '~a' not allowed in this context" n))))
+          (push n seen))))))
 
 (defun param-names (params &optional acc)
   "All identifier names bound by a parameter list (incl. destructured/rest)."
@@ -82,6 +108,8 @@
   ;; strict is inherited from enclosing code OR triggered by our own "use strict".
   (let ((*strict* (or *strict* (directive-prologue-strict-p body))))
   (let ((*out* '()) (pnames (param-names params)))
+    ;; strict early error: duplicate parameter names are a SyntaxError.
+    (when *strict* (check-no-duplicate-params params))
     ;; bind parameters from incoming call args
     (compile-params params)
     ;; hoist: pre-declare all `var` names (as undefined) so forward reads don't
@@ -202,6 +230,10 @@
      (if (fourth tgt) (compile-expr (third tgt)) (em :const (second (third tgt))))
      (em :rot3)                              ; bring val above obj,key : obj key val
      (em :set-prop) (em :pop))
+    (:private-member
+     ;; stack: val ; -> obj val -> private-set -> pop
+     (compile-expr (second tgt)) (em :swap)
+     (em :private-set (resolve-private-name (third tgt))) (em :pop))
     ((:array :object) (compile-assign-pattern tgt))))
 
 (defun assign-elem-with-default (elem)
@@ -323,6 +355,15 @@
     (:asyncfunc (compile-expr node) (em :declare-var (second node)))
     (:asyncgenfunc (compile-expr node) (em :declare-var (second node)))
     (:class (compile-expr node) (em :init-let (second node)))   ; class decl: lexical binding
+    (:private-field-init
+     ;; this.#name = INIT ; add a fresh private field to `this`'s brand table
+     (em :get-this) (em :const (resolve-private-name (second node)))
+     (compile-expr (third node)) (em :private-field-add))
+    (:private-method-init
+     ;; install a private method/accessor into `this`'s brand table
+     (destructuring-bind (name kind fn) (cdr node)
+       (em :get-this) (em :const (resolve-private-name name))
+       (compile-expr fn) (em :private-method-add kind)))
     (:return (compile-expr (second node)) (em :ret))
     (:throw (compile-expr (second node)) (em :throw-op))
     (:if (let ((l1 (lbl)) (l2 (lbl)))
@@ -333,17 +374,38 @@
     (:while (let ((top (lbl)) (end (lbl)))
               (em :label top) (compile-expr (second node)) (em :jmp-if-false end)
               (let ((*break-target* end) (*continue-target* top)
-                    (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*))
+                    (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+                    (*labels* (loop-label-entries end top *scope-depth*)) (*pending-labels* '()))
                 (compile-stmt (third node)))
               (em :jmp top) (em :label end)))
+    (:do-while (let ((top (lbl)) (cont (lbl)) (end (lbl)))
+                 (em :label top)
+                 (let ((*break-target* end) (*continue-target* cont)
+                       (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+                       (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
+                   (compile-stmt (third node)))
+                 (em :label cont) (compile-expr (second node)) (em :jmp-if-true top)
+                 (em :label end)))
     (:for (compile-for node))
     (:for-in (compile-scoped-loop node #'compile-for-in))
     (:for-of (compile-scoped-loop node #'compile-for-of))
     (:for-await-of (compile-scoped-loop node #'compile-for-await-of))
-    (:break (if *break-target* (progn (pop-envs (- *scope-depth* *break-depth*)) (em :jmp *break-target*))
-                (js-throw (make-native-error "SyntaxError" "illegal break"))))
-    (:continue (if *continue-target* (progn (pop-envs (- *scope-depth* *continue-depth*)) (em :jmp *continue-target*))
-                   (js-throw (make-native-error "SyntaxError" "illegal continue"))))
+    (:label (compile-labeled node))
+    (:break (let ((lbl (second node)))
+              (if lbl
+                  (let ((entry (assoc lbl *labels* :test #'string=)))
+                    (unless entry (js-throw (make-native-error "SyntaxError" (format nil "Undefined label '~a'" lbl))))
+                    (pop-envs (- *scope-depth* (fourth entry))) (em :jmp (second entry)))
+                  (if *break-target* (progn (pop-envs (- *scope-depth* *break-depth*)) (em :jmp *break-target*))
+                      (js-throw (make-native-error "SyntaxError" "illegal break"))))))
+    (:continue (let ((lbl (second node)))
+                 (if lbl
+                     (let ((entry (assoc lbl *labels* :test #'string=)))
+                       (unless (and entry (third entry))
+                         (js-throw (make-native-error "SyntaxError" (format nil "Undefined continue label '~a'" lbl))))
+                       (pop-envs (- *scope-depth* (fourth entry))) (em :jmp (third entry)))
+                     (if *continue-target* (progn (pop-envs (- *scope-depth* *continue-depth*)) (em :jmp *continue-target*))
+                         (js-throw (make-native-error "SyntaxError" "illegal continue"))))))
     (:switch (destructuring-bind (disc cases default) (cdr node)
                (let ((dv (string (gensym "SW"))) (end (lbl)) (deflabel (lbl))
                      (clabels (mapcar (lambda (c) (cons c (lbl))) cases)))
@@ -355,6 +417,14 @@
                    (dolist (cl clabels) (em :label (cdr cl)) (mapc #'compile-stmt (cdr (car cl))))
                    (em :label deflabel) (when default (mapc #'compile-stmt default)))
                  (em :label end))))
+    (:with
+     (when *strict*
+       (js-throw (make-native-error "SyntaxError" "'with' statements are not allowed in strict mode")))
+     (compile-expr (second node))                ; the object -> stack
+     (em :to-object) (em :push-with-env)         ; pop obj, push a with scope
+     (let ((*scope-depth* (1+ *scope-depth*)))
+       (compile-stmt (third node)))
+     (em :pop-env))
     (:try (destructuring-bind (blk param catch fin) (cdr node)
             (if catch
                 (let ((lc (lbl)) (after (lbl)))
@@ -371,6 +441,31 @@
                 (compile-stmt blk))
             (when fin (compile-stmt fin))))))   ; v0: finally runs on the normal/caught path
 
+(defun loop-label-entries (break-lbl continue-lbl depth)
+  "Register any *pending-labels* (labels attached to this loop) as label entries
+   pointing at the loop's break/continue targets, prepended to *labels*."
+  (append (mapcar (lambda (nm) (list nm break-lbl continue-lbl depth)) *pending-labels*)
+          *labels*))
+
+(defun iteration-stmt-p (node)
+  (and (consp node) (member (car node) '(:while :for :for-in :for-of :for-await-of :do-while))))
+
+(defun compile-labeled (node)
+  "(:label NAME STMT). Collect nested labels; if the target is an iteration
+   statement, the loop registers these labels (break+continue). Otherwise it's a
+   break-only label whose break target is the end of the statement."
+  (let ((names '()) (n node))
+    (loop while (and (consp n) (eq (car n) :label))
+          do (push (second n) names) (setf n (third n)))
+    (if (iteration-stmt-p n)
+        (let ((*pending-labels* (append names *pending-labels*)))
+          (compile-stmt n))
+        (let ((end (lbl)))
+          (let ((*labels* (append (mapcar (lambda (nm) (list nm end nil *scope-depth*)) names)
+                                  *labels*)))
+            (compile-stmt n))
+          (em :label end)))))
+
 (defun compile-for (node)
   (destructuring-bind (init test update body) (cdr node)
     (let ((lexical (and init (eq (car init) :var)
@@ -382,7 +477,8 @@
           (em :label top)
           (when test (compile-expr test) (em :jmp-if-false end))
           (let ((*break-target* end) (*continue-target* cont)
-                (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*))
+                (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+                (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
             (compile-stmt body))
           (em :label cont)
           (when update (compile-expr update) (em :pop))
@@ -423,7 +519,10 @@
       (em :get-var idx) (em :get-var len) (em :bin "<") (em :jmp-if-false end)
       (em :get-var keys) (em :get-var idx) (em :get-prop)     ; the key string
       (for-head-assign head)
-      (let ((*break-target* end) (*continue-target* cont)) (compile-stmt body))
+      (let ((*break-target* end) (*continue-target* cont)
+            (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+            (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
+        (compile-stmt body))
       (em :label cont)
       (em :get-var idx) (em :const 1d0) (em :bin "+") (em :set-var idx) (em :pop)
       (em :jmp top) (em :label end))))
@@ -438,7 +537,10 @@
       (em :get-var res) (em :get-prop-c "done") (em :jmp-if-true end)
       (em :get-var res) (em :get-prop-c "value")
       (for-head-assign head)
-      (let ((*break-target* end) (*continue-target* cont)) (compile-stmt body))
+      (let ((*break-target* end) (*continue-target* cont)
+            (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+            (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
+        (compile-stmt body))
       (em :label cont) (em :jmp top) (em :label end))))
 
 (defun compile-for-await-of (node)
@@ -453,7 +555,10 @@
       (em :get-var res) (em :get-prop-c "done") (em :jmp-if-true end)
       (em :get-var res) (em :get-prop-c "value") (em :await)              ; await the value
       (for-head-assign head)
-      (let ((*break-target* end) (*continue-target* cont)) (compile-stmt body))
+      (let ((*break-target* end) (*continue-target* cont)
+            (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+            (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
+        (compile-stmt body))
       (em :label cont) (em :jmp top) (em :label end))))
 
 ;;; ---- expressions (each leaves exactly one value on the stack) ----
@@ -468,7 +573,11 @@
     (:undefined (em :const *undefined*))
     (:this (em :get-this))
     (:ident (em :get-var (second node)))
-    (:bin (compile-expr (third node)) (compile-expr (fourth node)) (em :bin (second node)))
+    (:bin (if (and (string= (second node) "in")
+                   (consp (third node)) (eq (car (third node)) :private-ref))
+              (progn (compile-expr (fourth node))              ; #x in obj
+                     (em :private-in (resolve-private-name (second (third node)))))
+              (progn (compile-expr (third node)) (compile-expr (fourth node)) (em :bin (second node)))))
     (:unary (if (and (string= (second node) "typeof") (eq (car (third node)) :ident))
                 (em :typeof-var (second (third node)))     ; typeof of a NAME never throws
                 (progn (compile-expr (third node)) (em :unary (second node)))))
@@ -491,11 +600,18 @@
              (compile-expr (second node)) (em :jmp-if-false l1)
              (compile-expr (third node)) (em :jmp l2)
              (em :label l1) (compile-expr (fourth node)) (em :label l2)))
+    (:seq (loop for (e . more) on (cdr node)
+                do (compile-expr e) (when more (em :pop))))
     (:assign (compile-assign (second node) (third node) (fourth node)))
     (:update (compile-update (second node) (third node) (fourth node)))
     (:member (compile-expr (second node))
              (if (fourth node) (progn (compile-expr (third node)) (em :get-prop))
                  (em :get-prop-c (second (third node)))))   ; non-computed key node is (:str name)
+    (:private-member                                        ; obj.#name (brand-checked read)
+     (compile-expr (second node))
+     (em :private-get (resolve-private-name (third node))))
+    (:oprivate-member                                       ; obj?.#name (standalone)
+     (compile-optional-chain node))
     (:call (compile-call (second node) (third node)))
     (:new (compile-expr (second node))
           (if (some (lambda (a) (and (consp a) (eq (car a) :spread))) (third node))
@@ -528,6 +644,30 @@
   "Instance (non-static) field members, in source order."
   (remove-if-not (lambda (m) (and (eq (car m) :field) (not (fourth m)))) members))
 
+(defvar *private-scopes* '())   ; list of alists ("#name" . private-name-object)
+
+(defun private-member-keys (members ctor)
+  "All #private-name strings declared in a class (fields, methods, accessors),
+   including those in the constructor's own params/body? No — only member keys."
+  (declare (ignore ctor))
+  (let ((names '()))
+    (dolist (m members)
+      (let ((key (case (car m)
+                   (:method (third m))
+                   (:field (second m))
+                   (t nil))))
+        (when (and (consp key) (eq (car key) :private))
+          (pushnew (second key) names :test #'string=))))
+    (nreverse names)))
+
+(defun resolve-private-name (name)
+  "Look up a #private-name in the enclosing private scopes; SyntaxError if unbound."
+  (dolist (scope *private-scopes*
+                 (js-throw (make-native-error "SyntaxError"
+                             (format nil "Private field '~a' must be declared in an enclosing class" name))))
+    (let ((hit (assoc name scope :test #'string=)))
+      (when hit (return (cdr hit))))))
+
 (defun compile-class (node)
   "Compile (:class NAME SUPER MEMBERS CTOR) leaving the constructor on the stack.
    Strategy: build a ctor function + prototype object at runtime via ops; attach
@@ -535,34 +675,65 @@
    constructor prologue."
   (destructuring-bind (name super members ctor) (cdr node)
     (let* ((derived (and super t))
+           (privnames (private-member-keys members ctor))
+           (privscope (mapcar (lambda (nm) (cons nm (make-private-name nm))) privnames))
+           (*private-scopes* (cons privscope *private-scopes*))
            (fields (class-field-inits members))
            ;; the constructor body: default is `constructor(...args){ super(...args) }`
            ;; for derived, or an empty constructor otherwise.
-           (ctor-code (compile-class-ctor name ctor fields derived)))
+           (ctor-code (compile-class-ctor name ctor fields (priv-instance-methods members) derived)))
+      ;; A named class binds its own name (as a const) in an inner scope visible to
+      ;; the constructor, methods, and static elements — evaluate super/build/members
+      ;; inside that env so the class can refer to itself before the outer binding.
+      (when name (em :push-env) (em :tdz-declare name))
       ;; super value on stack (or undefined sentinel)
       (if super (compile-expr super) (em :const *undefined*))
       (em :make-class ctor-code derived name)            ; -> ctor (with .prototype)
-      ;; if named, the class name is bound inside method scope; we bound it lexically
-      ;; at the declaration site. For expression form, methods capture via the outer env.
+      (when name (em :dup) (em :init-const name))         ; bind the class name to the ctor
       ;; ctor is on the stack throughout; each member op consumes its extras and
       ;; leaves ctor in place.
       (dolist (m members)
         (ecase (car m)
+          (:static-block
+           ;; run { ... } at class definition with this=ctor
+           (em :closure (compile-fn nil '() (second m) nil :normal nil))
+           (em :run-static-block))                       ; ctor fn -> ctor
           (:method
            (destructuring-bind (kind key fn static) (cdr m)
-             ;; stack: ctor ; push key, push method-closure, def
-             (if (eq (car key) :computed) (compile-expr (second key)) (em :const (second key)))
-             (compile-expr fn)                            ; method closure (home set by op)
-             (em :class-method kind (if static t nil))))  ; ctor key fn -> ctor
+             (cond
+               ((eq (car key) :private)
+                ;; Private method/accessor. Instance-level ones are installed
+                ;; per-instance in the constructor (see priv-instance-installers);
+                ;; static ones go into the CLASS's private table now.
+                (when static
+                  (em :const (resolve-private-name (second key)))
+                  (compile-expr fn)
+                  (em :class-private-static kind)))       ; ctor pn fn -> ctor
+               (t
+                ;; stack: ctor ; push key, push method-closure, def
+                (if (eq (car key) :computed) (compile-expr (second key)) (em :const (second key)))
+                (compile-expr fn)                          ; method closure (home set by op)
+                (em :class-method kind (if static t nil)))))) ; ctor key fn -> ctor
           (:field
-           (when (fourth m)                               ; static field: init with this=ctor
-             (if (eq (car (second m)) :computed) (compile-expr (second (second m))) (em :const (second (second m))))
-             (if (third m)
-                 (compile-with-this-ctor (third m))       ; value, this=ctor
-                 (em :const *undefined*))
-             (em :class-static-field)))))                 ; ctor key val -> ctor
-      ;; final: ctor stays on the stack as the class value
-      )))
+           (cond
+             ((and (fourth m) (eq (car (second m)) :private))   ; static private field
+              (em :const (resolve-private-name (second (second m))))
+              (if (third m) (compile-with-this-ctor (third m)) (em :const *undefined*))
+              (em :class-private-static-field))                 ; ctor pn val -> ctor
+             ((fourth m)                                         ; static public field: this=ctor
+              (if (eq (car (second m)) :computed) (compile-expr (second (second m))) (em :const (second (second m))))
+              (if (third m)
+                  (compile-with-this-ctor (third m))
+                  (em :const *undefined*))
+              (em :class-static-field))))))                     ; ctor key val -> ctor
+      ;; pop the inner class-name scope; ctor stays on the stack as the class value
+      (when name (em :pop-env)))))
+
+(defun priv-instance-methods (members)
+  "Instance (non-static) private method/accessor members."
+  (remove-if-not (lambda (m) (and (eq (car m) :method) (not (fifth m))
+                                  (consp (third m)) (eq (car (third m)) :private)))
+                 members))
 
 (defun compile-with-this-ctor (expr)
   "Compile EXPR so that `this` refers to the constructor (top-of-stack ctor).
@@ -574,13 +745,15 @@
   (compile-expr expr))
 
 ;; A simplified static-field path: recompute below without the fragile dup.
-(defun compile-class-ctor (name ctor fields derived)
+(defun compile-class-ctor (name ctor fields priv-methods derived)
   "Build the code object for the class constructor. FIELDS are instance field
-   members to initialize (in the ctor prologue, after super() for derived)."
+   members to initialize (in the ctor prologue, after super() for derived).
+   PRIV-METHODS are instance private methods/accessors installed per-instance."
   (declare (ignore name))
   (let* ((params (if ctor (third ctor) (if derived (list (list :rest "args")) '())))
          (user-body (if ctor (fourth ctor) nil))
-         (field-stmts (mapcar #'field->stmt fields))
+         (field-stmts (append (mapcar #'priv-method->stmt priv-methods)
+                              (mapcar #'field->stmt fields)))
          ;; default constructor bodies
          (body (cond
                  (ctor (splice-field-inits user-body field-stmts derived))
@@ -594,13 +767,22 @@
 (defvar *compiling-ctor* nil)   ; :base / :derived while compiling a class constructor body
 
 (defun field->stmt (field)
-  "Turn a (:field KEY INIT STATIC) into a `this.KEY = INIT` statement."
+  "Turn a (:field KEY INIT STATIC) into an initializer statement (this=instance)."
   (destructuring-bind (key init static) (cdr field)
     (declare (ignore static))
-    (let ((tgt (if (eq (car key) :computed)
-                   (list :member (list :this) (second key) t)
-                   (list :member (list :this) (list :str (second key)) nil))))
-      (list :expr (list :assign "=" tgt (or init *undefined-ast*))))))
+    (if (eq (car key) :private)
+        (list :private-field-init (second key) (or init *undefined-ast*))
+        (let ((tgt (if (eq (car key) :computed)
+                       (list :member (list :this) (second key) t)
+                       (list :member (list :this) (list :str (second key)) nil))))
+          (list :expr (list :assign "=" tgt (or init *undefined-ast*)))))))
+
+(defun priv-method->stmt (m)
+  "Turn an instance (:method KIND (:private NAME) FN STATIC) into a per-instance
+   private brand-install statement."
+  (destructuring-bind (kind key fn static) (cdr m)
+    (declare (ignore static))
+    (list :private-method-init (second key) kind fn)))
 
 (defun splice-field-inits (user-body field-stmts derived)
   "Insert field initializers: for a base ctor, at the top of the body; for a
@@ -693,7 +875,7 @@
 
 ;;; ---- optional chaining ----
 (defun optional-chain-p (node)
-  (and (consp node) (member (car node) '(:omember :ocall))))
+  (and (consp node) (member (car node) '(:omember :ocall :oprivate-member))))
 
 (defun compile-optional-chain (node)
   "Compile a chain containing at least one ?. link. If any optional link's base
@@ -714,6 +896,13 @@
      (em :dup) (em :nullish-short short)      ; if base nullish, jump to short (base on stack)
      (if (fourth node) (progn (compile-expr (third node)) (em :get-prop))
          (em :get-prop-c (second (third node)))))
+    (:oprivate-member
+     (compile-chain-base (second node) short)
+     (em :dup) (em :nullish-short short)
+     (em :private-get (resolve-private-name (third node))))
+    (:private-member
+     (compile-chain-base (second node) short)
+     (em :private-get (resolve-private-name (third node))))
     (:ocall
      (compile-chain-base (second node) short)
      (em :dup) (em :nullish-short short)
@@ -784,11 +973,15 @@
           (progn (compile-arg-array args) (em :call-spread))
           (progn (mapc #'compile-expr args) (em :call (length args))))
       (return-from compile-call nil)))
-  (if (eq (car callee) :member)            ; method call: `this` is the object
-      (progn (compile-expr (second callee)) (em :dup)
-             (if (fourth callee) (progn (compile-expr (third callee)) (em :get-prop))
-                 (em :get-prop-c (second (third callee)))))
-      (progn (em :const *undefined*) (compile-expr callee)))   ; plain call: this = undefined
+  (cond
+    ((eq (car callee) :private-member)      ; obj.#m(...): this=obj, fn from brand
+     (compile-expr (second callee)) (em :dup)
+     (em :private-get (resolve-private-name (third callee))))
+    ((eq (car callee) :member)              ; method call: `this` is the object
+     (compile-expr (second callee)) (em :dup)
+     (if (fourth callee) (progn (compile-expr (third callee)) (em :get-prop))
+         (em :get-prop-c (second (third callee)))))
+    (t (em :const *undefined*) (compile-expr callee)))   ; plain call: this = undefined
   ;; stack now: thisv callee
   (if (some (lambda (a) (and (consp a) (eq (car a) :spread))) args)
       (progn (compile-arg-array args) (em :call-spread))       ; thisv callee argsArray -> result
@@ -833,6 +1026,16 @@
          (em :get-var obj) (em :get-var k) (compile-expr value) (em :set-prop)
          (em :jmp end)
          (em :label short)                                      ; old already on stack = result
+         (em :label end)))
+      (:private-member
+       (let ((short (lbl)) (pn (resolve-private-name (third target))) (obj (string (gensym "PO"))))
+         (compile-expr (second target)) (em :declare-var obj)
+         (em :get-var obj) (em :private-get pn)                 ; old on stack
+         (em jmpop short)                                       ; short-circuit: keep old
+         (em :pop)
+         (compile-expr value) (em :get-var obj) (em :swap) (em :private-set pn)
+         (em :jmp end)
+         (em :label short)
          (em :label end))))))
 
 (defun compile-assign (op target value)
@@ -858,7 +1061,16 @@
                   (em :get-prop)           ; stack: obj key old
                   (compile-expr value) (em :bin base))  ; stack: obj key new
            (compile-expr value))
-       (em :set-prop)))))
+       (em :set-prop))
+      (:private-member
+       (let ((pn (resolve-private-name (third target))) (obj (string (gensym "PO"))))
+         (compile-expr (second target)) (em :declare-var obj)   ; save obj
+         (if base
+             (progn (em :get-var obj) (em :private-get pn)      ; old
+                    (compile-expr value) (em :bin base))        ; new on stack
+             (compile-expr value))                              ; val on stack
+         ;; stack: val ; -> obj val -> private-set (leaves val)
+         (em :get-var obj) (em :swap) (em :private-set pn))))))
 
 (defun compile-update (op prefix target)
   (let ((binop (if (string= op "++") "+" "-")))
@@ -875,4 +1087,12 @@
        (if (fourth target) (compile-expr (third target)) (em :const (second (third target))))
        ;; stack: obj key ; VM op reads obj[key], applies +/-1, writes back,
        ;; and pushes the new (prefix) or old (postfix) numeric value.
-       (em :update-prop (if (string= op "++") 1d0 -1d0) prefix)))))
+       (em :update-prop (if (string= op "++") 1d0 -1d0) prefix))
+      (:private-member
+       (let ((pn (resolve-private-name (third target))) (obj (string (gensym "PO")))
+             (delta (if (string= op "++") 1 -1)))
+         (compile-expr (second target)) (em :declare-var obj)
+         (em :get-var obj) (em :private-get pn) (em :to-numeric)  ; old
+         (if prefix
+             (progn (em :num-step delta) (em :get-var obj) (em :swap) (em :private-set pn))
+             (progn (em :dup) (em :num-step delta) (em :get-var obj) (em :swap) (em :private-set pn) (em :pop))))))))

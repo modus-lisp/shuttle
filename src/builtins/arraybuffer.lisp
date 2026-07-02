@@ -97,15 +97,27 @@
              (start (clamp-rel (arg 0 args) len))
              (end (if (js-undefined-p (arg 1 args)) len (clamp-rel (arg 1 args) len)))
              (new-len (max 0 (- end start)))
-             (out (make-byte-vector new-len)))
-        ;; re-check detachment after coercion side effects
+             ;; SpeciesConstructor(O, %ArrayBuffer%) then Construct(ctor, «newLen»).
+             (ctor (species-constructor realm this ctor))
+             (new (js-construct ctor (list (float new-len 1d0)))))
+        ;; The constructed value must be a (non-shared) ArrayBuffer, not detached,
+        ;; distinct from O, and large enough.
+        (unless (array-buffer-p new)
+          (js-throw (make-native-error "TypeError" "Species constructor did not return an ArrayBuffer")))
+        (when (ab-detached-p new)
+          (js-throw (make-native-error "TypeError" "Species constructor returned a detached ArrayBuffer")))
+        (when (eq new this)
+          (js-throw (make-native-error "TypeError" "Species constructor returned the same ArrayBuffer")))
+        (when (< (length (ab-bytes new)) new-len)
+          (js-throw (make-native-error "TypeError" "Species constructor returned an ArrayBuffer that is too small")))
+        ;; re-check O detachment after construction side effects
         (when (ab-detached-p this)
           (js-throw (make-native-error "TypeError" "Cannot slice a detached ArrayBuffer")))
-        (let ((src (ab-bytes this)))
+        (let ((src (ab-bytes this)) (dst (ab-bytes new)))
           (dotimes (i new-len)
             (when (< (+ start i) (length src))
-              (setf (aref out i) (aref src (+ start i))))))
-        (make-array-buffer out proto)))
+              (setf (aref dst i) (aref src (+ start i))))))
+        new))
     ;; get detached
     (def-getter realm proto "detached"
       (lambda (this args) (declare (ignore args))
