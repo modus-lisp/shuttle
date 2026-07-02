@@ -26,6 +26,8 @@
                             ((= re *inf*) l)
                             (t (min (truncate re) l))))
                (count (max (- final k) 0)))
+          ;; ArraySpeciesCreate(O, count): validate O.constructor (+ @@species).
+          (%array-species-check o)
           (when (> count 4294967295)
             (js-throw (make-native-error "RangeError" "Invalid array length")))
           (let ((a (make-object :proto (realm-array-proto realm) :class "Array"))

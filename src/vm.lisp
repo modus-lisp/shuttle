@@ -246,8 +246,10 @@
       ((not (code-constructable code)) nil)
       (t
        (setf (js-object-construct fn)
-             (lambda (args new-target) (declare (ignore new-target))
-               (let* ((pp (js-get fn "prototype"))
+             (lambda (args new-target)
+               ;; OrdinaryCreateFromConstructor: the new object's [[Prototype]] is
+               ;; newTarget.prototype (Reflect.construct's 3rd arg), else fn's.
+               (let* ((pp (js-get (or new-target fn) "prototype"))
                       (obj (make-object :proto (if (js-object-p pp) pp (%obj-proto)))))
                  (let ((r (funcall (js-object-call fn) obj args))) (if (js-object-p r) r obj)))))))
     ;; a fresh .prototype so `new` works and methods can be attached.
@@ -1370,6 +1372,20 @@
             (:genclosure (push! (make-js-function (first a) env :kind :generator :lexical-this this)))
             (:asyncclosure (push! (make-js-function (first a) env :kind :async :lexical-this this)))
             (:asyncgenclosure (push! (make-js-function (first a) env :kind :async-generator :lexical-this this)))
+            ;; Named function EXPRESSION: bind its own name (immutable) to itself in
+            ;; a fresh env captured as the function's closure scope, so the body can
+            ;; reference the function by name even when the outer binding is reassigned.
+            ((:named-closure :named-genclosure :named-asyncclosure :named-asyncgenclosure)
+             (let* ((fenv (new-env env))
+                    (fn (make-js-function (first a)
+                                          fenv
+                                          :kind (case op
+                                                  (:named-genclosure :generator)
+                                                  (:named-asyncclosure :async)
+                                                  (:named-asyncgenclosure :async-generator))
+                                          :lexical-this this)))
+               (env-declare-const fenv (second a) fn)
+               (push! fn)))
             (:yield (push! (gen-yield (pop!))))
             (:yield-star (push! (yield-star-delegate (pop!))))
             (:await (push! (async-await (pop!))))

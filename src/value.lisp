@@ -150,12 +150,37 @@
       *null*))
 
 (defun js-set-proto (o v)
-  "[[SetPrototypeOf]]: internal :set-proto trap, else set the slot. Returns T/NIL."
+  "[[SetPrototypeOf]]: internal :set-proto trap, else OrdinarySetPrototypeOf.
+   Ordinary: same proto -> T; non-extensible & different proto -> NIL (reject);
+   a cycle through ordinary objects -> NIL. Returns T/NIL."
   (if (js-object-p o)
       (let ((tr (and (js-object-internal o) (getf (js-object-internal o) :set-proto))))
         (if tr (and (funcall tr o v) t)
-            (progn (setf (js-object-proto o) v) t)))
+            (ordinary-set-proto o v)))
       nil))
+
+(defun ordinary-set-proto (o v)
+  "OrdinarySetPrototypeOf(O, V): V is an object or null."
+  (let ((current (js-object-proto o)))
+    (cond
+      ;; SameValue(V, current) -> succeed with no change.
+      ((eq v current) t)
+      ;; non-extensible and V differs -> reject.
+      ((not (js-object-extensible o)) nil)
+      (t
+       ;; cycle check: walk the proposed chain. Stop (allow) if we reach null, or
+       ;; hit an exotic object with its own [[SetPrototypeOf]] (its check is opaque).
+       (let ((p v))
+         (loop
+           (cond
+             ((eq p *null*) (return))                    ; no cycle
+             ((eq p o) (return-from ordinary-set-proto nil)) ; cycle
+             ((and (js-object-p p) (js-object-internal p)
+                   (getf (js-object-internal p) :set-proto))
+              (return))                                  ; exotic proto: stop walking
+             ((js-object-p p) (setf p (js-object-proto p)))
+             (t (return)))))
+       (setf (js-object-proto o) v) t))))
 
 (defun js-extensible-p (o)
   "[[IsExtensible]]: internal :is-extensible trap, else the struct slot. Returns T/NIL."
@@ -290,11 +315,18 @@
 
 (defun array-index-inherited-blocker-p (o k)
   "T if K resolves on O's prototype chain to an accessor or a non-writable data
-   property — cases where OrdinarySet must NOT just create an own data prop."
+   property, OR the chain contains an exotic object (Proxy / anything with its own
+   [[Set]] / [[GetOwnProperty]] internal trap) — cases where the fast index write
+   must NOT just create an own data prop, but fall through to the ordinary
+   proto-walk so an inherited setter / a proxy trap runs."
   (loop for p = (js-object-proto o) then (js-object-proto p)
         while (js-object-p p)
-        for d = (gethash k (js-object-props p))
-        when d do (return (or (prop-accessor d) (not (prop-writable d))))))
+        do (let ((int (js-object-internal p)))
+             (when (and int (or (getf int :set) (getf int :get-own-property)
+                                (getf int :get-proto)))
+               (return t)))
+           (let ((d (gethash k (js-object-props p))))
+             (when d (return (or (prop-accessor d) (not (prop-writable d))))))))
 
 (defun ordinary-set (o key v &optional receiver)
   ;; OrdinarySet with the receiver walk: an own data prop on RECEIVER is written;

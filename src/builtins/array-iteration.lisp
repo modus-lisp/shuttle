@@ -23,18 +23,21 @@
       ;; Override kernel map/forEach: they omit ToObject(this) (array-likes,
       ;; strings, primitives) and map must preserve holes.
       (def-method realm ap "map" 1 (this args)
-        (let* ((o (to-object this)) (fn (arg 0 args)) (ta (arg 1 args)) (l (len o))
-               (a (make-object :proto (realm-array-proto realm) :class "Array")))
+        (let* ((o (to-object this)) (fn (arg 0 args)) (ta (arg 1 args)) (l (len o)))
           (callable fn)
-          ;; ArraySpeciesCreate(O, len) -> default ArrayCreate throws if len>2^32-1.
+          ;; ArraySpeciesCreate(O, len): read/validate O.constructor (+ @@species)
+          ;; and, on the default path, ArrayCreate throws if len>2^32-1.  This
+          ;; runs BEFORE any callback so a bad constructor => callback never fires.
+          (%array-species-check o)
           (when (> l 4294967295)
             (js-throw (make-native-error "RangeError" "Invalid array length")))
-          (dotimes (i l)
-            (let ((kk (princ-to-string i)))
-              (when (js-truthy* (js-has o kk))
-                (put a kk (js-call fn ta (list (js-get o kk) (float i 1d0) o))))))
-          (put a "length" (float l 1d0) :enumerable nil)
-          a))
+          (let ((a (make-object :proto (realm-array-proto realm) :class "Array")))
+            (dotimes (i l)
+              (let ((kk (princ-to-string i)))
+                (when (js-truthy* (js-has o kk))
+                  (put a kk (js-call fn ta (list (js-get o kk) (float i 1d0) o))))))
+            (put a "length" (float l 1d0) :enumerable nil)
+            a)))
       (def-method realm ap "forEach" 1 (this args)
         (let* ((o (to-object this)) (fn (arg 0 args)) (ta (arg 1 args)) (l (len o)))
           (callable fn)
@@ -45,6 +48,8 @@
       (def-method realm ap "filter" 1 (this args)
         (let* ((o (to-object this)) (fn (arg 0 args)) (ta (arg 1 args)) (l (len o)) (out '()))
           (callable fn)
+          ;; ArraySpeciesCreate(O, 0): validate constructor before the loop.
+          (%array-species-check o)
           (dotimes (i l)
             (when (js-truthy* (js-has o (princ-to-string i)))
               (let ((v (js-get o (princ-to-string i))))

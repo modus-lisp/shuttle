@@ -128,10 +128,15 @@
       (declare (ignorable #'len))
 
       (def-method realm ap "concat" 1 (this args)
-        (let ((a (make-object :proto (realm-array-proto realm) :class "Array"))
-              (n 0))
+        (let* ((o (to-object this))
+               (a (progn
+                    ;; ArraySpeciesCreate(O, 0): validate O.constructor (+ @@species)
+                    ;; before spreading any items.
+                    (%array-species-check o)
+                    (make-object :proto (realm-array-proto realm) :class "Array")))
+               (n 0))
           ;; items = [O, ...arguments]; O is ToObject(this value).
-          (dolist (e (cons (to-object this) args))
+          (dolist (e (cons o args))
             (if (%concat-spreadable-p e)
                 (let ((l (truncate (to-length (js-get e "length")))))
                   ;; n + len must not exceed 2^53-1 (checked before copying).

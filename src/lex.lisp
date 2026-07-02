@@ -18,8 +18,44 @@
   (let ((cc (char-code ch)))
     (if (> cc #xFFFF) (write-string (utf16-encode-cp cc) out) (write-char ch out))))
 
-(defun id-start-p (c) (or (alpha-char-p c) (char= c #\_) (char= c #\$)))
-(defun id-part-p  (c) (or (alphanumericp c) (char= c #\_) (char= c #\$)))
+(defun id-start-p (c) (or (alpha-char-p c) (char= c #\_) (char= c #\$)
+                          ;; ID_Start includes a broad Unicode letter range; SBCL's
+                          ;; alpha-char-p covers most. Also allow the common
+                          ;; Other_ID_Start pair (U+2118, U+212E, U+309B, U+309C).
+                          (member (char-code c) '(#x1885 #x1886 #x2118 #x212E #x309B #x309C))))
+(defun id-part-p  (c) (or (alphanumericp c) (char= c #\_) (char= c #\$)
+                          (id-start-p c)     ; ID_Continue superset of ID_Start
+                          ;; ZWNJ / ZWJ and Other_ID_Continue join chars.
+                          (member (char-code c) '(#x200C #x200D #x00B7 #x0387 #x1369 #x136A
+                                                  #x136B #x136C #x136D #x136E #x136F #x1370
+                                                  #x1371 #x19DA))))
+
+(defparameter *reserved-words*
+  ;; ReservedWord (keywords + literals); an escaped reserved word is an early error.
+  '("break" "case" "catch" "class" "const" "continue" "debugger" "default"
+    "delete" "do" "else" "enum" "export" "extends" "false" "finally" "for"
+    "function" "if" "import" "in" "instanceof" "new" "null" "return" "super"
+    "switch" "this" "throw" "true" "try" "typeof" "var" "void" "while" "with"))
+(defun reserved-word-p (s) (member s *reserved-words* :test #'string=))
+
+(defun read-id-escape (src i n)
+  "At SRC[i]=#\\\\ starting a `\\u` escape inside an identifier. Returns
+   (values CODEPOINT NEXT-I) or (values NIL NIL) if malformed."
+  (when (and (< (1+ i) n) (char= (char src (1+ i)) #\u))
+    (let ((j (+ i 2)))
+      (cond
+        ((and (< j n) (char= (char src j) #\{))          ; \u{ HHHH }
+         (incf j) (let ((v 0) (any nil))
+                    (loop while (and (< j n) (digit-char-p (char src j) 16))
+                          do (setf v (+ (* v 16) (digit-char-p (char src j) 16)) any t) (incf j))
+                    (if (and any (< j n) (char= (char src j) #\}) (<= v #x10FFFF))
+                        (values v (1+ j)) (values nil nil))))
+        (t                                                ; \uHHHH
+         (let ((v 0))
+           (dotimes (_ 4 (values v j))
+             (if (and (< j n) (digit-char-p (char src j) 16))
+                 (progn (setf v (+ (* v 16) (digit-char-p (char src j) 16))) (incf j))
+                 (return-from read-id-escape (values nil nil))))))))))
 
 (defparameter *regex-not-after-keywords*
   ;; identifier tokens after which a `/` is DIVISION, not a regex (they produce a value)
@@ -80,8 +116,14 @@
     (loop for k from start below end do (write-str-char (char src k) out))
     (get-output-stream-string out)))
 
+(defvar *escaped-idents* nil
+  "Hash of token-index -> T for :ident tokens whose spelling contained a unicode
+   escape AND is a reserved word. The parser rejects these only in Identifier
+   position (not as an IdentifierName). Set per tokenize, read by the parser.")
+
 (defun tokenize (src)
-  (let ((i 0) (n (length src)) (toks (make-array 0 :adjustable t :fill-pointer 0)))
+  (let ((i 0) (n (length src)) (toks (make-array 0 :adjustable t :fill-pointer 0))
+        (*escaped-idents* (make-hash-table)))
     (labels ((peek (&optional (k 0)) (if (< (+ i k) n) (char src (+ i k)) #\Nul))
              (emit (type val) (vector-push-extend (cons type val) toks)))
       (loop while (< i n) do
@@ -274,11 +316,45 @@
                              (t (with-js-floats
                                   (let ((r (decimal-string->rational text)))
                                     (if (null r) 0d0 (rational->double r)))))))))))
-            ;; identifier / keyword  (also #private-name as a lexeme)
-            ((or (id-start-p c) (and (char= c #\#) (< (1+ i) n) (id-start-p (char src (1+ i)))))
-             (let ((start i)) (when (char= c #\#) (incf i))
-               (loop while (and (< i n) (id-part-p (char src i))) do (incf i))
-               (emit :ident (subseq src start i))))
+            ;; identifier / keyword  (also #private-name as a lexeme). An identifier
+            ;; may open with, or contain, a \uHHHH / \u{..} unicode escape whose
+            ;; decoded code point is a valid ID_Start / ID_Continue char.
+            ((or (id-start-p c)
+                 (and (char= c #\#) (< (1+ i) n)
+                      (or (id-start-p (char src (1+ i))) (char= (char src (1+ i)) #\\)))
+                 (and (char= c #\\)
+                      (multiple-value-bind (cp ni) (read-id-escape src i n)
+                        (and cp (id-start-p (code-char cp)) ni))))
+             (let ((buf (make-string-output-stream)) (escaped nil))
+               (when (char= c #\#) (write-char #\# buf) (incf i))
+               ;; first char (start): plain or escaped
+               (if (char= (char src i) #\\)
+                   (multiple-value-bind (cp ni) (read-id-escape src i n)
+                     (unless (and cp (id-start-p (code-char cp)))
+                       (js-throw (make-native-error "SyntaxError" "Invalid identifier escape")))
+                     (write-str-char (code-char cp) buf) (setf i ni escaped t))
+                   (progn (write-char (char src i) buf) (incf i)))
+               ;; continuation chars
+               (loop while (< i n) do
+                 (let ((ch (char src i)))
+                   (cond
+                     ((id-part-p ch) (write-char ch buf) (incf i))
+                     ((char= ch #\\)
+                      (multiple-value-bind (cp ni) (read-id-escape src i n)
+                        (unless (and cp (id-part-p (code-char cp)))
+                          (js-throw (make-native-error "SyntaxError" "Invalid identifier escape")))
+                        (write-str-char (code-char cp) buf) (setf i ni escaped t)))
+                     (t (return)))))
+               (let ((name (get-output-stream-string buf)))
+                 ;; An escaped reserved word is an early SyntaxError ONLY where an
+                 ;; Identifier is required (binding / reference) — NOT as an
+                 ;; IdentifierName (property access `x.if`, object key, method
+                 ;; name), where any keyword spelling is legal. We can't distinguish
+                 ;; here, so record the escape on a parallel position map; the parser
+                 ;; rejects an escaped reserved word only in Identifier position.
+                 (when (and escaped (reserved-word-p name))
+                   (setf (gethash (fill-pointer toks) *escaped-idents*) t))
+                 (emit :ident name))))
             ;; punctuator (maximal munch)
             (t (let ((p (find-if (lambda (p) (and (<= (+ i (length p)) n)
                                                   (string= p src :start2 i :end2 (+ i (length p)))
@@ -289,4 +365,4 @@
                  (if p (progn (emit :punct p) (incf i (length p)))
                      (js-throw (make-native-error "SyntaxError" (format nil "Unexpected character ~s" c))))))))))
     (vector-push-extend (cons :eof nil) toks)
-    toks))
+    (values toks *escaped-idents*)))

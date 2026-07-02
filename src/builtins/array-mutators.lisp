@@ -156,6 +156,13 @@
                  (items (if (> argc 2) (nthcdr 2 args) '()))
                  (item-count (length items))
                  (removed '()))
+            ;; ArraySpeciesCreate(O, actualDeleteCount): validate O.constructor
+            ;; (+ @@species) and ArrayCreate — both happen BEFORE any element is
+            ;; read/deleted, so a bad ctor or an out-of-range delete count throws
+            ;; without observable property access (create-*-invalid-len, ctor-*).
+            (%array-species-check this)
+            (when (> del-count 4294967295)
+              (js-throw (make-native-error "RangeError" "Invalid array length")))
             ;; new length must not exceed 2^53-1
             (when (> (+ (- l del-count) item-count) 9007199254740991)
               (js-throw (make-native-error "TypeError" "splice exceeds maximum array length")))
@@ -164,9 +171,6 @@
               (let ((from (k (+ start i))))
                 (when (js-truthy* (js-has this from))
                   (push (cons i (js-get this from)) removed))))
-            ;; build removed array (ArrayCreate throws if del-count>2^32-1)
-            (when (> del-count 4294967295)
-              (js-throw (make-native-error "RangeError" "Invalid array length")))
             (let ((rem-arr (make-array-object '())))
               (dolist (cell (nreverse removed))
                 (js-set rem-arr (k (car cell)) (cdr cell)))

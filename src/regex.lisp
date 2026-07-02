@@ -57,6 +57,46 @@
 ;;; First pass: count capturing groups + collect names, so backreferences that
 ;;; appear before their group (and \k) can be validated / distinguished from
 ;;; octal escapes.
+;; Decode a RegExpIdentifierName starting at index I (just past the '<') up to
+;; the terminating '>'. \u HHHH and \u{ H+ } escapes are resolved (and combine a
+;; surrogate pair into an astral code point). Returns (values decoded-name
+;; index-of-'>'). Does not validate; callers that need error-checking use
+;; PARSE-GROUP-NAME. Used by the group-counting pre-pass so its name keys match
+;; the decoded names the real parser produces.
+(defun decode-group-name (src len i)
+  (let ((out (make-string-output-stream)))
+    ;; Strings here are UTF-16 code units (astral chars appear as surrogate
+    ;; pairs). We keep literal characters exactly as-is (so a surrogate pair in
+    ;; the source stays a pair, matching how the JS string / groups-object key is
+    ;; represented). Only a \u{cp} escape yielding an astral code point is
+    ;; expanded into its surrogate pair.
+    (flet ((emit-cp (cp)
+             (if (> cp #xFFFF)
+                 (let ((c (- cp #x10000)))
+                   (write-char (code-char (+ #xD800 (ash c -10))) out)
+                   (write-char (code-char (+ #xDC00 (logand c #x3FF))) out))
+                 (write-char (code-char cp) out))))
+      (loop while (and (< i len) (not (char= (char src i) #\>))) do
+        (if (and (char= (char src i) #\\) (< (1+ i) len) (char= (char src (1+ i)) #\u))
+            (progn
+              (incf i 2)
+              (if (and (< i len) (char= (char src i) #\{))
+                  (progn (incf i)
+                         (let ((v 0))
+                           (loop while (and (< i len) (digit-char-p (char src i) 16))
+                                 do (setf v (+ (* v 16) (digit-char-p (char src i) 16))) (incf i))
+                           (when (and (< i len) (char= (char src i) #\})) (incf i))
+                           (emit-cp v)))
+                  (let ((v 0))
+                    (dotimes (k 4)
+                      (when (and (< i len) (digit-char-p (char src i) 16))
+                        (setf v (+ (* v 16) (digit-char-p (char src i) 16))) (incf i)))
+                    ;; a plain \uHHHH is a single code unit (may be a lone
+                    ;; surrogate that pairs with an adjacent literal one)
+                    (write-char (code-char v) out))))
+            (progn (write-char (char src i) out) (incf i)))))
+    (values (get-output-stream-string out) i)))
+
 (defun rx-count-groups (src len)
   (let ((count 0) (names '()) (i 0))
     (loop while (< i len) do
@@ -76,9 +116,9 @@
                        (not (member (char src (+ i 3)) '(#\= #\!))))
                   (progn
                     (incf count)
-                    (let ((j (+ i 3)) (start (+ i 3)))
-                      (loop while (and (< j len) (not (char= (char src j) #\>))) do (incf j))
-                      (push (cons (subseq src start j) count) names))
+                    (multiple-value-bind (name j) (decode-group-name src len (+ i 3))
+                      (declare (ignore j))
+                      (push (cons name count) names))
                     (incf i))
                   (incf i)))
              (t (incf count) (incf i))))
@@ -91,7 +131,50 @@
       (let ((ast (parse-disjunction p ngroups names)))
         (unless (rp-eof p)
           (regex-syntax-error (format nil "unexpected '~a' at ~d" (rp-peek p) (rx-parser-pos p))))
+        (check-duplicate-group-names ast)
         (values ast ngroups names)))))
+
+(defun check-duplicate-group-names (ast)
+  "ES2025 duplicate named groups: a name may repeat only across the branches of
+   a Disjunction (mutually exclusive), never twice within one alternative. Walk
+   the AST returning the set of names reachable in a node; the branches of an
+   :alt may overlap with each other, but a :seq's children must not share names,
+   and no name may appear twice within a single subtree otherwise."
+  (labels ((names-in (node)
+             ;; Returns the list of group names in NODE; signals on an in-scope
+             ;; duplicate (two decls that are not in disjoint alternatives).
+             (cond
+               ((not (consp node)) '())
+               (t
+                (case (car node)
+                  (:group
+                   (let ((nm (caddr node))          ; (:group idx name body)
+                         (inner (names-in (cadddr node))))
+                     (if nm (union-check (list nm) inner) inner)))
+                  (:seq
+                   (reduce #'union-check (mapcar #'names-in (cdr node))
+                           :initial-value '()))
+                  (:alt
+                   ;; branches are mutually exclusive: their name sets may
+                   ;; overlap. Each branch is checked internally; the result is
+                   ;; the union (dedup) so an OUTER seq still catches a name used
+                   ;; both inside and outside the alternation.
+                   (let ((acc '()))
+                     (dolist (b (cdr node))
+                       (dolist (n (names-in b)) (pushnew n acc :test #'string=)))
+                     acc))
+                  (:repeat (names-in (car (last node))))
+                  ((:lookahead :lookbehind) (names-in (caddr node)))
+                  (:modifier (names-in (cadddr node)))
+                  (t '())))))
+           (union-check (a b)
+             ;; union of two name-sets that must be disjoint (else duplicate)
+             (dolist (n b)
+               (when (member n a :test #'string=)
+                 (regex-syntax-error (format nil "duplicate capture group name '~a'" n)))
+               (push n a))
+             a))
+    (names-in ast)))
 
 (defun parse-disjunction (p ngroups names)
   (let ((alts (list (parse-alternative p ngroups names))))
@@ -151,8 +234,28 @@
       (if has
           (let ((lazy (rp-eat p #\?)))
             (when (and mx (< mx mn)) (regex-syntax-error "quantifier out of order"))
+            ;; A quantifier applied to a quantifier is a SyntaxError in every
+            ;; mode: `a**`, `a???`, `x{1}{1,}`, etc. (grammar: Term := Atom
+            ;; Quantifier?, so a second quantifier has no Atom to bind).
+            (when (quantifier-follows-p p)
+              (regex-syntax-error "nothing to repeat"))
             (list :repeat mn mx lazy atom))
           atom))))
+
+(defun quantifier-follows-p (p)
+  "True if the next token is a quantifier: *, +, ? or a valid {n}/{n,}/{n,m}.
+   (A `{` that is not a valid quantifier is not one — Annex B treats it as a
+   literal, so it does not count here.) Does not consume input."
+  (let ((c (rp-peek p)))
+    (cond
+      ((member c '(#\* #\+ #\?)) t)
+      ((eql c #\{)
+       (let ((save (rx-parser-pos p)))
+         (multiple-value-bind (lo hi ok) (try-parse-braces p)
+           (declare (ignore lo hi))
+           (setf (rx-parser-pos p) save)   ; peek only
+           ok)))
+      (t nil))))
 
 (defun try-parse-braces (p)
   (let ((save (rx-parser-pos p)))
@@ -221,7 +324,7 @@
        (regex-syntax-error "lone brace/bracket in unicode mode"))
       ((char= c #\*) (regex-syntax-error "nothing to repeat"))
       ((char= c #\+) (regex-syntax-error "nothing to repeat"))
-      ((and (char= c #\?) (rx-parser-unicode p)) (regex-syntax-error "nothing to repeat"))
+      ((char= c #\?) (regex-syntax-error "nothing to repeat"))
       (t (rp-next p) (list :char c)))))
 
 (defun parse-modifier-flags (p)
@@ -244,12 +347,18 @@
     (values (nreverse add) (nreverse rem))))
 
 (defun parse-group-name (p)
-  (let ((start (rx-parser-pos p)))
-    (loop for c = (rp-peek p) while (and c (not (char= c #\>))) do (rp-next p))
-    (let ((name (subseq (rx-parser-src p) start (rx-parser-pos p))))
-      (unless (rp-eat p #\>) (regex-syntax-error "unterminated group name"))
-      (when (string= name "") (regex-syntax-error "empty group name"))
-      name)))
+  ;; RegExpIdentifierName: raw identifier chars plus \u escapes, decoded to the
+  ;; actual code points (so `(?<A>)` names the group "A"). Full Unicode
+  ;; ID_Start/ID_Continue validation needs property tables (out of scope), so we
+  ;; accept any non-empty decoded name and only reject a clearly-empty one.
+  (multiple-value-bind (name end)
+      (decode-group-name (rx-parser-src p) (rx-parser-len p) (rx-parser-pos p))
+    (setf (rx-parser-pos p) end)
+    (unless (rp-eat p #\>) (regex-syntax-error "unterminated group name"))
+    (when (string= name "") (regex-syntax-error "empty group name"))
+    name))
+
+(defun ascii-letter-p (c) (or (char<= #\a c #\z) (char<= #\A c #\Z)))
 
 (defun parse-atom-escape (p ngroups names)
   (rp-next p)
@@ -258,6 +367,12 @@
     (cond
       ((member c '(#\d #\D #\w #\W #\s #\S))
        (rp-next p) (list :class-escape c))
+      ;; \c followed by an ASCII letter is a control escape; otherwise, in
+      ;; non-/u mode, the '\' is a literal character and 'c' is parsed as an
+      ;; ordinary atom next (Annex B ControlEscape fallback: \cД, \c9, ...).
+      ((and (char= c #\c) (not (rx-parser-unicode p))
+            (let ((x (rp-peek p 1))) (not (and x (ascii-letter-p x)))))
+       (list :char #\\))
       ((char= c #\k)
        ;; \k is a named backreference only when the pattern actually declares
        ;; named groups (or /u forces the strict grammar). Otherwise (Annex B,
@@ -288,13 +403,22 @@
            ((rx-parser-unicode p) (regex-syntax-error "invalid backreference"))
            (t (setf (rx-parser-pos p) start)
               (parse-legacy-octal-or-digit p)))))
+      ;; \0 followed by another octal digit (non-/u) is a LegacyOctalEscape,
+      ;; e.g. \011 = 0o11. (Bare \0 not followed by a digit is NUL, handled by
+      ;; parse-char-escape-value; /u keeps \0 strictly NUL-only.)
+      ((and (char= c #\0) (not (rx-parser-unicode p))
+            (let ((d (rp-peek p 1))) (and d (char<= #\0 d #\7))))
+       (parse-legacy-octal-or-digit p))
       (t (list :char (parse-char-escape-value p))))))
 
 (defun parse-legacy-octal-or-digit (p)
   (let ((c (rp-peek p)))
     (if (and c (char<= #\0 c #\7))
-        (let ((val 0) (n 0))
-          (loop while (and (< n 3) (let ((d (rp-peek p))) (and d (char<= #\0 d #\7))))
+        ;; LegacyOctalEscapeSequence: 1–3 octal digits, but a 3rd digit is only
+        ;; part of the escape when the first is 0–3 (so the value stays ≤ 255).
+        ;; `\770` is therefore \77 followed by a literal '0'; `\400` is \40 + '0'.
+        (let ((max (if (char<= #\0 c #\3) 3 2)) (val 0) (n 0))
+          (loop while (and (< n max) (let ((d (rp-peek p))) (and d (char<= #\0 d #\7))))
                 do (setf val (+ (* val 8) (digit-char-p (rp-next p)))) (incf n))
           (list :char (code-char val)))
         (list :char (rp-next p)))))
@@ -311,13 +435,13 @@
       (#\b (code-char 8))
       (#\c
        (let ((x (rp-peek p)))
-         (if (and x (alpha-char-p x))
+         (if (and x (ascii-letter-p x))
              (progn (rp-next p) (code-char (mod (char-code (char-upcase x)) 32)))
-             ;; \c not followed by an ASCII letter: legacy identity of 'c'
-             ;; (Annex B); in /u mode this is a SyntaxError.
-             (if (rx-parser-unicode p)
-                 (regex-syntax-error "invalid \\c escape")
-                 #\c))))
+             ;; \c not followed by an ASCII letter: in /u mode a SyntaxError.
+             ;; In non-/u it is not a control escape at all — the '\' is a
+             ;; literal (handled by the caller emitting a literal backslash and
+             ;; leaving the 'c'); this branch is only reached in /u mode.
+             (regex-syntax-error "invalid \\c escape"))))
       (#\x (let ((save (rx-parser-pos p)) (v (parse-hex-value p 2)))
              (cond
                (v (code-char v))
@@ -422,8 +546,40 @@
               ((member e '(#\d #\D #\w #\W #\s #\S))
                (rp-next p) (list :class-escape e))
               ((char= e #\b) (rp-next p) (list :ch (code-char 8)))
+              ;; Annex B ClassControlLetter also accepts a DecimalDigit or '_'
+              ;; after \c (non-/u). In /u mode only ASCII letters are valid.
+              ((and (char= e #\c) (not (rx-parser-unicode p))
+                    (let ((x (rp-peek p 1))) (and x (or (alpha-char-p x) (digit-char-p x) (char= x #\_)))))
+               (rp-next p)              ; consume 'c'
+               (let ((x (rp-next p)))
+                 (list :ch (code-char (mod (char-code (char-upcase x)) 32)))))
+              ;; \c not followed by a valid control letter: the '\' is a literal
+              ;; ClassAtom on its own (Annex B); leave 'c' for the next atom.
+              ((and (char= e #\c) (not (rx-parser-unicode p)))
+               (list :ch #\\))
+              ;; Legacy octal / decimal escapes in a class (non-/u): \1..\7 are
+              ;; octal char values; \8 \9 are the literal digits.
+              ((and (not (rx-parser-unicode p)) (digit-char-p e))
+               (if (char<= #\0 e #\7)
+                   (let ((max (if (char<= #\0 e #\3) 3 2)) (val 0) (n 0))
+                     (loop while (and (< n max)
+                                      (let ((d (rp-peek p))) (and d (char<= #\0 d #\7))))
+                           do (setf val (+ (* val 8) (digit-char-p (rp-next p)))) (incf n))
+                     (list :ch (code-char val)))
+                   (progn (rp-next p) (list :ch e))))
               (t (list :ch (parse-char-escape-value p t))))))
-        (progn (rp-next p) (list :ch c)))))
+        ;; Under /u, a literal high surrogate followed by a low surrogate is one
+        ;; astral code point (stored as a single code-char > #xFFFF), so the
+        ;; class matches the whole code point rather than either half.
+        (progn
+          (rp-next p)
+          (if (and (rx-parser-unicode p) (high-surrogate-p c)
+                   (let ((n (rp-peek p))) (and n (low-surrogate-p n))))
+              (let ((lo (rp-next p)))
+                (list :ch (code-char (+ #x10000
+                                        (* (- (char-code c) #xD800) #x400)
+                                        (- (char-code lo) #xDC00)))))
+              (list :ch c))))))
 
 ;;; ===========================================================================
 ;;; Predefined class membership
@@ -459,6 +615,13 @@
   ignore-case multiline dot-all unicode
   (steps 0 :type fixnum))
 
+;; Match direction for the node currently being COMPILED: +1 forward, -1 when
+;; inside a lookbehind (matching proceeds right-to-left there, which is what
+;; makes a repeated group's final capture the LEFTMOST iteration). Bound around
+;; a lookbehind body in COMPILE-LOOKBEHIND; character-consuming matchers and the
+;; sequence combinator read it at compile time so no per-step branch is needed.
+(defvar *compile-direction* 1)
+
 ;; Bound total backtracking work per exec: a pathological pattern (nested
 ;; quantifiers, catastrophic backtracking) would otherwise recurse the CL
 ;; control stack to a FATAL, uncatchable exhaustion. On exceed we THROW
@@ -492,6 +655,16 @@
            (< (1+ pos) (mctx-len mc))
            (high-surrogate-p (char (mctx-input mc) pos))
            (low-surrogate-p (char (mctx-input mc) (1+ pos))))
+      2 1))
+
+;; Width of the code point ENDING at POS (i.e. the one to the left), for
+;; backward (lookbehind) matching: a low surrogate at pos-1 preceded by a high
+;; surrogate at pos-2 is one 2-unit code point.
+(defun rx-cp-width-back (mc pos)
+  (if (and (mctx-unicode mc)
+           (>= (- pos 2) 0)
+           (low-surrogate-p (char (mctx-input mc) (1- pos)))
+           (high-surrogate-p (char (mctx-input mc) (- pos 2))))
       2 1))
 
 ;;; ===========================================================================
@@ -559,7 +732,10 @@
 (defun compile-seq (nodes)
   (if (null nodes)
       (lambda (mc pos k) (declare (ignore mc)) (funcall k pos))
-      (let ((compiled (mapcar #'compile-node nodes)))
+      ;; In a lookbehind (backward direction) the terms must be matched
+      ;; right-to-left, so compile them in reversed order.
+      (let ((compiled (mapcar #'compile-node
+                              (if (minusp *compile-direction*) (reverse nodes) nodes))))
         (labels ((chain (ms)
                    (if (null (cdr ms))
                        (car ms)
@@ -576,29 +752,48 @@
         (when (funcall m mc pos k) (return t))))))
 
 (defun compile-char (c)
-  (if (> (char-code c) #xFFFF)
-      ;; An astral pattern char (from \u{...} in /u mode) must match the two
-      ;; UTF-16 code units of its surrogate-pair encoding in the input.
-      (let* ((cp (- (char-code c) #x10000))
-             (hi (code-char (+ #xD800 (ash cp -10))))
-             (lo (code-char (+ #xDC00 (logand cp #x3FF)))))
-        (lambda (mc pos k)
-          (and (< (1+ pos) (mctx-len mc))
-               (char= (char (mctx-input mc) pos) hi)
-               (char= (char (mctx-input mc) (1+ pos)) lo)
-               (funcall k (+ pos 2)))))
-      (lambda (mc pos k)
-        (and (< pos (mctx-len mc))
-             (rx-char-eq mc (char (mctx-input mc) pos) c)
-             (funcall k (1+ pos))))))
+  (let ((backward (minusp *compile-direction*)))
+    (if (> (char-code c) #xFFFF)
+        ;; An astral pattern char (from \u{...} in /u mode) must match the two
+        ;; UTF-16 code units of its surrogate-pair encoding in the input.
+        (let* ((cp (- (char-code c) #x10000))
+               (hi (code-char (+ #xD800 (ash cp -10))))
+               (lo (code-char (+ #xDC00 (logand cp #x3FF)))))
+          (if backward
+              (lambda (mc pos k)
+                (and (>= (- pos 2) 0)
+                     (char= (char (mctx-input mc) (- pos 2)) hi)
+                     (char= (char (mctx-input mc) (- pos 1)) lo)
+                     (funcall k (- pos 2))))
+              (lambda (mc pos k)
+                (and (< (1+ pos) (mctx-len mc))
+                     (char= (char (mctx-input mc) pos) hi)
+                     (char= (char (mctx-input mc) (1+ pos)) lo)
+                     (funcall k (+ pos 2))))))
+        (if backward
+            (lambda (mc pos k)
+              (and (> pos 0)
+                   (rx-char-eq mc (char (mctx-input mc) (1- pos)) c)
+                   (funcall k (1- pos))))
+            (lambda (mc pos k)
+              (and (< pos (mctx-len mc))
+                   (rx-char-eq mc (char (mctx-input mc) pos) c)
+                   (funcall k (1+ pos))))))))
 
 (defun compile-dot ()
-  (lambda (mc pos k)
-    (and (< pos (mctx-len mc))
-         (or (mctx-dot-all mc)
-             (not (line-terminator-p (char (mctx-input mc) pos))))
-         ;; In /u a '.' consumes a whole code point (a surrogate pair counts once).
-         (funcall k (+ pos (rx-cp-width mc pos))))))
+  (if (minusp *compile-direction*)
+      (lambda (mc pos k)
+        (and (> pos 0)
+             (let ((w (rx-cp-width-back mc pos)))
+               (and (or (mctx-dot-all mc)
+                        (not (line-terminator-p (char (mctx-input mc) (- pos w)))))
+                    (funcall k (- pos w))))))
+      (lambda (mc pos k)
+        (and (< pos (mctx-len mc))
+             (or (mctx-dot-all mc)
+                 (not (line-terminator-p (char (mctx-input mc) pos))))
+             ;; In /u a '.' consumes a whole code point (a surrogate pair counts once).
+             (funcall k (+ pos (rx-cp-width mc pos)))))))
 
 (defun compile-bol ()
   (lambda (mc pos k)
@@ -627,18 +822,53 @@
            (funcall k pos)))))
 
 (defun compile-class-escape (esc)
-  (lambda (mc pos k)
-    (and (< pos (mctx-len mc))
-         (class-escape-member-p esc (char (mctx-input mc) pos))
-         (funcall k (1+ pos)))))
+  (if (minusp *compile-direction*)
+      (lambda (mc pos k)
+        (and (> pos 0)
+             (class-escape-member-p esc (char (mctx-input mc) (1- pos)))
+             (funcall k (1- pos))))
+      (lambda (mc pos k)
+        (and (< pos (mctx-len mc))
+             (class-escape-member-p esc (char (mctx-input mc) pos))
+             (funcall k (1+ pos))))))
+
+(defun class-input-cp (mc pos)
+  "Return (values code-point-char width) for the code point starting at POS,
+   combining a surrogate pair into one astral char under /u."
+  (let* ((in (mctx-input mc)) (c (char in pos)))
+    (if (and (mctx-unicode mc) (high-surrogate-p c)
+             (< (1+ pos) (mctx-len mc)) (low-surrogate-p (char in (1+ pos))))
+        (values (code-char (+ #x10000
+                              (* (- (char-code c) #xD800) #x400)
+                              (- (char-code (char in (1+ pos))) #xDC00)))
+                2)
+        (values c 1))))
+
+(defun class-input-cp-back (mc pos)
+  "As CLASS-INPUT-CP but for the code point ending at POS (lookbehind)."
+  (let* ((in (mctx-input mc)) (c (char in (1- pos))))
+    (if (and (mctx-unicode mc) (low-surrogate-p c)
+             (>= (- pos 2) 0) (high-surrogate-p (char in (- pos 2))))
+        (values (code-char (+ #x10000
+                              (* (- (char-code (char in (- pos 2))) #xD800) #x400)
+                              (- (char-code c) #xDC00)))
+                2)
+        (values c 1))))
 
 (defun compile-char-class (negated items)
-  (lambda (mc pos k)
-    (and (< pos (mctx-len mc))
-         (let* ((c (char (mctx-input mc) pos))
-                (in (char-in-class-p mc c items)))
-           (and (if negated (not in) in)
-                (funcall k (1+ pos)))))))
+  (if (minusp *compile-direction*)
+      (lambda (mc pos k)
+        (and (> pos 0)
+             (multiple-value-bind (c w) (class-input-cp-back mc pos)
+               (let ((in (char-in-class-p mc c items)))
+                 (and (if negated (not in) in)
+                      (funcall k (- pos w)))))))
+      (lambda (mc pos k)
+        (and (< pos (mctx-len mc))
+             (multiple-value-bind (c w) (class-input-cp mc pos)
+               (let ((in (char-in-class-p mc c items)))
+                 (and (if negated (not in) in)
+                      (funcall k (+ pos w)))))))))
 
 (defun char-in-class-p (mc c items)
   (dolist (item items nil)
@@ -655,47 +885,64 @@
              (when (char<= lo c hi) (return t))))))))
 
 (defun compile-group (idx body)
-  (let ((m (compile-node body)))
+  (let ((m (compile-node body))
+        (backward (minusp *compile-direction*)))
     (if idx
         (lambda (mc pos k)
           (let ((saved (aref (mctx-captures mc) idx)))
             (or (funcall m mc pos
                          (lambda (p2)
-                           (setf (aref (mctx-captures mc) idx) (cons pos p2))
+                           ;; The span is (start . end) with start <= end. Forward
+                           ;; matching ends at p2 >= pos; backward (lookbehind)
+                           ;; matching ends at p2 <= pos.
+                           (setf (aref (mctx-captures mc) idx)
+                                 (if backward (cons p2 pos) (cons pos p2)))
                            (or (funcall k p2)
                                (progn (setf (aref (mctx-captures mc) idx) saved) nil))))
                 (progn (setf (aref (mctx-captures mc) idx) saved) nil))))
         m)))
 
-(defun match-backref-cap (mc cap pos k)
+(defun match-backref-cap (mc cap pos k &optional backward)
   "Try to match the captured span CAP (a (start . end) cons or NIL) at POS,
-   calling K on success. An unset capture matches the empty string."
+   calling K on success. An unset capture matches the empty string. BACKWARD
+   matches the span ending at POS (moving left), for use inside a lookbehind."
   (if (null cap)
       (funcall k pos)
       (let* ((cs (car cap)) (ce (cdr cap)) (clen (- ce cs)))
-        (if (> (+ pos clen) (mctx-len mc))
-            nil
-            (let ((ok t))
-              (dotimes (i clen)
-                (unless (rx-char-eq mc (char (mctx-input mc) (+ pos i))
-                                    (char (mctx-input mc) (+ cs i)))
-                  (setf ok nil) (return)))
-              (and ok (funcall k (+ pos clen))))))))
+        (if backward
+            (if (< (- pos clen) 0)
+                nil
+                (let ((ok t) (base (- pos clen)))
+                  (dotimes (i clen)
+                    (unless (rx-char-eq mc (char (mctx-input mc) (+ base i))
+                                        (char (mctx-input mc) (+ cs i)))
+                      (setf ok nil) (return)))
+                  (and ok (funcall k base))))
+            (if (> (+ pos clen) (mctx-len mc))
+                nil
+                (let ((ok t))
+                  (dotimes (i clen)
+                    (unless (rx-char-eq mc (char (mctx-input mc) (+ pos i))
+                                        (char (mctx-input mc) (+ cs i)))
+                      (setf ok nil) (return)))
+                  (and ok (funcall k (+ pos clen)))))))))
 
 (defun compile-backref (idx)
-  (lambda (mc pos k)
-    (match-backref-cap mc (aref (mctx-captures mc) idx) pos k)))
+  (let ((backward (minusp *compile-direction*)))
+    (lambda (mc pos k)
+      (match-backref-cap mc (aref (mctx-captures mc) idx) pos k backward))))
 
 (defun compile-named-backref (idxs)
   "\\k<name> where NAME may map to several (duplicate-named) group indices: use
    whichever one is currently captured, else match the empty string."
   (if (null (cdr idxs))
       (compile-backref (car idxs))
-      (lambda (mc pos k)
-        (let ((cap (loop for i in idxs
-                         for c = (aref (mctx-captures mc) i)
-                         when c return c)))
-          (match-backref-cap mc cap pos k)))))
+      (let ((backward (minusp *compile-direction*)))
+        (lambda (mc pos k)
+          (let ((cap (loop for i in idxs
+                           for c = (aref (mctx-captures mc) i)
+                           when c return c)))
+            (match-backref-cap mc cap pos k backward))))))
 
 ;;; ---- quantifiers ----
 (defun collect-capture-indices (node)
@@ -756,7 +1003,9 @@
 
 ;;; ---- lookaround ----
 (defun compile-lookahead (negate body)
-  (let ((m (compile-node body)))
+  ;; A lookahead always matches forward, even when it appears inside a
+  ;; lookbehind (its Disjunction is evaluated with +1 direction).
+  (let ((m (let ((*compile-direction* 1)) (compile-node body))))
     (lambda (mc pos k)
       (let* ((saved (copy-seq (mctx-captures mc)))
              (matched (funcall m mc pos (lambda (p2) (declare (ignore p2)) t))))
@@ -770,15 +1019,15 @@
                (progn (replace (mctx-captures mc) saved) nil))))))))
 
 (defun compile-lookbehind (negate body)
-  (let ((m (compile-node body)))
+  ;; The body is compiled in backward (-1) direction: matching starts at POS and
+  ;; consumes leftward, so a repeated group's final capture is its LEFTMOST
+  ;; iteration and captures reflect right-to-left evaluation (per spec). The
+  ;; continuation just needs to succeed once; the resulting captures are kept
+  ;; (positive lookbehind) so back-references outside can see them.
+  (let ((m (let ((*compile-direction* -1)) (compile-node body))))
     (lambda (mc pos k)
       (let* ((saved (copy-seq (mctx-captures mc)))
-             (matched
-               (block found
-                 (loop for s from pos downto 0 do
-                   (when (funcall m mc s (lambda (p2) (= p2 pos)))
-                     (return-from found t)))
-                 nil)))
+             (matched (funcall m mc pos (lambda (p2) (declare (ignore p2)) t))))
         (cond
           (negate
            (replace (mctx-captures mc) saved)

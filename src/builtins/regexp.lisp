@@ -196,17 +196,19 @@
                   (push m results)
                   (when (string= m "")
                     (let ((li (to-length (js-get re "lastIndex"))))
-                      (js-set re "lastIndex" (float (advance-string-index s (truncate li) unicode) 1d0)))))))
+                      (set-lastindex-or-throw re (float (advance-string-index s (truncate li) unicode) 1d0)))))))
             (if (null results) *null*
                 (make-array-object (nreverse results))))))))
 
 (defun symbol-search-impl (realm re args)
   (let* ((s (to-string (arg 0 args)))
          (previous (js-get re "lastIndex")))
-    (unless (same-value previous 0d0) (js-set re "lastIndex" 0d0))
+    ;; Set(rx,"lastIndex",0,true) — a failed set (poisoned setter / non-writable)
+    ;; is an abrupt completion, so it must throw.
+    (unless (same-value previous 0d0) (set-lastindex-or-throw re 0d0))
     (let ((r (regexp-exec-abstract realm re s)))
       (let ((current (js-get re "lastIndex")))
-        (unless (same-value current previous) (js-set re "lastIndex" previous)))
+        (unless (same-value current previous) (set-lastindex-or-throw re previous)))
       (if (eq r *null*) -1d0 (js-get r "index")))))
 
 (defun symbol-split-impl (realm re args)
@@ -317,11 +319,16 @@
          (replace-value (arg 1 args))
          (functional (js-callable-p replace-value))
          (rep-str (unless functional (to-string replace-value)))
-         ;; Spec: read the flags STRING once; derive global/unicode from it.
+         ;; Spec (@@replace): flags := ToString(Get(rx,"flags")); global is
+         ;; "g" ∈ flags; and, only when global, fullUnicode is "u"/"v" ∈ flags.
+         ;; (The `flags` getter itself reads the individual flag getters, so an
+         ;; overridden `global`/`unicode` is honored transitively — and reading
+         ;; `flags` here means the `global`/`unicode` properties are NOT read
+         ;; directly, matching the observable-Get order the spec requires.)
          (flags (to-string (js-get re "flags")))
          (global (and (find #\g flags) t))
-         (unicode (and (or (find #\u flags) (find #\v flags)) t)))
-    (when global (js-set re "lastIndex" 0d0))
+         (unicode (and global (or (find #\u flags) (find #\v flags)) t)))
+    (when global (set-lastindex-or-throw re 0d0))
     (let ((results '()))
       ;; collect all matches
       (loop
@@ -332,7 +339,7 @@
           (let ((m (to-string (js-get r "0"))))
             (when (string= m "")
               (let ((li (to-length (js-get re "lastIndex"))))
-                (js-set re "lastIndex"
+                (set-lastindex-or-throw re
                         (float (advance-string-index s (truncate li) unicode) 1d0)))))))
       (setf results (nreverse results))
       (let ((accumulated (make-string-output-stream)) (next-source 0))
@@ -352,8 +359,12 @@
                                          captures
                                          (list (float position 1d0) s)
                                          (unless (js-undefined-p named-groups) (list named-groups)))))
+                       ;; Non-functional replacement: if named captures are
+                       ;; present they are ToObject'd first (so a `groups` of
+                       ;; null throws TypeError, per spec step 14.l.i.1).
                        (get-substitution matched s position captures
-                                         (unless (js-undefined-p named-groups) named-groups)
+                                         (unless (js-undefined-p named-groups)
+                                           (to-object named-groups))
                                          rep-str))))
             (when (>= position next-source)
               (write-string (subseq s next-source position) accumulated)
@@ -394,7 +405,7 @@
                              (let ((ms (to-string (js-get m "0"))))
                                (when (string= ms "")
                                  (let ((li (to-length (js-get re "lastIndex"))))
-                                   (js-set re "lastIndex"
+                                   (set-lastindex-or-throw re
                                            (float (advance-string-index s (truncate li) unicode) 1d0))))))
                            (put res "value" m) (put res "done" *false*)))))
                res)) 0)
@@ -570,7 +581,8 @@
               (values (if (js-undefined-p pattern) "" (to-string pattern))
                       (if (js-undefined-p flags) "" (to-string flags))))
         (setf (regexp-compiled this) (regex-compile src fl))
-        (js-set this "lastIndex" 0d0)
+        ;; Set(obj,"lastIndex",0,true): a non-writable lastIndex makes this throw.
+        (set-lastindex-or-throw this 0d0)
         this)))
   ;; --- getters ---
   (flet ((flag-getter (name char)

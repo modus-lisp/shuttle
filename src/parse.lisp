@@ -9,6 +9,13 @@
 (defun cur-val () (cdr (cur)))
 (defun adv () (prog1 (cur) (incf *pos*)))
 (defun punct? (v) (and (eq (cur-type) :punct) (string= (cur-val) v)))
+(defun check-escaped-ident ()
+  "Early error: the current token is an escaped reserved word used in Identifier
+   (binding/reference) position, which is not allowed (a keyword may not be spelled
+   with a unicode escape). Legal as an IdentifierName (property/key/method name)."
+  (when (and *escaped-idents* (gethash *pos* *escaped-idents*))
+    (js-throw (make-native-error "SyntaxError"
+               (format nil "Keyword '~a' must not contain escaped characters" (cur-val))))))
 (defun kw? (v) (and (eq (cur-type) :ident) (string= (cur-val) v)))
 (defun eat (v) (if (punct? v) (adv) (js-throw (make-native-error "SyntaxError" (format nil "Expected '~a'" v)))))
 (defun opt (v) (when (punct? v) (adv) t))
@@ -24,11 +31,13 @@
 (defparameter *assignops* '("=" "+=" "-=" "*=" "/=" "%=" "**="
                             "<<=" ">>=" ">>>=" "&=" "|=" "^=" "&&=" "||=" "??="))
 (defparameter *nullish-op* "??")        ; parsed with logical precedence
+(defvar *no-in* nil)          ; NoIn context: `in` is NOT a binary op (for-in head LHS)
 
 (defun parse-program (src)
-  (let ((*toks* (tokenize src)) (*pos* 0) (stmts '()))
-    (loop until (eq (cur-type) :eof) do (push (parse-stmt) stmts))
-    (list :block (nreverse stmts))))
+  (multiple-value-bind (toks escaped) (tokenize src)
+    (let ((*toks* toks) (*escaped-idents* escaped) (*pos* 0) (stmts '()))
+      (loop until (eq (cur-type) :eof) do (push (parse-stmt) stmts))
+      (list :block (nreverse stmts)))))
 
 ;;; ---- statements ----
 (defun parse-stmt ()
@@ -121,9 +130,12 @@
                               do (let ((n2 (parse-binding-target)))
                                    (push (cons n2 (when (opt "=") (parse-expr 2))) decls)))
                         (setf init (list :var decl-kind (nreverse decls))))))))
-          (t (let ((e (parse-expr 1)))
+          (t (let ((e (let ((*no-in* t)) (parse-expr 1))))
                (cond ((or (kw? "in") (kw? "of"))
                       (let ((kind (cur-val))) (adv)
+                        (unless (assignable-target-p e "=")
+                          (js-throw (make-native-error "SyntaxError"
+                                     "Invalid left-hand side in for-in/of")))
                         (let ((obj (parse-expr 1))) (eat ")")
                           (return-from parse-for-tail
                             (list (cond ((string= kind "in") :for-in) (await :for-await-of) (t :for-of))
@@ -177,7 +189,7 @@
   (cond
     ((punct? "[") (parse-array-pattern))
     ((punct? "{") (parse-object-pattern))
-    ((eq (cur-type) :ident) (prog1 (cur-val) (adv)))
+    ((eq (cur-type) :ident) (check-escaped-ident) (prog1 (cur-val) (adv)))
     (t (js-throw (make-native-error "SyntaxError" "Invalid binding target")))))
 
 ;;; ---- destructuring patterns ----
@@ -374,8 +386,12 @@
           ((and (punct? "?") (>= 2 min-bp))
            (adv) (let ((then (parse-expr 1))) (eat ":")
                    (setf left (list :cond left then (parse-expr 2)))))
-          ;; instanceof / in (keyword operators, relational precedence)
-          ((and (eq tt :ident) (member tv '("instanceof" "in") :test #'string=) (>= 9 min-bp))
+          ;; instanceof / in (keyword operators, relational precedence). In a NoIn
+          ;; context (for-in head LHS), `in` is not consumed as a binary op so the
+          ;; for-tail can recognize it as the iteration keyword.
+          ((and (eq tt :ident) (string= tv "instanceof") (>= 9 min-bp))
+           (adv) (setf left (list :bin tv left (parse-expr 10))))
+          ((and (eq tt :ident) (string= tv "in") (>= 9 min-bp) (not *no-in*))
            (adv) (setf left (list :bin tv left (parse-expr 10))))
           ;; nullish coalescing ?? (logical, short-circuits on null/undefined)
           ((and (eq tt :punct) (string= tv "??") (>= 5 min-bp))
@@ -427,19 +443,19 @@
           ((punct? "?.")
            (adv)
            (cond ((punct? "(") (setf e (list :ocall e (parse-args))))    ; ?.( args )
-                 ((punct? "[") (adv) (let ((k (parse-expr 1))) (eat "]")
+                 ((punct? "[") (adv) (let ((k (let ((*no-in* nil)) (parse-expr 1)))) (eat "]")
                                        (setf e (list :omember e k t))))  ; ?.[ expr ]
                  ((private-name-token-p)
                   (setf e (list :oprivate-member e (prog1 (cur-val) (adv)))))
                  (t (setf e (list :omember e (list :str (cur-val)) nil)) (adv)))) ; ?.ident
-          ((punct? "[") (adv) (let ((k (parse-expr 1))) (eat "]") (setf e (list :member e k t))))
+          ((punct? "[") (adv) (let ((k (let ((*no-in* nil)) (parse-expr 1)))) (eat "]") (setf e (list :member e k t))))
           ((and allow-call (punct? "(")) (setf e (list :call e (parse-args))))
           ((eq (cur-type) :template)                                     ; tagged template
            (setf e (list :tagged-template e (parse-template-node))))
           (t (return e)))))
 
 (defun parse-args ()
-  (eat "(") (let ((args '()))
+  (eat "(") (let ((args '()) (*no-in* nil))
               (loop until (punct? ")") do
                 (if (punct? "...")
                     (progn (adv) (push (list :spread (parse-expr 2)) args))
@@ -450,7 +466,7 @@
 (defun parse-array-literal ()
   "Array literal with holes ([1,,3] -> nil element) and spread ([...a])."
   (eat "[")
-  (let ((elems '()))
+  (let ((elems '()) (*no-in* nil))
     (loop until (punct? "]") do
       (cond
         ((punct? ",") (push nil elems) (adv))         ; elision
@@ -492,6 +508,7 @@
        ;; `await` is a reserved word (not a usable identifier) in async context.
        (when (and *in-async* (string= tv "await"))
          (js-throw (make-native-error "SyntaxError" "await is reserved in async functions")))
+       (check-escaped-ident)      ; an escaped reserved word can't be an Identifier
        (adv) (if (punct? "=>")                  ; id => body  (arrow)
                  (progn (adv) (list :arrow (list tv) (parse-arrow-body)))
                  (list :ident tv)))
@@ -562,7 +579,7 @@
   ;; ( ... ); if followed by =>, its contents are arrow params (which may include
   ;; defaults, rest, and destructuring patterns). Speculatively parse as a param
   ;; list; on failure, backtrack and parse as a parenthesized expression.
-  (let ((start *pos*))
+  (let ((start *pos*) (*no-in* nil))
     (or (ignore-errors
           (eat "(")
           (let ((params (parse-param-list)))
@@ -618,7 +635,7 @@
 
 (defun parse-object-literal ()
   (eat "{")
-  (let ((props '()))
+  (let ((props '()) (*no-in* nil))
     (loop until (punct? "}") do
       (cond
         ;; spread: ...expr

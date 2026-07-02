@@ -100,13 +100,13 @@
           (return nil)))))          ; first non-string-literal stmt ends the prologue
 
 (defun compile-fn (name params body &optional toplevel (this-mode :normal) (constructable t))
-  ;; A function whose body opens with "use strict" is strict: its `this` is NOT
-  ;; substituted (undefined stays undefined). We otherwise can't track strict mode,
-  ;; so sloppy substitution is the default. (Arrows keep :lexical regardless.)
-  (when (and (eq this-mode :normal) (directive-prologue-strict-p body))
-    (setf this-mode :strict))
-  ;; strict is inherited from enclosing code OR triggered by our own "use strict".
+  ;; A strict function's `this` is NOT substituted (undefined stays undefined):
+  ;; strict is triggered by the body's own "use strict" prologue OR inherited from
+  ;; enclosing strict code. sloppy substitution is the default. (Arrows keep
+  ;; :lexical regardless — they inherit `this` from the definition site.)
   (let ((*strict* (or *strict* (directive-prologue-strict-p body))))
+  (when (and (eq this-mode :normal) *strict*)
+    (setf this-mode :strict))
   (let ((*out* '()) (pnames (param-names params)))
     ;; strict early error: duplicate parameter names are a SyntaxError.
     (when *strict* (check-no-duplicate-params params))
@@ -132,6 +132,8 @@
    deferred body. Returns a CODE whose INST-INSTRS is the instantiation stream and
    INSTRS is the body; both run against the SAME function environment."
   (let ((*strict* (or *strict* (directive-prologue-strict-p body))))
+  (when (and (eq this-mode :normal) *strict*)
+    (setf this-mode :strict))
   (let ((pnames (param-names params)) (inst nil))
     (let ((*out* '()))
       (compile-params params)
@@ -501,11 +503,10 @@
   (cond ((eq (car head) :var)
          (let ((tgt (car (first (third head)))))
            (if (stringp tgt) (em :declare-var tgt) (bind-target tgt))))
-        ((eq (car head) :ident) (em :set-var (second head)) (em :pop))
-        ((member (car head) '(:member))            ; obj.p / obj[k] loop target
-         (compile-assign-pattern head) (em :pop))
+        ((member (car head) '(:ident :member :private-member))  ; simple LHS loop target
+         (assign-to-target head))
         ((member (car head) '(:array :object))     ; destructuring assignment target
-         (compile-assign-pattern head) (em :pop))
+         (compile-assign-pattern head))
         (t (js-throw (make-native-error "SyntaxError" "unsupported for-in/of target")))))
 
 (defun compile-for-in (node)
@@ -619,12 +620,20 @@
               (progn (mapc #'compile-expr (third node)) (em :new (length (third node))))))
     (:array (compile-array-literal (second node)))
     (:object (compile-object-literal (second node)))
-    (:func (em :closure (compile-fn (second node) (third node) (fourth node))))
+    (:func (if (second node)
+               (em :named-closure (compile-fn (second node) (third node) (fourth node)) (second node))
+               (em :closure (compile-fn (second node) (third node) (fourth node)))))
     ;; concise/accessor method: ordinary this-mode (sloppy substitution) but not constructable
     (:method-func (em :closure (compile-fn (second node) (third node) (fourth node) nil :normal nil)))
-    (:genfunc (em :genclosure (compile-fn-split (second node) (third node) (fourth node))))
-    (:asyncfunc (em :asyncclosure (compile-fn-split (second node) (third node) (fourth node))))
-    (:asyncgenfunc (em :asyncgenclosure (compile-fn-split (second node) (third node) (fourth node))))
+    (:genfunc (if (second node)
+                  (em :named-genclosure (compile-fn-split (second node) (third node) (fourth node)) (second node))
+                  (em :genclosure (compile-fn-split (second node) (third node) (fourth node)))))
+    (:asyncfunc (if (second node)
+                    (em :named-asyncclosure (compile-fn-split (second node) (third node) (fourth node)) (second node))
+                    (em :asyncclosure (compile-fn-split (second node) (third node) (fourth node)))))
+    (:asyncgenfunc (if (second node)
+                       (em :named-asyncgenclosure (compile-fn-split (second node) (third node) (fourth node)) (second node))
+                       (em :asyncgenclosure (compile-fn-split (second node) (third node) (fourth node)))))
     (:arrow (em :closure (compile-fn nil (second node) (third node) nil :lexical nil)))
     (:async-arrow (em :asyncclosure (compile-fn-split nil (second node) (third node) :lexical)))
     (:await (compile-expr (second node)) (em :await))

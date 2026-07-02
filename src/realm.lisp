@@ -482,7 +482,7 @@
   (put ap "length" 0d0 :enumerable nil :writable t :configurable nil)
   (let ((actor (native-function realm "Array"
                  (lambda (this args) (declare (ignore this)) (array-construct realm args)) 1)))
-    (setf (js-object-construct actor) (lambda (args nt) (declare (ignore nt)) (array-construct realm args)))
+    (setf (js-object-construct actor) (lambda (args nt) (array-construct realm args nt)))
     (def-value actor "prototype" ap :writable nil :configurable nil)
     (def-value ap "constructor" actor)
     (def-method realm actor "isArray" 1 (this args)
@@ -544,14 +544,20 @@
            :enumerable nil :writable t :configurable t)
       (def-method realm ap "values" 0 (this args) (make-array-iterator realm this)))))
 
-(defun array-construct (realm args)
-  (if (and (= (length args) 1) (floatp (first args)))
-      (let ((n (first args)))
-        (unless (and (= n (with-js-floats (ftruncate n))) (<= 0 n #xFFFFFFFF))
-          (js-throw (make-native-error "RangeError" "Invalid array length")))
-        (let ((o (make-object :proto (realm-array-proto realm) :class "Array")))
-          (put o "length" n :enumerable nil :writable t :configurable nil) o))
-      (make-array-object args)))
+(defun array-construct (realm args &optional new-target)
+  ;; OrdinaryCreateFromConstructor(newTarget, %Array.prototype%): a subclass'
+  ;; newTarget.prototype becomes the [[Prototype]] so `Reflect.construct(Array,[],Der)`
+  ;; is instanceof Der.
+  (let ((proto (let ((pp (and (js-object-p new-target) (js-get new-target "prototype"))))
+                 (if (js-object-p pp) pp (realm-array-proto realm)))))
+    (if (and (= (length args) 1) (floatp (first args)))
+        (let ((n (first args)))
+          (unless (and (= n (with-js-floats (ftruncate n))) (<= 0 n #xFFFFFFFF))
+            (js-throw (make-native-error "RangeError" "Invalid array length")))
+          (let ((o (make-object :proto proto :class "Array")))
+            (put o "length" n :enumerable nil :writable t :configurable nil) o))
+        (let ((o (make-array-object args)))
+          (setf (js-object-proto o) proto) o))))
 
 (defun clamp-index (v len default)
   (if (js-undefined-p v) default
