@@ -189,10 +189,16 @@
       (declare (ignore args))
       (instant-to-string realm (instant-ns this) *undefined* t))
 
-    ;; ---- toZonedDateTimeISO (ZonedDateTime not built this round) ----
+    ;; ---- toZonedDateTimeISO ----
+    ;; Dynamically dispatch to the realm's Temporal.ZonedDateTime if it is
+    ;; registered (the concurrent ZDT type lights this up without another edit);
+    ;; a clear TypeError otherwise.
     (def-method realm proto "toZonedDateTimeISO" 1 (this args)
-      (instant-ns this)   ; brand-check first
-      (js-throw (make-native-error "TypeError" "Temporal.ZonedDateTime is not implemented")))
+      (let ((ns (instant-ns this)))   ; brand-check first
+        (if (and (fboundp 'to-time-zone-identifier) (fboundp 'make-zoneddatetime))
+            (multiple-value-bind (tz-id offset) (funcall 'to-time-zone-identifier (arg 0 args))
+              (funcall 'make-zoneddatetime realm ns tz-id offset "iso8601"))
+            (js-throw (make-native-error "TypeError" "Temporal.ZonedDateTime is not available")))))
 
     ;; ---- valueOf: Temporal types are never primitives ----
     (def-method realm proto "valueOf" 0 (this args)

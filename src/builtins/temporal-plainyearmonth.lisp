@@ -270,30 +270,12 @@
 ;;; ===========================================================================
 (defun yearmonth-difference-settings (op options)
   "GetDifferenceSettings for PlainYearMonth: allowed units are year/month only,
-   smallestUnit default :month, largestUnit default (auto ->) :year. Reads
-   largestUnit, roundingIncrement, roundingMode, smallestUnit in spec order.
-   Year/month rounding increments are UNBOUNDED (no divide-evenly check), so we do
-   not route through the kernel's get-difference-settings which enforces that."
-  (let* ((all-units '(:year :month :week :day :hour :minute :second
-                      :millisecond :microsecond :nanosecond))
-         (largest (get-temporal-unit options "largestUnit" :datetime nil
-                                     all-units '(("auto" . :auto))))
-         (increment (get-rounding-increment options))
-         (mode (get-rounding-mode options :trunc))
-         (smallest (get-temporal-unit options "smallestUnit" :datetime nil all-units)))
-    (when (and largest (not (eq largest :auto)) (not (member largest '(:year :month))))
-      (js-throw (make-native-error "RangeError" "largestUnit not allowed here")))
-    (when (and smallest (not (member smallest '(:year :month))))
-      (js-throw (make-native-error "RangeError" "smallestUnit not allowed here")))
-    (when (eq op :since) (setf mode (negate-rounding-mode mode)))
-    (let* ((sm (or smallest :month))
-           (lg (cond ((or (null largest) (eq largest :auto)) :year)
-                     (t largest))))
-      (when (< (unit-rank sm) (unit-rank lg))
-        (js-throw (make-native-error "RangeError" "smallestUnit is coarser than largestUnit")))
-      ;; Increment must be a positive integer; no upper bound / divide check.
-      (validate-rounding-increment increment most-positive-fixnum t)
-      (values sm lg increment mode))))
+   smallestUnit default :month, largestUnit default (auto ->) :year. Year/month
+   rounding increments are UNBOUNDED; the kernel's get-difference-settings now
+   parameterizes that via a NIL max-increment for calendar units."
+  (get-difference-settings op options :month :year
+                           '(:year :month) '(:year :month)
+                           (lambda (unit) (declare (ignore unit)) nil)))
 
 (defun yearmonth-difference (realm this args op)
   (let* ((this-date (pym-iso-date this))

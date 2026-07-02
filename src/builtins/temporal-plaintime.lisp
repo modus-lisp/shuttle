@@ -170,6 +170,11 @@
             (bag (arg 0 args)))
         (unless (js-object-p bag)
           (js-throw (make-native-error "TypeError" "with() argument must be an object")))
+        ;; Reject any Temporal-branded object (PlainDate/PlainTime/PlainDateTime/
+        ;; PlainYearMonth/PlainMonthDay/ZonedDateTime/Duration/Instant): a
+        ;; PlainTimeLike bag must be a plain property bag, per ToTemporalTimeRecord.
+        (when (temporal-branded-object-p bag)
+          (js-throw (make-native-error "TypeError" "with() argument must be a plain object, not a Temporal instance")))
         ;; RejectObjectWithCalendarOrTimeZone (calendar then timeZone) precedes
         ;; the field reads, which precede the options read.
         (reject-calendar-or-timezone bag)
@@ -224,9 +229,13 @@
                                                     '(:hour :minute :second :millisecond :microsecond :nanosecond))))
                   (values smallest increment mode)))
           (let* ((unit-ns (plaintime-unit->ns smallest))
-                 (max (floor +ns-per-day+ unit-ns)))
-            ;; PlainTime.round: the increment must be < the count of smallestUnit
-            ;; in a day (exclusive) AND divide it evenly.
+                 ;; PlainTime.round: the increment must be < the count of
+                 ;; smallestUnit in the NEXT-COARSER unit (hours->24 per day,
+                 ;; minutes->60, seconds->60, sub-second->1000) AND divide it
+                 ;; evenly. (Using minutes-in-a-DAY, etc. would wrongly accept 60.)
+                 (max (ecase smallest
+                        (:hour 24) (:minute 60) (:second 60)
+                        (:millisecond 1000) (:microsecond 1000) (:nanosecond 1000))))
             (validate-rounding-increment increment max nil)
             (when (/= 0 (mod max increment))
               (js-throw (make-native-error "RangeError" "increment does not divide evenly")))

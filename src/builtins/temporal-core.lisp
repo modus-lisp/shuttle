@@ -543,10 +543,11 @@
             (list :hour hh :minute mm :second ss :ms msv :us usv :ns nsv)))))))
 
 (defun parse-annotations (p)
-  "Parse zero or more [...] annotations. Returns the calendar id (string) or NIL.
-   Handles critical flag '!' and [u-ca=...]. A critical unknown annotation is a
-   RangeError; a non-critical unknown one is ignored. A non-iso8601 calendar is
-   a RangeError."
+  "Parse zero or more [...] annotations. Returns (values calendar-id critical)
+   where CALENDAR-ID is the first [u-ca=VALUE] value (string) or NIL, and
+   CRITICAL is T if any calendar annotation carried the '!' critical flag.
+   Handles the critical flag and time-zone annotations. A critical unknown
+   annotation is a RangeError; a non-critical unknown one is ignored."
   (let ((calendar nil) (tz-count 0) (cal-count 0) (cal-critical nil))
     (flet ((valid-akey (s)     ; annotation key: [a-z_][a-z0-9_-]*
              (and (plusp (length s))
@@ -582,15 +583,18 @@
                 (t
                  ;; Bare annotation = a time-zone annotation (e.g. [UTC], [+01:00],
                  ;; [NotATimeZone]). At most one is allowed. An offset-form TZ
-                 ;; annotation must be minute-or-second precision — a fractional
-                 ;; (sub-second) offset is NOT a valid time-zone identifier.
+                 ;; annotation must be MINUTE precision — a sub-minute offset (any
+                 ;; seconds and/or fractional-seconds component, e.g. [-07:00:01]
+                 ;; or [-07:00:00.5]) is NOT a valid time-zone identifier.
                  (incf tz-count)
                  (when (> tz-count 1) (p-fail))
                  (when (and (plusp (length content))
-                            (member (char content 0) '(#\+ #\-))
-                            (find #\. content))
-                   (p-fail)))))))))
-    calendar))
+                            (member (char content 0) '(#\+ #\-)))
+                   (multiple-value-bind (off nx sub)
+                       (parse-offset-string content 0 (length content))
+                     (when (and off (= nx (length content)) sub)
+                       (p-fail)))))))))))
+    (values calendar cal-critical)))
 
 (defun parse-iso-datetime (s kind)
   "Parse a Temporal date/datetime string. KIND selects the accepted shape:
@@ -602,7 +606,7 @@
   (let* ((p (make-pstate :str s :pos 0 :len (length s)))
          (year nil) (month 1) (day 1) (t-designator nil)
          (time nil) (offset nil) (z nil) (offset-present nil) (offset-sub-minute nil)
-         (date-present nil) (time-present nil))
+         (date-present nil) (time-present nil) (calendar nil) (calendar-critical nil))
     ;; Optional leading date.
     (when (and (not (eq kind :time))
                (member (p-peek p) '(#\+ #\-) :test #'eql))
@@ -640,8 +644,9 @@
          (multiple-value-bind (off nx sub) (parse-offset-string s (pstate-pos p))
            (unless off (p-fail))
            (setf offset off offset-present t offset-sub-minute sub (pstate-pos p) nx)))))
-    ;; Annotations.
-    (parse-annotations p)
+    ;; Annotations — surface the [u-ca=...] calendar id (+ its critical flag).
+    (multiple-value-bind (cal cal-critical) (parse-annotations p)
+      (setf calendar cal calendar-critical cal-critical))
     ;; Must be fully consumed.
     (unless (p-eof p) (p-fail))
     ;; KIND-specific requirements.
@@ -659,6 +664,7 @@
           :ns (if time (getf time :ns) 0)
           :offset offset :z z :offset-present offset-present
           :offset-sub-minute offset-sub-minute
+          :calendar calendar :calendar-critical calendar-critical
           :time-present time-present :date-present date-present
           :t-designator t-designator)))
 
@@ -745,34 +751,39 @@
                                :microseconds 0 :nanoseconds 0))
 
 (defun parse-temporal-duration (s)
-  "Parse an ISO-8601 duration string (P[n]Y[n]M[n]W[n]D[T[n]H[n]M[n]S], with the
-   final component of each of H/M/S optionally fractional). Returns a duration
-   plist. RangeError on malformed."
+  "Parse an ISO-8601 duration string (P[n]Y[n]M[n]W[n]D[T[n]H[n]M[n]S]). A
+   fraction is allowed ONLY on the final present component of H/M/S (and never on
+   a date unit); the fractional value CASCADES down the finer time units
+   (hours->minutes->seconds->subsecond, minutes->seconds->subsecond,
+   seconds->subsecond), exactly per the spec — NOT dumped into seconds. Returns a
+   duration plist. RangeError on malformed. This is the single duration-string
+   parser for the whole Temporal surface."
   (let* ((s (string-trim '(#\Space #\Tab #\Newline #\Return) s))
          (p (make-pstate :str s :pos 0 :len (length s)))
          (sign 1))
     (case (p-peek p) (#\+ (incf (pstate-pos p))) ((#\-) (setf sign -1) (incf (pstate-pos p))))
     (unless (p-char p #\P) (p-fail))
     (let ((years 0) (months 0) (weeks 0) (days 0)
-          (hours 0) (minutes 0) (seconds 0) (frac 0)
-          (any nil) (in-time nil) (seen-frac nil))
+          (hours 0) (minutes 0) (seconds 0) (sub-ns 0)
+          (any nil) (in-time nil) (frac-used nil))
       (labels ((read-num ()
-                 "Read an unsigned integer (+ optional fraction after . or ,).
-                  Returns (values int-part frac-ns-per-unit-flag frac-rational)."
+                 "Read an unsigned integer + optional fraction after . or ,.
+                  Returns (values int-part frac-rational had-fraction)."
                  (let ((start (pstate-pos p)) (v 0) (n 0))
                    (loop while (and (p-peek p) (digit-char-p (p-peek p)))
                          do (setf v (+ (* v 10) (digit-char-p (p-peek p)))) (incf (pstate-pos p)) (incf n))
-                   (when (zerop n) (setf (pstate-pos p) start) (return-from read-num nil))
-                   (let ((fr 0))
+                   (when (zerop n) (setf (pstate-pos p) start) (return-from read-num (values nil 0 nil)))
+                   (let ((fr 0) (had nil))
                      (when (member (p-peek p) '(#\. #\,))
-                       (incf (pstate-pos p))
+                       (incf (pstate-pos p)) (setf had t)
                        (let ((num 0) (den 1) (fn 0))
                          (loop while (and (p-peek p) (digit-char-p (p-peek p)))
                                do (setf num (+ (* num 10) (digit-char-p (p-peek p))) den (* den 10))
                                   (incf (pstate-pos p)) (incf fn))
-                         (when (zerop fn) (p-fail))
-                         (setf fr (/ num den) seen-frac t)))
-                     (values v fr)))))
+                         ;; 1..9 fractional digits only (ISO Temporal grammar).
+                         (when (or (zerop fn) (> fn 9)) (p-fail))
+                         (setf fr (/ num den))))
+                     (values v fr had)))))
         (loop
           (let ((c (p-peek p)))
             (cond
@@ -780,39 +791,45 @@
               ((and (not in-time) (member c '(#\T #\t)))
                (incf (pstate-pos p)) (setf in-time t))
               (t
-               (multiple-value-bind (v fr) (read-num)
+               ;; Nothing may follow a fractional component.
+               (when frac-used (p-fail))
+               (multiple-value-bind (v fr had) (read-num)
                  (unless v (p-fail))
-                 (when (and seen-frac (or (plusp fr)))
-                   ;; fraction only allowed on last component; enforce below
-                   )
                  (let ((desig (p-peek p)))
                    (unless desig (p-fail))
                    (incf (pstate-pos p))
                    (setf any t)
+                   (when had (setf frac-used t))
                    (if (not in-time)
+                       (progn
+                         (when (plusp fr) (p-fail))  ; date units may not be fractional
+                         (case (char-upcase desig)
+                           (#\Y (setf years v)) (#\M (setf months v))
+                           (#\W (setf weeks v)) (#\D (setf days v))
+                           (t (p-fail))))
                        (case (char-upcase desig)
-                         (#\Y (when (plusp fr) (p-fail)) (setf years v))
-                         (#\M (when (plusp fr) (p-fail)) (setf months v))
-                         (#\W (when (plusp fr) (p-fail)) (setf weeks v))
-                         (#\D (when (plusp fr) (p-fail)) (setf days v))
-                         (t (p-fail)))
-                       (case (char-upcase desig)
-                         (#\H (setf hours v) (when (plusp fr) (incf frac (* fr +ns-per-hour+))))
-                         (#\M (setf minutes v) (when (plusp fr) (incf frac (* fr +ns-per-min+))))
-                         (#\S (setf seconds v) (when (plusp fr) (incf frac (* fr +ns-per-s+))))
+                         (#\H (setf hours v)
+                              (when (plusp fr)
+                                ;; cascade: frac hours -> minutes -> seconds -> subsec
+                                (let* ((fm (* fr 60)) (wm (floor fm)))
+                                  (setf minutes wm)
+                                  (let* ((fs (* (- fm wm) 60)) (ws (floor fs)))
+                                    (setf seconds ws sub-ns (floor (* (- fs ws) +ns-per-s+)))))))
+                         (#\M (setf minutes v)
+                              (when (plusp fr)
+                                (let* ((fs (* fr 60)) (ws (floor fs)))
+                                  (setf seconds ws sub-ns (floor (* (- fs ws) +ns-per-s+))))))
+                         (#\S (setf seconds v)
+                              (when (plusp fr)
+                                (setf sub-ns (floor (* fr +ns-per-s+)))))
                          (t (p-fail)))))))))))
       (unless any (p-fail))
-      ;; Distribute the fractional-time-part ns into s/ms/us/ns.
-      (let* ((extra (round frac))
-             (ns (mod extra 1000))
-             (us (mod (floor extra 1000) 1000))
-             (ms (mod (floor extra 1000000) 1000))
-             (s2 (floor extra 1000000000)))
-        (flet ((m (x) (* sign x)))
-          (list :years (m years) :months (m months) :weeks (m weeks) :days (m days)
-                :hours (m hours) :minutes (m minutes)
-                :seconds (m (+ seconds s2))
-                :milliseconds (m ms) :microseconds (m us) :nanoseconds (m ns)))))))
+      (multiple-value-bind (ms r1) (floor sub-ns +ns-per-ms+)
+        (multiple-value-bind (us ns) (floor r1 +ns-per-us+)
+          (flet ((m (x) (* sign x)))
+            (list :years (m years) :months (m months) :weeks (m weeks) :days (m days)
+                  :hours (m hours) :minutes (m minutes) :seconds (m seconds)
+                  :milliseconds (m ms) :microseconds (m us) :nanoseconds (m ns))))))))
 
 (defun duration-time-ns (d)
   "Total nanoseconds of the time components (hours..nanoseconds), exact."
@@ -839,15 +856,20 @@
     d))
 
 (defun validate-duration-range (d)
-  "IsValidDuration magnitude limits: each of years/months/weeks/days must be <
-   2^32 in magnitude, and the total time (days..nanoseconds, expressed in
-   seconds) must be < 2^53. RangeError otherwise. Returns D."
-  (dolist (f '(:years :months :weeks :days))
+  "IsValidDuration: sign coherence + magnitude limits. Only years/months/weeks
+   are bounded by 2^32 in magnitude; DAYS is bounded solely by the total-time
+   limit — the total time (days..nanoseconds, expressed in seconds) must be <
+   2^53. RangeError otherwise. Returns D. This is the single IsValidDuration
+   used by the whole Temporal surface."
+  (validate-duration d)
+  (dolist (f '(:years :months :weeks))
     (when (>= (abs (getf d f)) 4294967296)
       (js-throw (make-native-error "RangeError" "duration component out of range"))))
-  (let* ((total-ns (+ (* (getf d :days) +ns-per-day+) (duration-time-ns d)))
-         (total-s (truncate (abs total-ns) +ns-per-s+)))
-    (when (>= total-s (expt 2 53))
+  ;; The total time (days as 24h + time part) in seconds must be strictly < 2^53
+  ;; in magnitude. Max valid is 9007199254740991.999999999 s, so compare the exact
+  ;; ns total to 2^53 * 1e9.
+  (let ((total-ns (+ (* (getf d :days) +ns-per-day+) (duration-time-ns d))))
+    (when (>= (abs total-ns) (* (expt 2 53) +ns-per-s+))
       (js-throw (make-native-error "RangeError" "duration out of range"))))
   d)
 
@@ -964,11 +986,20 @@
       ;; largestUnit must be at least as coarse as smallestUnit.
       (when (< (unit-rank sm) (unit-rank lg))
         (js-throw (make-native-error "RangeError" "smallestUnit is coarser than largestUnit")))
-      ;; The increment must divide evenly into the next-coarser unit (and be < it).
+      ;; Increment validation. Calendar units (year/month/week/day) are unbounded
+      ;; per spec — ValidateTemporalRoundingIncrement is called with the count of
+      ;; the smallest unit in the next-coarser unit ONLY for time units (where the
+      ;; increment must also divide evenly into that count). MAX-INCREMENT returns
+      ;; NIL for a calendar unit (meaning: only require increment >= 1).
       (let ((maximum (funcall max-increment sm)))
-        (validate-rounding-increment increment maximum nil)
-        (when (/= 0 (mod maximum increment))
-          (js-throw (make-native-error "RangeError" "roundingIncrement does not divide evenly"))))
+        (cond
+          (maximum
+           (validate-rounding-increment increment maximum nil)
+           (when (/= 0 (mod maximum increment))
+             (js-throw (make-native-error "RangeError" "roundingIncrement does not divide evenly"))))
+          (t
+           ;; Unbounded calendar unit: just require a positive integer.
+           (validate-rounding-increment increment most-positive-fixnum t))))
       (values sm lg increment mode))))
 
 (defun unit-rank (unit)
@@ -1012,6 +1043,19 @@
   "Stamp SLOT (a keyword) = VALUE on O's internal plist."
   (setf (getf (js-object-internal o) slot) value)
   o)
+
+(defparameter +temporal-brand-slots+
+  '(:temporal-instant :temporal-plaintime :temporal-plaindate :temporal-plaindatetime
+    :temporal-plainyearmonth :temporal-plainmonthday :temporal-zoneddatetime
+    :temporal-duration)
+  "The internal-slot keywords that brand a Temporal instance.")
+
+(defun temporal-branded-object-p (v)
+  "T if V is an object carrying any Temporal type brand (used to reject a Temporal
+   instance where a plain property bag is required, e.g. PlainXxx.prototype.with)."
+  (and (js-object-p v)
+       (some (lambda (slot) (not (eq (getf (js-object-internal v) slot 'none) 'none)))
+             +temporal-brand-slots+)))
 
 (defun temporal-slot (this slot type-name)
   "RequireInternalSlot: read SLOT off THIS or TypeError with TYPE-NAME."

@@ -21,88 +21,25 @@
   (and (<= 1 m 12) (<= 1 d (days-in-month y m))))
 
 (defun pdt-regulate-iso-date (y m d overflow)
-  "RegulateISODate: :constrain clamps month to 1..12 then day to that month's
-   range; :reject RangeErrors on any out-of-range field. Returns an iso-date."
-  (ecase overflow
-    (:constrain
-     (let* ((mm (max 1 (min 12 m)))
-            (dd (max 1 (min (days-in-month y mm) d))))
-       (make-iso-date y mm dd)))
-    (:reject
-     (unless (pdt-valid-iso-date-p y m d)
-       (js-throw (make-native-error "RangeError" "date field out of range")))
-     (make-iso-date y m d))))
-
-(defun pdt-balance-iso-date (y m d)
-  "BalanceISODate: normalize a possibly out-of-range (m may be <1 or >12, d may
-   be anything) date into a canonical iso-date via day arithmetic."
-  ;; First balance the month into the year.
-  (multiple-value-bind (yy mm0) (floor (+ (1- m) (* 12 y)) 12)
-    (let* ((mm (1+ mm0))
-           ;; epoch-days of (yy mm 1) then add (d-1) days.
-           (days (+ (iso-date->epoch-days (make-iso-date yy mm 1)) (1- d))))
-      (epoch-days->iso-date days))))
+  "RegulateISODate — delegates to PlainDate's regulate-iso-date (behavior-identical:
+   :constrain clamps month then day; :reject RangeErrors any out-of-range field).
+   Kept as a thin wrapper because PlainDateTime + the concurrent ZonedDateTime call
+   it by the y/m/d-arg name."
+  (regulate-iso-date y m d overflow))
 
 (defun pdt-add-iso-date (y m d years months weeks days overflow)
-  "AddISODate: add a calendar duration (years/months/weeks/days) to an ISO date.
-   Years+months are added to the year/month then RegulateISODate constrains the
-   day; weeks+days are added as plain days afterward."
-  (let* ((ym (+ (* y 12) (1- m) (* years 12) months))
-         (yy (floor ym 12))
-         (mm (1+ (mod ym 12)))
-         ;; regulate the (yy mm d) into range first
-         (reg (pdt-regulate-iso-date yy mm d overflow))
-         (extra-days (+ (* weeks 7) days))
-         (total (+ (iso-date->epoch-days reg) extra-days)))
-    (epoch-days->iso-date total)))
-
-(defun pdt-days-until (y1 m1 d1 y2 m2 d2)
-  (- (iso-date->epoch-days (make-iso-date y2 m2 d2))
-     (iso-date->epoch-days (make-iso-date y1 m1 d1))))
+  "AddISODate — delegates to PlainDate's add-iso-date (behavior-identical: y/m
+   added+regulated, then weeks*7+days via epoch-day arithmetic). Thin y/m/d-arg
+   wrapper around the iso-date-record API."
+  (add-iso-date (make-iso-date y m d) years months weeks days overflow))
 
 (defun pdt-difference-iso-date (y1 m1 d1 y2 m2 d2 largest-unit)
-  "DifferenceISODate: the difference date2 - date1 as a (values years months
-   weeks days). LARGEST-UNIT is one of :year :month :week :day. Follows the
-   spec's estimate-then-correct calendar-difference algorithm for iso8601."
-  (ecase largest-unit
-    ((:year :month)
-     (let ((sign (cond ((< (pdt-cmp-date y1 m1 d1 y2 m2 d2) 0) 1)
-                       ((> (pdt-cmp-date y1 m1 d1 y2 m2 d2) 0) -1)
-                       (t 0))))
-       (if (zerop sign)
-           (values 0 0 0 0)
-           ;; Work entirely in whole months of offset from date1. Estimate the
-           ;; total-month offset, correct it so the intermediate does not pass
-           ;; date2, then take the leftover days. Split into years+months only
-           ;; when year-largest.
-           (labels ((intermediate (mos)
-                      ;; date1 + MOS months, day constrained into the target month.
-                      (let* ((tot (+ (* y1 12) (1- m1) mos))
-                             (iy (floor tot 12)) (im (1+ (mod tot 12)))
-                             (id (min d1 (days-in-month iy im))))
-                        (values iy im id))))
-             (let ((mtotal (- (+ (* y2 12) m2) (+ (* y1 12) m1))))
-               ;; Correct for overshoot: if the intermediate has passed date2 in
-               ;; the sign direction (signum c = sign), step one month back. This
-               ;; runs at most a couple iterations (the day-constrain can only
-               ;; shift the boundary by ~1 month).
-               (loop
-                 (multiple-value-bind (iy im id) (intermediate mtotal)
-                   (let ((c (pdt-cmp-date iy im id y2 m2 d2)))
-                     (if (= (signum c) sign)
-                         (decf mtotal sign)
-                         (return)))))
-               (multiple-value-bind (iy im id) (intermediate mtotal)
-                 (let ((days (pdt-days-until iy im id y2 m2 d2)))
-                   (if (eq largest-unit :month)
-                       (values 0 mtotal 0 days)
-                       (values (truncate mtotal 12) (rem mtotal 12) 0 days)))))))))
-    ((:week :day)
-     (let ((days (pdt-days-until y1 m1 d1 y2 m2 d2)))
-       (if (eq largest-unit :week)
-           (multiple-value-bind (w rem) (truncate days 7)
-             (values 0 0 w rem))
-           (values 0 0 0 days))))))
+  "DifferenceISODate — delegates to PlainDate's difference-iso-date (which returns
+   a duration plist) and unpacks to (values years months weeks days). Thin
+   y/m/d-arg wrapper; behavior verified identical against the test262 gate."
+  (let ((dur (difference-iso-date (make-iso-date y1 m1 d1) (make-iso-date y2 m2 d2)
+                                  largest-unit)))
+    (values (getf dur :years) (getf dur :months) (getf dur :weeks) (getf dur :days))))
 
 (defun pdt-cmp-date (y1 m1 d1 y2 m2 d2)
   "-1/0/1 comparing two ISO dates."
@@ -269,31 +206,13 @@
                       (js-throw (make-native-error "RangeError" "invalid calendar string")))))))
        (unless (eq r :reduced)
          (when (or (getf r :offset-present) (getf r :z))
-           (js-throw (make-native-error "RangeError" "a calendar string may not carry a time zone"))))
-       ;; The [u-ca=...] annotation (if any) must name iso8601. Extract it
-       ;; directly since the core parser doesn't surface it.
-       (let ((cal (pdt-extract-calendar-annotation s)))
-         (when (and cal (not (string-equal cal "iso8601")))
-           (js-throw (make-native-error "RangeError" "only the iso8601 calendar is supported"))))))))
-
-(defun pdt-extract-calendar-annotation (s)
-  "Return the first [u-ca=VALUE] (or [!u-ca=VALUE]) annotation VALUE in S, or NIL
-   if none. Used because the core parser doesn't surface the calendar in its
-   result plist. VALUE is returned as-is (the caller validates it)."
-  (let ((pos 0) (n (length s)))
-    (loop
-      (let ((open (position #\[ s :start pos)))
-        (unless open (return nil))
-        (let ((close (position #\] s :start open)))
-          (unless close (return nil))
-          (let* ((inner (subseq s (1+ open) close))
-                 (inner (if (and (plusp (length inner)) (char= (char inner 0) #\!))
-                            (subseq inner 1) inner))
-                 (eq (position #\= inner)))
-            (when (and eq (string= (subseq inner 0 eq) "u-ca"))
-              (return (subseq inner (1+ eq)))))
-          (setf pos (1+ close))))
-      (when (>= pos n) (return nil)))))
+           (js-throw (make-native-error "RangeError" "a calendar string may not carry a time zone")))
+         ;; The [u-ca=...] annotation (if any) must name iso8601. The core parser
+         ;; now surfaces it in :calendar. (The :reduced branch already validated
+         ;; its annotation to be null-or-iso8601 in pdt-reduced-date-string-p.)
+         (let ((cal (getf r :calendar)))
+           (when (and cal (not (string-equal cal "iso8601")))
+             (js-throw (make-native-error "RangeError" "only the iso8601 calendar is supported")))))))))
 
 (defun pdt-reduced-date-string-p (s)
   "T if S is a reduced ISO calendar-date form (YYYY-MM, YYYY-MM-DD, MM-DD, or the
@@ -347,9 +266,8 @@
          (js-throw (make-native-error "RangeError" "a UTC designator is not valid for PlainDateTime")))
        ;; A [u-ca=...] annotation value must be exactly the iso8601 identifier
        ;; (a date-like string is NOT a valid annotation calendar, unlike a bag's
-       ;; calendar property). The core parser doesn't surface :calendar in its
-       ;; plist, so extract it from the string ourselves.
-       (let ((cal (pdt-extract-calendar-annotation v)))
+       ;; calendar property). The core parser surfaces it in :calendar.
+       (let ((cal (getf r :calendar)))
          (when (and cal (not (string-equal cal "iso8601")))
            (js-throw (make-native-error "RangeError" "only the iso8601 calendar is supported"))))
        (let ((date (make-iso-date (getf r :year) (getf r :month) (getf r :day)))
@@ -590,6 +508,8 @@
             (bag (arg 0 args)))
         (unless (js-object-p bag)
           (js-throw (make-native-error "TypeError" "with() argument must be an object")))
+        (when (temporal-branded-object-p bag)
+          (js-throw (make-native-error "TypeError" "with() argument must be a plain object, not a Temporal instance")))
         ;; RejectObjectWithCalendarOrTimeZone (calendar then timeZone).
         (reject-calendar-or-timezone bag)
         (let* ((date (getf slot :date)) (time (getf slot :time))
@@ -733,10 +653,25 @@
       (declare (ignore args))
       (make-temporal-plaintime realm (plaindatetime-time this)))
 
-    ;; ---- toZonedDateTime (B3 — ZonedDateTime deferred) ----
+    ;; ---- toZonedDateTime ----
+    ;; Dispatch dynamically to the realm's Temporal.ZonedDateTime if present (the
+    ;; concurrent ZDT type lights this up); a clear TypeError otherwise. The
+    ;; datetime is interpreted as wall-clock time in the given fixed-offset zone.
     (def-method realm proto "toZonedDateTime" 1 (this args)
-      (plaindatetime-slot this)   ; brand-check
-      (js-throw (make-native-error "TypeError" "Temporal.ZonedDateTime is not implemented")))
+      (let ((date (plaindatetime-date this))
+            (time (plaindatetime-time this)))
+        (unless (and (fboundp 'to-time-zone-identifier) (fboundp 'make-zoneddatetime))
+          (js-throw (make-native-error "TypeError" "Temporal.ZonedDateTime is not available")))
+        ;; options (disambiguation) is read/validated (observable) though a
+        ;; fixed-offset zone has no gaps or overlaps.
+        (let ((opts (get-options-object (arg 1 args))))
+          (when (fboundp 'get-disambiguation-option)
+            (funcall 'get-disambiguation-option opts)))
+        (multiple-value-bind (tz-id offset) (funcall 'to-time-zone-identifier (arg 0 args))
+          (let ((ns (- (iso-datetime->epoch-ns date time) offset)))
+            (unless (valid-epoch-ns-p ns)
+              (js-throw (make-native-error "RangeError" "ZonedDateTime out of range")))
+            (funcall 'make-zoneddatetime realm ns tz-id offset "iso8601")))))
 
     ;; ---- valueOf ----
     (def-method realm proto "valueOf" 0 (this args)
@@ -754,13 +689,12 @@
 ;;; helpers (post-install)
 ;;; ---------------------------------------------------------------------------
 (defun pdt-max-increment (unit)
-  ;; Calendar units (year/month/week/day) have no spec maximum on the difference
-  ;; rounding increment — only >= 1. The kernel's get-difference-settings still
-  ;; runs validate + a divisibility check against this value, so we return a
-  ;; large value that admits increment 1 (the only calendar increment the corpus
-  ;; exercises) while time units use their real next-coarser-unit counts.
+  ;; Calendar units (year/month/week/day) have NO spec maximum on the difference
+  ;; rounding increment — only >= 1. NIL tells get-difference-settings the unit is
+  ;; unbounded (skip the divide-evenly check). Time units use their real
+  ;; next-coarser-unit counts.
   (ecase unit
-    (:year 1000000000) (:month 1000000000) (:week 1000000000) (:day 1000000000)
+    ((:year :month :week :day) nil)
     (:hour 24) (:minute 60) (:second 60)
     (:millisecond 1000) (:microsecond 1000) (:nanosecond 1000)))
 

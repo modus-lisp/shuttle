@@ -62,8 +62,7 @@
     (flet ((try (kind pre)
              (handler-case
                  (let ((full (if pre (concatenate 'string pre s) s)))
-                   (parse-iso-datetime full kind)
-                   (list (or (extract-uca-annotation full) "iso8601")))
+                   (list (or (getf (parse-iso-datetime full kind) :calendar) "iso8601")))
                (shuttle-error () nil))))
       (let ((res (or (try :datetime nil)
                      (try :time nil)
@@ -96,8 +95,7 @@
                         (if (find #\- core) core
                             (concatenate 'string (subseq core 0 4) "-" (subseq core 4 6)))
                         "-01" (subseq s br))))
-            (parse-iso-datetime full :datetime)
-            (list (or (extract-uca-annotation s) "iso8601")))
+            (list (or (getf (parse-iso-datetime full :datetime) :calendar) "iso8601")))
         (shuttle-error () nil)))))
 
 (defun try-reduced-monthday (s)
@@ -121,9 +119,7 @@
                 (t nil))))
         (when full
           (handler-case
-              (progn
-                (parse-iso-datetime full :datetime)
-                (list (or (extract-uca-annotation s) "iso8601")))
+              (list (or (getf (parse-iso-datetime full :datetime) :calendar) "iso8601"))
             (shuttle-error () nil)))))))
 
 (defun canonicalize-calendar-id (v)
@@ -365,29 +361,12 @@
       (js-throw (make-native-error "RangeError" "date out of range")))
     date))
 
-(defun extract-uca-annotation (s)
-  "Return the FIRST [u-ca=VALUE] annotation value in S, or NIL. (The core
-   parser validates annotation structure/criticality but discards the u-ca
-   value; we recover it here from the raw string.)"
-  (let ((needle "u-ca="))
-    (loop for open = (position #\[ s) then (position #\[ s :start (1+ open))
-          while open
-          for close = (position #\] s :start open)
-          while close
-          do (let* ((body (subseq s (1+ open) close))
-                    (b (if (and (plusp (length body)) (char= (char body 0) #\!))
-                           (subseq body 1) body)))
-               (when (and (>= (length b) (length needle))
-                          (string= needle b :end2 (length needle)))
-                 (return-from extract-uca-annotation (subseq b (length needle))))))
-    nil))
-
 (defun calendar-from-parse (r s)
-  "The calendar id from a parsed string S's [u-ca=...] annotation (defaults to
-   iso8601). R is the parse plist (unused for calendar — the core parser
-   discards the value). The recovered id must be iso8601 — RangeError otherwise."
-  (declare (ignore r))
-  (let ((cal (extract-uca-annotation s)))
+  "The calendar id from a parsed string's [u-ca=...] annotation (defaults to
+   iso8601). R is the parse-iso-datetime plist, which now surfaces :calendar. The
+   recovered id must be iso8601 — RangeError otherwise."
+  (declare (ignore s))
+  (let ((cal (getf r :calendar)))
     (cond ((null cal) "iso8601")
           ((string-equal cal "iso8601") "iso8601")
           (t (js-throw (make-native-error "RangeError"
@@ -609,6 +588,8 @@
             (bag (arg 0 args)))
         (unless (js-object-p bag)
           (js-throw (make-native-error "TypeError" "with() argument must be an object")))
+        (when (temporal-branded-object-p bag)
+          (js-throw (make-native-error "TypeError" "with() argument must be a plain object, not a Temporal instance")))
         (reject-calendar-or-timezone bag)
         ;; Read partial fields (alpha order), fill from THIS, then resolve via
         ;; the same validator as from() so monthCode range / conflicts throw.
@@ -692,9 +673,11 @@
       (let* ((date (pd-iso-date this))
              (calendar (pd-calendar-id this))
              (pym-ctor (require-temporal-ctor realm "PlainYearMonth")))
+        ;; For iso8601 the resulting PlainYearMonth's reference ISO day is the
+        ;; canonical 1 (CalendarYearMonthFromFields), NOT the source date's day.
         (js-construct pym-ctor
           (list (float (iso-date-year date) 1d0) (float (iso-date-month date) 1d0)
-                calendar (float (iso-date-day date) 1d0)))))
+                calendar 1d0))))
 
     ;; ---- toPlainMonthDay ----
     (def-method realm proto "toPlainMonthDay" 0 (this args)
@@ -702,15 +685,38 @@
       (let* ((date (pd-iso-date this))
              (calendar (pd-calendar-id this))
              (pmd-ctor (require-temporal-ctor realm "PlainMonthDay")))
+        ;; For iso8601 the resulting PlainMonthDay's reference ISO year is the
+        ;; canonical 1972 (a leap year), NOT the source date's year.
         (js-construct pmd-ctor
           (list (float (iso-date-month date) 1d0) (float (iso-date-day date) 1d0)
-                calendar (float (iso-date-year date) 1d0)))))
+                calendar 1972d0))))
 
-    ;; ---- toZonedDateTime (defers to B3) ----
+    ;; ---- toZonedDateTime ----
+    ;; Dispatch dynamically to the realm's Temporal.ZonedDateTime if present (the
+    ;; concurrent ZDT type lights this up); a clear TypeError otherwise. ITEM is a
+    ;; time-zone string, or { timeZone, plainTime? }.
     (def-method realm proto "toZonedDateTime" 1 (this args)
-      (pd-iso-date this)
-      (js-throw (make-native-error "TypeError"
-                  "Temporal.PlainDate.prototype.toZonedDateTime is not implemented")))
+      (let ((date (pd-iso-date this))
+            (calendar (pd-calendar-id this))
+            (item (arg 0 args)))
+        (unless (and (fboundp 'to-time-zone-identifier) (fboundp 'make-zoneddatetime))
+          (js-throw (make-native-error "TypeError" "Temporal.ZonedDateTime is not available")))
+        (multiple-value-bind (tz-id offset time)
+            (if (and (js-object-p item) (not (js-undefined-p (js-get item "timeZone"))))
+                ;; { timeZone, plainTime? }
+                (multiple-value-bind (id off) (funcall 'to-time-zone-identifier (js-get item "timeZone"))
+                  (let ((pt (js-get item "plainTime")))
+                    (values id off
+                            (if (js-undefined-p pt)
+                                (make-iso-time 0 0 0 0 0 0)
+                                (to-temporal-time realm pt)))))
+                ;; a bare time-zone value -> midnight
+                (multiple-value-bind (id off) (funcall 'to-time-zone-identifier item)
+                  (values id off (make-iso-time 0 0 0 0 0 0))))
+          (let ((ns (- (iso-datetime->epoch-ns date time) offset)))
+            (unless (valid-epoch-ns-p ns)
+              (js-throw (make-native-error "RangeError" "ZonedDateTime out of range")))
+            (funcall 'make-zoneddatetime realm ns tz-id offset calendar)))))
 
     ;; ---- toString / toJSON / toLocaleString ----
     (def-method realm proto "toString" 0 (this args)

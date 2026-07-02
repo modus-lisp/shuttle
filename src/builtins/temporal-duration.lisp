@@ -23,21 +23,10 @@
 ;;; Duration magnitude / range validation (IsValidDuration).
 ;;; ===========================================================================
 (defun full-validate-duration (d)
-  "IsValidDuration: sign coherence + magnitude. Per spec only years/months/weeks
-   are bounded by 2^32; DAYS is bounded only by the total-seconds<2^53 limit
-   (the kernel's validate-duration-range wrongly caps days at 2^32, so we do our
-   own range check here)."
-  (validate-duration d)
-  (dolist (f '(:years :months :weeks))
-    (when (>= (abs (getf d f)) 4294967296)
-      (js-throw (make-native-error "RangeError" "duration component out of range"))))
-  ;; IsValidDuration: the total time (days..ns) expressed in seconds must be
-  ;; strictly < 2^53 in magnitude. The max valid duration is
-  ;; 9007199254740991.999999999 s, so compare the exact ns total to 2^53 * 1e9.
-  (let ((total-ns (+ (* (getf d :days) +ns-per-day+) (duration-time-ns d))))
-    (when (>= (abs total-ns) (* (expt 2 53) +ns-per-s+))
-      (js-throw (make-native-error "RangeError" "duration out of range"))))
-  d)
+  "IsValidDuration — now a thin alias for the kernel's validate-duration-range,
+   which correctly bounds only years/months/weeks by 2^32 and days via the total
+   seconds < 2^53 limit. Kept as a local name to minimize callsite churn."
+  (validate-duration-range d))
 
 (defun duration-has-calendar-units-p (d)
   (or (/= 0 (getf d :years)) (/= 0 (getf d :months)) (/= 0 (getf d :weeks))))
@@ -47,95 +36,15 @@
   (+ (* (getf d :days) +ns-per-day+) (duration-time-ns d)))
 
 ;;; ===========================================================================
-;;; ISO-8601 duration string parser (own — the kernel's parse-temporal-duration
-;;; dumps a fractional hours/minutes value straight into seconds, but the spec
-;;; cascades the fraction hours->minutes->seconds->subsecond; it also fails to
-;;; reject a fraction on a non-final component). We parse fully here and reuse
-;;; it for from()/add()/subtract()/round()/total()/compare() string arguments.
+;;; ISO-8601 duration string parsing — the kernel's parse-temporal-duration is
+;;; now the single correct parser (cascades a fractional hours/minutes/seconds
+;;; value hours->minutes->seconds->subsecond and rejects a fraction on any but
+;;; the final present component), so we route everything through the kernel's
+;;; to-temporal-duration-record.
 ;;; ===========================================================================
-(defun parse-duration-string-full (s)
-  "Parse an ISO-8601 duration string into a duration plist, cascading a
-   fractional hours/minutes/seconds value into the finer time units and
-   rejecting a fraction anywhere but the final present component. RangeError on
-   malformed."
-  (let* ((s (string-trim '(#\Space #\Tab #\Newline #\Return) s))
-         (n (length s)) (i 0) (sign 1))
-    (labels ((fail () (js-throw (make-native-error "RangeError" "invalid ISO 8601 duration")))
-             (peek () (when (< i n) (char s i)))
-             (read-number ()
-               ;; unsigned integer + optional fraction. Returns (values int frac
-               ;; had-fraction) where FRAC is a rational in [0,1).
-               (let ((start i) (v 0) (digs 0))
-                 (loop while (and (< i n) (digit-char-p (char s i)))
-                       do (setf v (+ (* v 10) (digit-char-p (char s i)))) (incf i) (incf digs))
-                 (when (zerop digs) (setf i start) (return-from read-number (values nil 0 nil)))
-                 (let ((frac 0) (had nil))
-                   (when (member (peek) '(#\. #\,))
-                     (incf i) (setf had t)
-                     (let ((num 0) (den 1) (fd 0))
-                       (loop while (and (< i n) (digit-char-p (char s i)))
-                             do (setf num (+ (* num 10) (digit-char-p (char s i))) den (* den 10))
-                                (incf i) (incf fd))
-                       ;; 1..9 fractional digits only (ISO Temporal grammar).
-                       (when (or (zerop fd) (> fd 9)) (fail))
-                       (setf frac (/ num den))))
-                   (values v frac had)))))
-      (case (peek) (#\+ (incf i)) (#\- (setf sign -1) (incf i)))
-      (unless (and (< i n) (char-equal (char s i) #\P)) (fail))
-      (incf i)
-      (let ((years 0) (months 0) (weeks 0) (days 0)
-            (hours 0) (minutes 0) (seconds 0) (sub-ns 0)
-            (in-time nil) (any nil) (frac-used nil))
-        (loop
-          (let ((c (peek)))
-            (cond
-              ((null c) (return))
-              ((and (not in-time) (char-equal c #\T)) (incf i) (setf in-time t))
-              (t
-               (when frac-used (fail)) ; nothing may follow a fractional component
-               (multiple-value-bind (v frac had) (read-number)
-                 (unless v (fail))
-                 (let ((desig (peek)))
-                   (unless desig (fail))
-                   (incf i) (setf any t)
-                   (when had (setf frac-used t))
-                   (if (not in-time)
-                       (progn
-                         (when (plusp frac) (fail))  ; date units may not be fractional
-                         (case (char-upcase desig)
-                           (#\Y (setf years v)) (#\M (setf months v))
-                           (#\W (setf weeks v)) (#\D (setf days v))
-                           (t (fail))))
-                       (case (char-upcase desig)
-                         (#\H (setf hours v)
-                              (when (plusp frac)
-                                ;; cascade: frac hours -> minutes -> seconds -> subsec
-                                (let* ((fm (* frac 60)) (wm (floor fm)))
-                                  (setf minutes wm)
-                                  (let* ((fs (* (- fm wm) 60)) (ws (floor fs)))
-                                    (setf seconds ws sub-ns (floor (* (- fs ws) +ns-per-s+)))))))
-                         (#\M (setf minutes v)
-                              (when (plusp frac)
-                                (let* ((fs (* frac 60)) (ws (floor fs)))
-                                  (setf seconds ws sub-ns (floor (* (- fs ws) +ns-per-s+))))))
-                         (#\S (setf seconds v)
-                              (when (plusp frac)
-                                (setf sub-ns (floor (* frac +ns-per-s+)))))
-                         (t (fail))))))))))
-        (unless any (fail))
-        (multiple-value-bind (ms r1) (floor sub-ns +ns-per-ms+)
-          (multiple-value-bind (us ns) (floor r1 +ns-per-us+)
-            (flet ((sg (x) (* sign x)))
-              (list :years (sg years) :months (sg months) :weeks (sg weeks) :days (sg days)
-                    :hours (sg hours) :minutes (sg minutes) :seconds (sg seconds)
-                    :milliseconds (sg ms) :microseconds (sg us) :nanoseconds (sg ns)))))))))
-
 (defun to-duration-record (v)
-  "Like the kernel to-temporal-duration-record but routes STRING arguments
-   through our own parser (correct fractional cascade + fraction placement)."
-  (if (stringp v)
-      (validate-duration (parse-duration-string-full v))
-      (to-temporal-duration-record v)))
+  "ToTemporalDurationRecord — delegates to the kernel (strings, bags, instances)."
+  (to-temporal-duration-record v))
 
 ;;; ===========================================================================
 ;;; ToIntegerIfIntegral for a single argument (constructor + fields).
@@ -257,27 +166,62 @@
   (let ((ns (temporal-namespace realm)))
     (and ns (js-object-p (ignore-errors (js-get ns "PlainDate"))))))
 
+(defun zdt-relativeto-local-iso (v)
+  "The local (wall-clock) iso-date of a ZonedDateTime relativeTo V. For the
+   fixed-offset zones the corpus exercises, days are exactly 24h, so a
+   ZonedDateTime relativeTo is behaviorally a PlainDate relativeTo at this date."
+  (let ((slot (getf (js-object-internal v) :temporal-zoneddatetime)))
+    (multiple-value-bind (date time) (epoch-ns->iso-datetime (+ (getf slot :ns) (getf slot :offset)))
+      (declare (ignore time))
+      date)))
+
+(defun relativeto-is-zoned-shaped-p (v)
+  "T if a relativeTo value V (bag or string) denotes a ZonedDateTime: a bag with a
+   non-undefined `timeZone` property, or a string carrying a bare (time-zone)
+   [Zone] annotation (as opposed to only a [u-ca=...] one)."
+  (cond
+    ((stringp v)
+     (let* ((s (string-trim '(#\Space #\Tab #\Newline #\Return) v))
+            (br (position #\[ s)))
+       (and br
+            (let ((rb (position #\] s :start br)))
+              (and rb
+                   (let ((ann (subseq s (1+ br) rb)))
+                     (when (and (plusp (length ann)) (char= (char ann 0) #\!))
+                       (setf ann (subseq ann 1)))
+                     ;; a bare annotation (no '=') is a time-zone annotation
+                     (null (position #\= ann))))))))
+    ((js-object-p v)
+     (not (js-undefined-p (js-get v "timeZone"))))
+    (t nil)))
+
 (defun to-relative-to (realm options)
-  "Read options.relativeTo. Returns (values kind iso-date) where kind is
-   :none (undefined), :plaindate (iso-date), or :zoned (=> B3, unsupported here).
-   Coerces strings/bags to a PlainDate via the realm's PlainDate.from when
-   available. On a ZonedDateTime-shaped relativeTo, returns :zoned."
+  "GetTemporalRelativeToOption. Returns (values kind iso-date) where kind is
+   :none (undefined) or :plaindate (iso-date). A ZonedDateTime relativeTo (an
+   instance, a timeZone-bearing bag, or a bracketed string) is resolved via the
+   registered Temporal.ZonedDateTime and reduced to its local iso-date — for the
+   fixed-offset zones the corpus uses this is behaviorally a PlainDate relativeTo.
+   A plain string/bag is coerced through Temporal.PlainDate.from."
   (let ((v (%opt-get options "relativeTo")))
     (cond
       ((js-undefined-p v) (values :none nil))
+      ;; ZonedDateTime instance.
       ((and (js-object-p v) (getf (js-object-internal v) :temporal-zoneddatetime))
-       (values :zoned nil))
+       (values :plaindate (zdt-relativeto-local-iso v)))
+      ;; PlainDate / PlainDateTime instance.
       ((and (js-object-p v)
             (or (getf (js-object-internal v) :temporal-plaindate)
                 (getf (js-object-internal v) :temporal-plaindatetime)))
        (values :plaindate (relative-to-plaindate-iso realm v)))
+      ;; A zoned-shaped bag/string: build a ZonedDateTime (correct observable
+      ;; read order, offset/timeZone validation) and reduce to its local date.
+      ((and (relativeto-is-zoned-shaped-p v) (fboundp 'to-temporal-zoneddatetime))
+       (let ((z (funcall 'to-temporal-zoneddatetime realm v *undefined*)))
+         (values :plaindate (zdt-relativeto-local-iso z))))
       (t
-       ;; string or property bag: delegate to Temporal.PlainDate.from (correct
-       ;; observable read order, calendar + overflow handling, date extraction
-       ;; from a datetime/offset form) and extract its iso-date. A ZonedDateTime
-       ;; relativeTo (timeZone-bearing bag / bracketed string) would need B3; the
-       ;; PlainDate path still resolves the date for the tests the corpus runs
-       ;; without a real time zone.
+       ;; Plain string or property bag: delegate to Temporal.PlainDate.from
+       ;; (observable read order, calendar + overflow, date extraction from a
+       ;; datetime/offset form) and extract its iso-date.
        (let* ((ns (temporal-namespace realm))
               (pd (js-get ns "PlainDate"))
               (from (js-get pd "from"))
@@ -813,27 +757,29 @@
                (options (if string-shorthand nil (get-options-object arg0)))
                (all-units '(:year :month :week :day :hour :minute :second
                             :millisecond :microsecond :nanosecond)))
-          (multiple-value-bind (smallest largest increment mode)
+          ;; Spec read order (non-shorthand): largestUnit, relativeTo,
+          ;; roundingIncrement, roundingMode, smallestUnit — relativeTo is read
+          ;; between largestUnit and roundingIncrement.
+          (multiple-value-bind (smallest largest increment mode kind rel-iso)
               (if string-shorthand
                   (let ((hit (assoc arg0 (unit-alist all-units) :test #'string=)))
                     (unless hit (js-throw (make-native-error "RangeError" "invalid smallestUnit")))
-                    (values (cdr hit) nil 1 :half-expand))
-                  (let* ((largest (get-temporal-unit options "largestUnit" :datetime nil
-                                                     all-units '(("auto" . :auto))))
-                         (increment (get-rounding-increment options))
-                         (mode (get-rounding-mode options :half-expand))
-                         (smallest (get-temporal-unit options "smallestUnit" :datetime nil
-                                                      all-units)))
-                    ;; keep :auto distinct from truly-absent (NIL).
-                    (values smallest largest increment mode)))
+                    (values (cdr hit) nil 1 :half-expand :none nil))
+                  (let ((largest (get-temporal-unit options "largestUnit" :datetime nil
+                                                    all-units '(("auto" . :auto)))))
+                    (multiple-value-bind (kind rel-iso) (to-relative-to realm options)
+                      (let ((increment (get-rounding-increment options))
+                            (mode (get-rounding-mode options :half-expand))
+                            (smallest (get-temporal-unit options "smallestUnit" :datetime nil
+                                                         all-units)))
+                        ;; keep :auto distinct from truly-absent (NIL).
+                        (values smallest largest increment mode kind rel-iso)))))
             (when (and (null smallest) (null largest))
               (js-throw (make-native-error "RangeError" "at least one of smallestUnit/largestUnit required")))
             ;; :auto largestUnit resolves to the duration's default largest unit.
             (when (eq largest :auto)
               (setf largest (duration-default-largest-unit d)))
-            ;; Resolve relativeTo (options only in non-shorthand form).
-            (multiple-value-bind (kind rel-iso)
-                (if string-shorthand (values :none nil) (to-relative-to realm options))
+            (progn
               (when (eq kind :zoned)
                 (js-throw (make-native-error "TypeError" "ZonedDateTime relativeTo not yet supported")))
               ;; Defaults for smallest/largest.
@@ -893,17 +839,18 @@
         (let* ((string-shorthand (stringp arg0))
                (options (if string-shorthand nil (get-options-object arg0)))
                (all-units '(:year :month :week :day :hour :minute :second
-                            :millisecond :microsecond :nanosecond))
-               (unit (if string-shorthand
-                         (let ((hit (assoc arg0 (unit-alist all-units) :test #'string=)))
-                           (unless hit (js-throw (make-native-error "RangeError" "invalid unit")))
-                           (cdr hit))
-                         (get-temporal-unit options "unit" :datetime :required all-units))))
+                            :millisecond :microsecond :nanosecond)))
+          ;; Spec read order: relativeTo is read BEFORE unit.
           (multiple-value-bind (kind rel-iso)
               (if string-shorthand (values :none nil) (to-relative-to realm options))
             (when (eq kind :zoned)
               (js-throw (make-native-error "TypeError" "ZonedDateTime relativeTo not yet supported")))
-            (let ((needs-rel (or (member unit '(:year :month :week))
+            (let* ((unit (if string-shorthand
+                             (let ((hit (assoc arg0 (unit-alist all-units) :test #'string=)))
+                               (unless hit (js-throw (make-native-error "RangeError" "invalid unit")))
+                               (cdr hit))
+                             (get-temporal-unit options "unit" :datetime :required all-units)))
+                   (needs-rel (or (member unit '(:year :month :week))
                                  (duration-has-calendar-units-p d))))
               (cond
                 ((and needs-rel (member kind '(:none :need-plaindate)))

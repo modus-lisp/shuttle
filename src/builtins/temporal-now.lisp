@@ -14,6 +14,14 @@
         (+ (* sec +ns-per-s+) (* usec +ns-per-us+))
         (* (- (get-universal-time) 2208988800) +ns-per-s+))))
 
+(defun now-tz-offset (tz)
+  "Offset-ns for a Temporal.Now time-zone argument: undefined -> 0 (system UTC);
+   a String -> its offset (TypeError on a non-string). Uses the ZonedDateTime
+   time-zone resolver so ISO-string / annotation forms behave identically."
+  (cond ((js-undefined-p tz) 0)
+        ((stringp tz) (nth-value 1 (to-time-zone-identifier tz)))
+        (t (js-throw (make-native-error "TypeError" "timeZone must be a string")))))
+
 (defun install-temporal-now (realm)
   (let* ((op (realm-object-proto realm))
          (now (make-object :proto op :class "Object")))
@@ -44,18 +52,33 @@
           (declare (ignore date))
           (make-temporal-plaintime realm time))))
 
-    ;; Date-bearing members require the later types; they defer with a
-    ;; clear TypeError so the few tests that reach them fail loudly rather than
-    ;; silently. These upgrade once PlainDate/PlainDateTime/
-    ;; ZonedDateTime exist.
-    (flet ((deferred (name)
-             (def-method realm now name 0 (this args)
-               (declare (ignore this args))
-               (js-throw (make-native-error "TypeError"
-                           (format nil "Temporal.Now.~a is not implemented yet" name))))))
-      (deferred "plainDateISO")
-      (deferred "plainDateTimeISO")
-      (deferred "zonedDateTimeISO"))
+    ;; plainDateTimeISO([timeZone]) -> the wall-clock date+time in the given zone.
+    (def-method realm now "plainDateTimeISO" 0 (this args)
+      (declare (ignore this))
+      (let* ((tz (arg 0 args))
+             (offset (now-tz-offset tz))
+             (ns (+ (now-epoch-ns) offset)))
+        (multiple-value-bind (date time) (epoch-ns->iso-datetime ns)
+          (make-temporal-plaindatetime realm date time))))
+
+    ;; plainDateISO([timeZone]) -> the wall-clock date in the given zone.
+    (def-method realm now "plainDateISO" 0 (this args)
+      (declare (ignore this))
+      (let* ((tz (arg 0 args))
+             (offset (now-tz-offset tz))
+             (ns (+ (now-epoch-ns) offset)))
+        (multiple-value-bind (date time) (epoch-ns->iso-datetime ns)
+          (declare (ignore time))
+          (make-plain-date date "iso8601" realm))))
+
+    ;; zonedDateTimeISO([timeZone]) -> the current instant as a ZonedDateTime in
+    ;; the given zone (default the system zone, "UTC").
+    (def-method realm now "zonedDateTimeISO" 0 (this args)
+      (declare (ignore this))
+      (let ((tz (arg 0 args)))
+        (multiple-value-bind (tz-id offset)
+            (if (js-undefined-p tz) (values "UTC" 0) (to-time-zone-identifier tz))
+          (make-zoneddatetime realm (now-epoch-ns) tz-id offset "iso8601"))))
 
     ;; Hang Now on the Temporal namespace (non-enumerable, writable, configurable).
     (temporal-register realm "Now" now)))
