@@ -442,23 +442,39 @@
   (unless (stringp v)
     (js-throw (make-native-error "TypeError" "RegExp.escape argument must be a string")))
   (with-output-to-string (out)
-    (loop for i from 0 below (length v)
-          for c = (char v i) do
-      (cond
-        ;; First code point that is ASCII alnum: hex-escape so the escaped string
-        ;; can never merge with a preceding token or begin an identifier-ish run.
-        ((and (= i 0)
-              (or (char<= #\0 c #\9) (char<= #\a c #\z) (char<= #\A c #\Z)))
-         (write-string (regex-escape-hex (char-code c)) out))
-        ((member c +regex-syntax-chars+)
-         (write-char #\\ out) (write-char c out))
-        ((char= c #\Tab) (write-string "\\t" out))
-        ((char= c #\Newline) (write-string "\\n" out))
-        ((char= c (code-char 11)) (write-string "\\v" out))
-        ((char= c #\Page) (write-string "\\f" out))
-        ((char= c #\Return) (write-string "\\r" out))
-        ((regex-escapable-p c) (write-string (regex-escape-hex (char-code c)) out))
-        (t (write-char c out))))))
+    (let ((len (length v)) (i 0))
+      (loop while (< i len) do
+        (let ((c (char v i)))
+          ;; EncodeForRegExpEscape operates on CODE POINTS: a well-formed
+          ;; surrogate pair is one astral code point and is emitted verbatim
+          ;; (the astral set is never in the escapable set). Only a LONE
+          ;; surrogate code unit is hex-escaped as an unpaired code unit.
+          (cond
+            ((and (<= #xD800 (char-code c) #xDBFF)
+                  (< (1+ i) len)
+                  (<= #xDC00 (char-code (char v (1+ i))) #xDFFF))
+             ;; valid surrogate pair -> keep both code units unchanged
+             (write-char c out)
+             (write-char (char v (1+ i)) out)
+             (incf i 2))
+            (t
+             (cond
+               ;; First code point that is ASCII alnum: hex-escape so the escaped
+               ;; string can never merge with a preceding token or begin an
+               ;; identifier-ish run.
+               ((and (= i 0)
+                     (or (char<= #\0 c #\9) (char<= #\a c #\z) (char<= #\A c #\Z)))
+                (write-string (regex-escape-hex (char-code c)) out))
+               ((member c +regex-syntax-chars+)
+                (write-char #\\ out) (write-char c out))
+               ((char= c #\Tab) (write-string "\\t" out))
+               ((char= c #\Newline) (write-string "\\n" out))
+               ((char= c (code-char 11)) (write-string "\\v" out))
+               ((char= c #\Page) (write-string "\\f" out))
+               ((char= c #\Return) (write-string "\\r" out))
+               ((regex-escapable-p c) (write-string (regex-escape-hex (char-code c)) out))
+               (t (write-char c out)))
+             (incf i))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Install

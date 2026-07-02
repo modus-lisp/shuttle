@@ -229,8 +229,21 @@
                              (#\n (write-char #\Newline out)) (#\t (write-char #\Tab out))
                              (#\r (write-char #\Return out))  (#\b (write-char #\Backspace out))
                              (#\f (write-char #\Page out))    (#\v (write-char (code-char 11) out))
-                             (#\0 (if (and (< (1+ i) n) (digit-char-p (char src (1+ i))))
-                                      (write-char #\0 out) (write-char #\Nul out)))
+                             ;; \0 not followed by a digit -> NUL. \0-\7 followed by
+                             ;; octal digits -> LegacyOctalEscapeSequence (Annex B B.1.2,
+                             ;; sloppy). \8 \9 -> the digit itself (NonOctalDecimalEscape).
+                             ((#\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7)
+                              (let* ((d0 (- (char-code e) (char-code #\0)))
+                                     (val d0)
+                                     ;; max digits: \0-\3 allow up to 3, \4-\7 up to 2
+                                     (maxmore (if (<= d0 3) 2 1)))
+                                (loop repeat maxmore
+                                      while (and (< (1+ i) n)
+                                                 (char<= #\0 (char src (1+ i)) #\7))
+                                      do (setf val (+ (* val 8) (- (char-code (char src (1+ i))) (char-code #\0))))
+                                         (incf i))
+                                (write-char (code-char val) out)))
+                             ((#\8 #\9) (write-char e out))    ; NonOctalDecimalEscapeSequence
                              (#\x (let ((v (hexn 2))) (write-char (code-char (or v (char-code #\x))) out)))
                              (#\u (if (and (< (1+ i) n) (char= (char src (1+ i)) #\{))
                                       (let ((v 0)) (incf i)   ; skip {

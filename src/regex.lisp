@@ -627,12 +627,19 @@
 ;; control stack to a FATAL, uncatchable exhaustion. On exceed we THROW
 ;; 'regex-overflow, caught in regex-exec -> treat as no match.
 ;; Set together with the runner's --control-stack-size (inspect/run262.sh): the
-;; matcher nests one frame per quantifier repetition, so the budget must fit in
-;; the stack. At 200000 with a ~256MB stack, real long-input matches (e.g. /f.*/
-;; on 80k chars) succeed while exponential blowups still bail before a FATAL,
-;; uncatchable stack exhaustion. (True fix = iterative fast-path for single-char
-;; quantifiers; TODO.)
-(defparameter *regex-max-steps* 200000)
+;; general (recursive) matcher nests one frame per quantifier repetition of a
+;; COMPLEX body (group/alternation), so the budget must fit in the stack. The
+;; common case — a quantifier over a single code point (literal / . / class) —
+;; now runs through COMPILE-REPEAT-SINGLE, which is ITERATIVE (no per-char frame)
+;; and only touches the step budget as a linear counter, so the budget no longer
+;; has to be small to protect the stack. Raised to 10M so genuine long-input
+;; single-char scans complete; the budget is shared across ALL candidate start
+;; positions of one regex-exec (mctx is reused), so an O(n^2) start-position ×
+;; backtrack scan of a NON-matching pattern over a long string bails at the
+;; ceiling (-> correct "no match") in well under a second instead of hanging,
+;; and a truly exponential group blowup still bails well before a FATAL,
+;; uncatchable stack exhaustion.
+(defparameter *regex-max-steps* 10000000)
 (declaim (inline regex-step))
 (defun regex-step (mc)
   (when (> (the fixnum (incf (the fixnum (mctx-steps mc)))) (the fixnum *regex-max-steps*))
@@ -944,6 +951,128 @@
                            when c return c)))
             (match-backref-cap mc cap pos k backward))))))
 
+;;; ---- single-char stepper (iterative-quantifier fast path) ----
+;;; A "single-char" body is one whose match always consumes exactly ONE code
+;;; point (1 or 2 UTF-16 units under /u) and never captures: :char, :dot,
+;;; :class-escape, :char-class. For a quantifier over such a body we can match
+;;; greedily in a forward (or backward, under lookbehind) SCAN — recording each
+;;; boundary in a stack — and then backtrack by popping boundaries, WITHOUT the
+;;; O(n)-deep recursion of the general CPS RepeatMatcher. This is what keeps
+;;; `X*`, `X+`, `X{n,m}` (and their lazy forms) from blowing the control stack /
+;;; step budget on long inputs, including the pathological backtracking cases
+;;; (`a+b`, `.*x` on a long run of matching chars).
+;;;
+;;; SINGLE-CHAR-STEPPER returns, for a single-char BODY, a closure
+;;;   (lambda (mc pos) -> next-pos | nil)
+;;; that tries to consume one code point at POS in the current compile direction
+;;; (advancing right for forward, left for backward) and returns the new index,
+;;; or NIL if the body does not match there. Returns NIL (not a closure) when
+;;; BODY is not a single-char matcher, so the caller falls back to the general
+;;; recursive path.
+(defun single-char-stepper (body)
+  (let ((backward (minusp *compile-direction*)))
+    (case (car body)
+      (:char
+       (let ((c (cadr body)))
+         (if (> (char-code c) #xFFFF)
+             ;; astral literal: two code units
+             (let* ((cp (- (char-code c) #x10000))
+                    (hi (code-char (+ #xD800 (ash cp -10))))
+                    (lo (code-char (+ #xDC00 (logand cp #x3FF)))))
+               (if backward
+                   (lambda (mc pos)
+                     (when (and (>= (- pos 2) 0)
+                                (char= (char (mctx-input mc) (- pos 2)) hi)
+                                (char= (char (mctx-input mc) (1- pos)) lo))
+                       (- pos 2)))
+                   (lambda (mc pos)
+                     (when (and (< (1+ pos) (mctx-len mc))
+                                (char= (char (mctx-input mc) pos) hi)
+                                (char= (char (mctx-input mc) (1+ pos)) lo))
+                       (+ pos 2)))))
+             (if backward
+                 (lambda (mc pos)
+                   (when (and (> pos 0)
+                              (rx-char-eq mc (char (mctx-input mc) (1- pos)) c))
+                     (1- pos)))
+                 (lambda (mc pos)
+                   (when (and (< pos (mctx-len mc))
+                              (rx-char-eq mc (char (mctx-input mc) pos) c))
+                     (1+ pos)))))))
+      (:dot
+       (if backward
+           (lambda (mc pos)
+             (when (> pos 0)
+               (let ((w (rx-cp-width-back mc pos)))
+                 (when (or (mctx-dot-all mc)
+                           (not (line-terminator-p (char (mctx-input mc) (- pos w)))))
+                   (- pos w)))))
+           (lambda (mc pos)
+             (when (and (< pos (mctx-len mc))
+                        (or (mctx-dot-all mc)
+                            (not (line-terminator-p (char (mctx-input mc) pos)))))
+               (+ pos (rx-cp-width mc pos))))))
+      (:class-escape
+       (let ((esc (cadr body)))
+         (if backward
+             (lambda (mc pos)
+               (when (and (> pos 0)
+                          (class-escape-member-p esc (char (mctx-input mc) (1- pos))))
+                 (1- pos)))
+             (lambda (mc pos)
+               (when (and (< pos (mctx-len mc))
+                          (class-escape-member-p esc (char (mctx-input mc) pos)))
+                 (1+ pos))))))
+      (:char-class
+       (let ((negated (cadr body)) (items (caddr body)))
+         (if backward
+             (lambda (mc pos)
+               (when (> pos 0)
+                 (multiple-value-bind (c w) (class-input-cp-back mc pos)
+                   (let ((in (char-in-class-p mc c items)))
+                     (when (if negated (not in) in) (- pos w))))))
+             (lambda (mc pos)
+               (when (< pos (mctx-len mc))
+                 (multiple-value-bind (c w) (class-input-cp mc pos)
+                   (let ((in (char-in-class-p mc c items)))
+                     (when (if negated (not in) in) (+ pos w)))))))))
+      (t nil))))
+
+(defun compile-repeat-single (mn mx lazy step)
+  "Iterative RepeatMatcher for a single-code-point body. STEP is the closure from
+   SINGLE-CHAR-STEPPER. Greedily scans up to MX (or end of matchable run) counting
+   from MN, recording each boundary, then hands successive extents to the
+   continuation K — from the greediest down to MN (greedy) or from MN up (lazy).
+   No recursion depth proportional to the match length."
+  (lambda (mc pos k)
+    (block matched
+      ;; Scan forward collecting boundaries. BOUNDS[i] is the index after i steps;
+      ;; BOUNDS[0] = POS. We stop at MX steps (if bounded), at a non-match, or when
+      ;; a zero-width step would loop (STEP returns the same index).
+      (let ((bounds (make-array 16 :adjustable t :fill-pointer 1 :initial-element pos))
+            (cur pos) (count 0))
+        (loop
+          (when (and mx (>= count mx)) (return))
+          (regex-step mc)
+          (let ((next (funcall step mc cur)))
+            (when (or (null next) (= next cur)) (return))
+            (setf cur next) (incf count)
+            (vector-push-extend cur bounds)))
+        ;; COUNT = number of matched code points (>= 0). Need at least MN.
+        (when (< count mn) (return-from matched nil))
+        (if lazy
+            ;; lazy: fewest first — try MN, then MN+1, ... up to COUNT
+            (loop for i from mn to count do
+              (regex-step mc)
+              (let ((r (funcall k (aref bounds i))))
+                (when r (return-from matched r))))
+            ;; greedy: most first — try COUNT, then COUNT-1, ... down to MN
+            (loop for i from count downto mn do
+              (regex-step mc)
+              (let ((r (funcall k (aref bounds i))))
+                (when r (return-from matched r)))))
+        nil))))
+
 ;;; ---- quantifiers ----
 (defun collect-capture-indices (node)
   "The set of capturing-group indices that appear anywhere inside NODE (used to
@@ -962,6 +1091,13 @@
 
 (defun compile-repeat (node)
   (destructuring-bind (mn mx lazy body) (cdr node)
+    ;; Fast path: a quantifier over a single-code-point, non-capturing body
+    ;; (literal / . / class-escape / char-class) is matched iteratively, avoiding
+    ;; the O(match-length)-deep recursion (and step-budget blowup) of the general
+    ;; RepeatMatcher — the big win for long inputs and backtracking-heavy patterns.
+    (let ((step (single-char-stepper body)))
+      (when step
+        (return-from compile-repeat (compile-repeat-single mn mx lazy step))))
     (let ((m (compile-node body))
           ;; Captures inside the body are cleared before each iteration so that,
           ;; e.g., a group that failed to match on the current pass reads as
@@ -1094,15 +1230,26 @@
     ;; Scan candidate start positions. Under /u we advance by whole code
     ;; points (AdvanceStringIndex), so a match is never anchored in the middle
     ;; of a surrogate pair.
-    (let ((pos start))
+    ;; ONE match-context is reused across all candidate start positions so the
+    ;; step budget (mctx-steps) accumulates over the whole exec rather than
+    ;; resetting per start. This bounds the O(n^2) start-position × backtrack
+    ;; work of a non-matching pattern on a long string to a single 10M-step
+    ;; ceiling (bail -> no match), instead of paying the full budget at *every*
+    ;; start. Captures and the modifier-mutable flags are reset each iteration.
+    (let* ((caps (make-array (1+ n) :initial-element nil))
+           (base-i (compiled-regex-ignore-case cre))
+           (base-m (compiled-regex-multiline cre))
+           (base-s (compiled-regex-dot-all cre))
+           (mc (make-mctx :input input :len len :captures caps
+                          :ignore-case base-i :multiline base-m :dot-all base-s
+                          :unicode unicode))
+           (pos start))
       (loop
-        (let* ((caps (make-array (1+ n) :initial-element nil))
-               (mc (make-mctx :input input :len len :captures caps
-                              :ignore-case (compiled-regex-ignore-case cre)
-                              :multiline (compiled-regex-multiline cre)
-                              :dot-all (compiled-regex-dot-all cre)
-                              :unicode unicode))
-               (end nil))
+        (fill caps nil)
+        (setf (mctx-ignore-case mc) base-i
+              (mctx-multiline mc) base-m
+              (mctx-dot-all mc) base-s)
+        (let ((end nil))
           (when (funcall matcher mc pos (lambda (p) (setf end p) t))
             (setf (aref caps 0) (cons pos end))
             (return-from regex-exec (values end caps)))

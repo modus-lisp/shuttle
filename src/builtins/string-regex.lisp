@@ -72,7 +72,18 @@
           (when (js-object-p separator)
             (multiple-value-bind (r present) (call-symbol-method separator *symbol-split* this limit)
               (when present (return-from done r))))
-          (string-split realm (to-string this) separator limit))))
+          ;; Fallback String.prototype.split (no @@split) — spec order (21.1.3.23):
+          ;;   3. S := ToString(O)
+          ;;   6. lim := (limit undefined) ? 2^32-1 : ToUint32(limit)
+          ;;   7. R := ToString(separator)   <-- BEFORE the lim=0 check
+          ;;   8. If lim = 0, return empty array
+          ;; (We do the ToString/ToUint32 here rather than in string-split, which
+          ;; short-circuits on lim=0 before ToString and clamps instead of doing
+          ;; ToUint32 — see core-bug proposal.)
+          (let* ((s (to-string this))
+                 (lim (if (js-undefined-p limit) #xFFFFFFFF (to-uint32 limit)))
+                 (rsep (to-string separator)))     ; must run even when lim=0
+            (string-split-plain realm s separator rsep lim)))))
     ;; ---- replace ----
     (def-method realm sp "replace" 2 (this args)
       (block done
@@ -96,6 +107,30 @@
             (multiple-value-bind (r present) (call-symbol-method search-value *symbol-replace* this replace-value)
               (when present (return-from done r))))
           (string-replace-plain realm (to-string this) search-value replace-value t))))))
+
+;;; --- plain (non-regex) split, used when separator has no @@split ---
+;;; S / RSEP already coerced (ToString); SEPARATOR is the raw value (to detect
+;;; undefined); LIM is the already-ToUint32'd limit.
+(defun string-split-plain (realm s separator rsep lim)
+  (declare (ignorable realm))
+  (cond
+    ((zerop lim) (make-array-object '()))
+    ((js-undefined-p separator) (make-array-object (list s)))
+    (t
+     (let ((out '()))
+       (if (string= rsep "")
+           ;; empty separator: split into individual UTF-16 code units, up to LIM
+           (loop for c across s while (< (length out) lim) do (push (string c) out))
+           (let ((start 0) (slen (length rsep)))
+             (loop
+               (let ((p (search rsep s :start2 start)))
+                 (cond
+                   ((or (null p) (>= (length out) lim))
+                    (when (< (length out) lim) (push (subseq s start) out))
+                    (return))
+                   (t (push (subseq s start p) out)
+                      (setf start (+ p slen))))))))
+       (make-array-object (nreverse out))))))
 
 ;;; --- plain (non-regex) replace, used when searchValue has no @@replace ---
 (defun string-replace-plain (realm s search-value replace-value all)

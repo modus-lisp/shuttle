@@ -48,8 +48,27 @@
 ;;; A binding value of the TDZ sentinel means "declared but not yet initialized"
 ;;; (let/const temporal dead zone). CONSTS holds names that may not be reassigned.
 (defvar *tdz* '#:tdz)                    ; unique uninitialized marker
-(defstruct env vars parent consts with-obj)
+(defstruct env vars parent consts with-obj block)
 (defun new-env (parent) (make-env :vars (make-hash-table :test 'equal) :parent parent))
+(defun new-block-env (parent) (make-env :vars (make-hash-table :test 'equal) :parent parent :block t))
+(defun env-var-scope-has (env name)
+  "Is NAME already bound in the nearest var scope (skipping block envs, stopping at
+   the first non-block env — the function/global scope)? Used by Annex B B.3.3 to
+   avoid clobbering an existing param/var when creating a block-fn's var binding."
+  (loop for e = env then (env-parent e) while e
+        do (when (nth-value 1 (gethash name (env-vars e))) (return-from env-var-scope-has t))
+           (unless (env-block e) (return-from env-var-scope-has nil)))
+  nil)
+(defun env-var-set (env name val)
+  "Assign an existing var-scoped binding of NAME, skipping block-scoped lexical
+   envs (Annex B B.3.3: the block function's var binding lives in the nearest
+   function/global scope, not the shadowing block lexical)."
+  (loop for e = env then (env-parent e) while e
+        do (unless (env-block e)
+             (when (nth-value 1 (gethash name (env-vars e)))
+               (setf (gethash name (env-vars e)) val) (return-from env-var-set val))))
+  ;; no var binding found (shouldn't happen if pre-declared) — set on root
+  (setf (gethash name (env-vars (env-root env))) val) val)
 (defun new-with-env (parent obj) (make-env :vars (make-hash-table :test 'equal) :parent parent :with-obj obj))
 (defun env-root (e) (loop while (env-parent e) do (setf e (env-parent e))) e)
 (defun with-binds-p (obj name)
@@ -163,6 +182,13 @@
     (let ((r (js-call next it '())))
       (unless (js-object-p r) (js-throw (make-native-error "TypeError" "iterator result is not an object")))
       r)))
+(defun iterator-close (it)
+  "IteratorClose: call it.return() if present, ignoring a thrown result (we are
+   already unwinding an abrupt completion)."
+  (when (js-object-p it)
+    (let ((ret (ignore-errors (js-get it "return"))))
+      (when (js-callable-p ret)
+        (ignore-errors (js-call ret it '()))))))
 
 (defun make-arguments-object (args)
   "A minimal (unmapped) arguments object: indexed elements + length + @@iterator."
@@ -500,230 +526,469 @@
 (defun (setf promise-value) (v p) (setf (getf (js-object-internal p) :promise-value) v))
 (defun promise-reactions (p) (getf (js-object-internal p) :promise-reactions))
 (defun (setf promise-reactions) (v p) (setf (getf (js-object-internal p) :promise-reactions) v))
+(defun promise-already-handled-p (p) (getf (js-object-internal p) :promise-handled))
+(defun (setf promise-already-handled-p) (v p) (setf (getf (js-object-internal p) :promise-handled) v))
 
 (defvar *promise-global-installed* '())   ; realms into which Promise has been installed
 (defun ensure-promise-global ()
-  "Install the Promise constructor as a global in the current realm (once). We own
-   a minimal Promise here; a richer builtins/promise.lisp can supersede it later."
+  "Install the Promise constructor as a global in the current realm (once)."
   (let ((realm *current-realm*))
     (unless (member realm *promise-global-installed*)
       (push realm *promise-global-installed*)
       (unless (nth-value 1 (env-get (realm-global-env realm) "Promise"))
         (install-promise-global realm)))))
 
-(defun make-promise ()
+(defun native-fn (fn &optional (len 1) (name ""))
+  "A bare callable JS object wrapping CL FN (this args) -> value."
+  (let ((o (make-object :proto (%fn-proto) :class "Function")))
+    (setf (js-object-call o) fn)
+    (put o "length" (float len 1d0) :enumerable nil :writable nil :configurable t)
+    (put o "name" name :enumerable nil :writable nil :configurable t)
+    o))
+
+;;; ---- OrdinaryCreateFromConstructor helper ----
+(defun get-proto-from-constructor (new-target default-proto)
+  "GetPrototypeFromConstructor(newTarget, defaultProto): use newTarget.prototype if
+   it is an object, else DEFAULT-PROTO."
+  (if (js-object-p new-target)
+      (let ((pp (js-get new-target "prototype")))
+        (if (js-object-p pp) pp default-proto))
+      default-proto))
+
+(defun make-promise (&optional (proto (promise-prototype)))
+  "Allocate a pending promise object whose [[Prototype]] is PROTO."
   (ensure-promise-global)
-  (let ((p (make-object :proto (promise-prototype) :class "Promise")))
+  (let ((p (make-object :proto proto :class "Promise")))
     (setf (js-object-internal p)
           (list* :promise-state :pending :promise-value *undefined* :promise-reactions '()
                  (js-object-internal p)))
     p))
 
+;;; ---- PromiseCapability records ----
+;;; A capability is (promise resolve reject) — resolve/reject are JS callables.
+(defstruct pcap promise resolve reject)
+
+(defun new-promise-capability (c)
+  "NewPromiseCapability(C): C must be a constructor. Runs C with a
+   GetCapabilitiesExecutor and captures the resolve/reject it hands back."
+  (unless (and (js-object-p c) (js-object-construct c))
+    (js-throw (make-native-error "TypeError" "Promise capability requires a constructor")))
+  (let ((resolve *undefined*) (reject *undefined*))
+    (let* ((executor
+             (native-fn
+              (lambda (this args) (declare (ignore this))
+                ;; GetCapabilitiesExecutor: resolve/reject each set exactly once.
+                (unless (js-undefined-p resolve)
+                  (js-throw (make-native-error "TypeError" "capability resolve already set")))
+                (unless (js-undefined-p reject)
+                  (js-throw (make-native-error "TypeError" "capability reject already set")))
+                (setf resolve (if args (car args) *undefined*))
+                (setf reject (if (cdr args) (cadr args) *undefined*))
+                *undefined*)
+              2))
+           (promise (js-construct c (list executor) c)))
+      (unless (js-callable-p resolve)
+        (js-throw (make-native-error "TypeError" "Promise resolve is not callable")))
+      (unless (js-callable-p reject)
+        (js-throw (make-native-error "TypeError" "Promise reject is not callable")))
+      (make-pcap :promise promise :resolve resolve :reject reject))))
+
+(defun cap-resolve (cap value)
+  (js-call (pcap-resolve cap) *undefined* (list value)))
+(defun cap-reject (cap reason)
+  (js-call (pcap-reject cap) *undefined* (list reason)))
+
+(defun promise-fulfill (p value)
+  "FulfillPromise: transition pending P to fulfilled and schedule fulfill reactions."
+  (let ((reactions (nreverse (promise-reactions p))))
+    (setf (promise-state p) :fulfilled (promise-value p) value (promise-reactions p) '())
+    (dolist (r reactions) (schedule-reaction p r))))
+
+(defun promise-reject-internal (p reason)
+  "RejectPromise: transition pending P to rejected and schedule reject reactions."
+  (let ((reactions (nreverse (promise-reactions p))))
+    (setf (promise-state p) :rejected (promise-value p) reason (promise-reactions p) '())
+    (dolist (r reactions) (schedule-reaction p r))))
+
 (defun promise-settle (p state value)
-  "Transition a pending promise to :fulfilled/:rejected and schedule its reactions."
+  "Legacy shim used by the async driver. Transition pending P to STATE/VALUE."
   (when (eq (promise-state p) :pending)
-    (setf (promise-state p) state (promise-value p) value)
-    (let ((reactions (nreverse (promise-reactions p))))
-      (setf (promise-reactions p) '())
-      (dolist (r reactions) (schedule-reaction p r)))))
+    (if (eq state :fulfilled) (promise-fulfill p value) (promise-reject-internal p value))))
+
+;;; ---- resolving functions (spec CreateResolvingFunctions) ----
+(defun make-resolving-functions (p)
+  "Return (values resolveFn rejectFn) — the pair passed to a Promise executor. Both
+   share an alreadyResolved guard; resolve adopts thenables via a job."
+  (let ((already nil))
+    (values
+     (native-fn
+      (lambda (this args) (declare (ignore this))
+        (let ((resolution (if args (car args) *undefined*)))
+          (unless already
+            (setf already t)
+            (cond
+              ((eq resolution p)
+               (when (eq (promise-state p) :pending)
+                 (promise-reject-internal p (make-native-error "TypeError" "Chaining cycle detected"))))
+              ((not (js-object-p resolution))
+               (when (eq (promise-state p) :pending) (promise-fulfill p resolution)))
+              (t
+               (block resolve-get
+                 (let ((then (handler-case (js-get resolution "then")
+                               (shuttle-error (e)
+                                 (when (eq (promise-state p) :pending)
+                                   (promise-reject-internal p (shuttle-error-value e)))
+                                 (return-from resolve-get)))))
+                   (if (js-callable-p then)
+                       (enqueue-microtask (make-then-job resolution then p))
+                       (when (eq (promise-state p) :pending) (promise-fulfill p resolution)))))))))
+        *undefined*)
+      1)
+     (native-fn
+      (lambda (this args) (declare (ignore this))
+        (unless already
+          (setf already t)
+          (when (eq (promise-state p) :pending)
+            (promise-reject-internal p (if args (car args) *undefined*))))
+        *undefined*)
+      1))))
+
+(defun make-then-job (thenable then p)
+  "PromiseResolveThenableJob: a microtask that calls thenable.then with fresh
+   resolving functions for P."
+  (lambda ()
+    (multiple-value-bind (res rej) (make-resolving-functions p)
+      (handler-case (js-call then thenable (list res rej))
+        (shuttle-error (e) (js-call rej *undefined* (list (shuttle-error-value e))))))))
 
 (defun resolve-promise (p value)
-  "Fulfill P with VALUE, but if VALUE is a thenable, adopt its state."
-  (cond
-    ((eq p value)
-     (promise-settle p :rejected (make-native-error "TypeError" "Chaining cycle detected")))
-    ((and (js-object-p value)
-          (let ((then (ignore-errors (js-get value "then")))) (and (js-callable-p then) then)))
-     (let ((then (js-get value "then")))
-       ;; thenable: subscribe. Schedule the .then call as a microtask.
-       (enqueue-microtask
-        (lambda ()
-          (let ((done nil))
-            (flet ((res (this args) (declare (ignore this))
-                     (unless done (setf done t) (resolve-promise p (if args (car args) *undefined*)))
-                     *undefined*)
-                   (rej (this args) (declare (ignore this))
-                     (unless done (setf done t) (promise-settle p :rejected (if args (car args) *undefined*)))
-                     *undefined*))
-              (handler-case
-                  (js-call then value (list (native-fn #'res) (native-fn #'rej)))
-                (shuttle-error (e)
-                  (unless done (setf done t) (promise-settle p :rejected (shuttle-error-value e))))))))) ))
-    (t (promise-settle p :fulfilled value))))
+  "Internal resolve used by the async driver / Promise.resolve fast path."
+  (multiple-value-bind (res rej) (make-resolving-functions p)
+    (declare (ignore rej))
+    (js-call res *undefined* (list value))))
 
-(defun native-fn (fn &optional (len 1))
-  "A bare callable JS object wrapping CL FN (this args) -> value."
-  (let ((o (make-object :proto (%fn-proto) :class "Function")))
-    (setf (js-object-call o) fn)
-    (put o "length" (float len 1d0) :enumerable nil :writable nil :configurable t)
-    (put o "name" "" :enumerable nil :writable nil :configurable t)
-    o))
-
+;;; ---- reactions ----
+;;; A reaction is (kind . handler): KIND is :fulfill or :reject, HANDLER is a JS
+;;; callable or NIL (default passthrough); CAP is the target capability. Stored as
+;;; a list (cap fulfill-handler reject-handler) where handlers may be NIL.
 (defun schedule-reaction (p reaction)
-  "Queue REACTION (on-fulfill . on-reject), each a CL closure of one arg, on the
-   microtask queue against P's settled state."
-  (destructuring-bind (on-fulfill . on-reject) reaction
+  "Queue REACTION against P's settled state on the microtask queue."
+  (destructuring-bind (cap fulfill-handler reject-handler) reaction
     (let ((state (promise-state p)) (value (promise-value p)))
       (enqueue-microtask
        (lambda ()
-         (if (eq state :fulfilled)
-             (when on-fulfill (funcall on-fulfill value))
-             (when on-reject  (funcall on-reject value))))))))
+         (let ((handler (if (eq state :fulfilled) fulfill-handler reject-handler)))
+           (cond
+             ((null handler)
+              ;; default: passthrough (fulfill) or rethrow (reject)
+              (if cap
+                  (if (eq state :fulfilled) (cap-resolve cap value) (cap-reject cap value))
+                  ;; internal reaction (CL closure form) — value ignored
+                  nil))
+             ((functionp handler)
+              ;; internal CL closure reaction (async driver / await)
+              (funcall handler value))
+             (t
+              (handler-case
+                  (let ((r (js-call handler *undefined* (list value))))
+                    (when cap (cap-resolve cap r)))
+                (shuttle-error (e)
+                  (when cap (cap-reject cap (shuttle-error-value e)))))))))))))
 
 (defun promise-then (p on-fulfill on-reject)
-  "Register CL-closure reactions (each (value)->_) on promise P. Returns nothing;
-   used internally by the async driver and await."
-  (let ((reaction (cons on-fulfill on-reject)))
+  "Register CL-closure reactions (each (value)->_) on promise P. Internal use by the
+   async driver and await (no result promise)."
+  (setf (promise-already-handled-p p) t)
+  (let ((reaction (list nil on-fulfill on-reject)))
     (if (eq (promise-state p) :pending)
         (push reaction (promise-reactions p))
         (schedule-reaction p reaction))))
 
-(defun js-promise-resolve (value)
-  "Promise.resolve(value): if VALUE is already a promise, return it; else a new
-   fulfilled/adopting promise."
-  (if (promisep value) value
-      (let ((p (make-promise))) (resolve-promise p value) p)))
+(defun perform-promise-then (p on-fulfill on-reject result-cap)
+  "PerformPromiseThen with JS handlers (or *undefined*) targeting RESULT-CAP."
+  (setf (promise-already-handled-p p) t)
+  (let* ((f (and (js-callable-p on-fulfill) on-fulfill))
+         (r (and (js-callable-p on-reject) on-reject))
+         (reaction (list result-cap f r)))
+    (if (eq (promise-state p) :pending)
+        (push reaction (promise-reactions p))
+        (schedule-reaction p reaction))
+    (if result-cap (pcap-promise result-cap) *undefined*)))
+
+(defun js-promise-resolve (value &optional (c nil))
+  "PromiseResolve(C, value). With no C, uses %Promise%. If VALUE is a promise whose
+   constructor is C, return it; else new capability, resolve with VALUE."
+  (let ((c (or c (promise-constructor))))
+    (if (and (promisep value)
+             (let ((ctor (ignore-errors (js-get value "constructor")))) (eq ctor c)))
+        value
+        (let ((cap (new-promise-capability c)))
+          (cap-resolve cap value)
+          (pcap-promise cap)))))
+
+(defun promise-constructor ()
+  (let ((cell (assoc *current-realm* *promise-ctor-cache*)))
+    (if cell (cdr cell)
+        (progn (ensure-promise-global)
+               (cdr (assoc *current-realm* *promise-ctor-cache*))))))
+
+(defun promise-species-ctor (o default)
+  "SpeciesConstructor(O, defaultConstructor): C = O.constructor; if undefined return
+   default; else S = C[@@species]; if null/undefined return default; must be ctor.
+   (Named distinctly from builtins/regexp.lisp's 3-arg species-constructor.)"
+  (let ((c (js-get o "constructor")))
+    (if (js-undefined-p c) default
+        (progn
+          (unless (js-object-p c)
+            (js-throw (make-native-error "TypeError" "constructor is not an object")))
+          (let* ((species-sym (or *symbol-species* (well-known-symbol "species")))
+                 (s (if species-sym (js-get c species-sym) *undefined*)))
+            (if (js-null-or-undef s) default
+                (if (and (js-object-p s) (js-object-construct s)) s
+                    (js-throw (make-native-error "TypeError" "@@species is not a constructor")))))))))
+
+(defvar *symbol-species* nil)   ; @@species (looked up lazily)
 
 (defun promise-prototype ()
   (let ((cell (assoc *current-realm* *promise-proto-cache*)))
     (if cell (cdr cell)
         (let ((pp (make-object :proto (%obj-proto))))
-          (flet ((native (name fn) (let ((f (make-object :proto (%fn-proto) :class "Function")))
-                                     (setf (js-object-call f) fn)
-                                     (put f "name" name :enumerable nil :writable nil :configurable t)
-                                     (put pp name f :enumerable nil :configurable t :writable t))))
-            (native "then" (lambda (this args)
-                             (unless (promisep this)
-                               (js-throw (make-native-error "TypeError" "Promise.prototype.then on non-promise")))
-                             (let ((onf (and args (js-callable-p (car args)) (car args)))
-                                   (onr (and (cdr args) (js-callable-p (cadr args)) (cadr args)))
-                                   (result (make-promise)))
-                               (promise-then this
-                                 (lambda (v)
-                                   (if onf
-                                       (handler-case (resolve-promise result (js-call onf *undefined* (list v)))
-                                         (shuttle-error (e) (promise-settle result :rejected (shuttle-error-value e))))
-                                       (resolve-promise result v)))
-                                 (lambda (v)
-                                   (if onr
-                                       (handler-case (resolve-promise result (js-call onr *undefined* (list v)))
-                                         (shuttle-error (e) (promise-settle result :rejected (shuttle-error-value e))))
-                                       (promise-settle result :rejected v))))
-                               result)))
-            (native "catch" (lambda (this args)
-                              (let ((then (js-get this "then")))
-                                (js-call then this (list *undefined* (if args (car args) *undefined*))))))
-            (native "finally" (lambda (this args)
-                                (let ((cb (and args (js-callable-p (car args)) (car args)))
-                                      (then (js-get this "then")))
-                                  (js-call then this
-                                    (list (native-fn (lambda (this2 a) (declare (ignore this2))
-                                                       (when cb (js-call cb *undefined* '()))
-                                                       (if a (car a) *undefined*)))
-                                          (native-fn (lambda (this2 a) (declare (ignore this2))
-                                                       (when cb (js-call cb *undefined* '()))
-                                                       (js-throw (if a (car a) *undefined*))))))))))
+          (flet ((native (name len fn)
+                   (let ((f (native-fn fn len name)))
+                     (put pp name f :enumerable nil :configurable t :writable t))))
+            (native "then" 2
+              (lambda (this args)
+                (unless (promisep this)
+                  (js-throw (make-native-error "TypeError" "Promise.prototype.then called on non-promise")))
+                (let* ((onf (if args (car args) *undefined*))
+                       (onr (if (cdr args) (cadr args) *undefined*))
+                       (c (promise-species-ctor this (promise-constructor)))
+                       (cap (new-promise-capability c)))
+                  (perform-promise-then this onf onr cap))))
+            (native "catch" 1
+              (lambda (this args)
+                (let ((then (js-get this "then")))
+                  (js-call then this (list *undefined* (if args (car args) *undefined*))))))
+            (native "finally" 1
+              (lambda (this args)
+                (unless (js-object-p this)
+                  (js-throw (make-native-error "TypeError" "Promise.prototype.finally called on non-object")))
+                (let* ((c (promise-species-ctor this (promise-constructor)))
+                       (on-finally (if args (car args) *undefined*))
+                       (then (js-get this "then")))
+                  (if (js-callable-p on-finally)
+                      (let ((then-finally
+                              (native-fn
+                               (lambda (th a) (declare (ignore th))
+                                 (let* ((value (if a (car a) *undefined*))
+                                        (result (js-call on-finally *undefined* '()))
+                                        (promise (js-promise-resolve result c))
+                                        (value-thunk (native-fn (lambda (t2 a2) (declare (ignore t2 a2)) value) 0)))
+                                   (let ((th2 (js-get promise "then")))
+                                     (js-call th2 promise (list value-thunk)))))
+                               1))
+                            (catch-finally
+                              (native-fn
+                               (lambda (th a) (declare (ignore th))
+                                 (let* ((reason (if a (car a) *undefined*))
+                                        (result (js-call on-finally *undefined* '()))
+                                        (promise (js-promise-resolve result c))
+                                        (thrower (native-fn (lambda (t2 a2) (declare (ignore t2 a2))
+                                                              (js-throw reason)) 0)))
+                                   (let ((th2 (js-get promise "then")))
+                                     (js-call th2 promise (list thrower)))))
+                               1)))
+                        (js-call then this (list then-finally catch-finally)))
+                      (js-call then this (list on-finally on-finally)))))))
           (let ((tag (or *symbol-to-string-tag* (well-known-symbol "toStringTag"))))
             (when tag
               (put pp tag "Promise" :enumerable nil :writable nil :configurable t)))
           (push (cons *current-realm* pp) *promise-proto-cache*)
           pp))))
 
+(defun promise-executor-run (p executor)
+  "Run a Promise EXECUTOR with fresh resolving functions bound to P. A synchronous
+   throw rejects P via the reject function."
+  (multiple-value-bind (res rej) (make-resolving-functions p)
+    (handler-case (js-call executor *undefined* (list res rej))
+      (shuttle-error (e) (js-call rej *undefined* (list (shuttle-error-value e)))))
+    p))
+
 (defun install-promise-global (realm)
-  "Install a minimal Promise constructor + statics into REALM's global. Idempotent
-   caller (ensure-promise-global). Not installed if a builtins/promise.lisp already
-   defined one."
+  "Install the Promise constructor + statics into REALM's global."
   (let* ((*current-realm* realm)
          (proto (promise-prototype))
          (ctor (make-object :proto (%fn-proto) :class "Function")))
     (setf (js-object-call ctor)
-          (lambda (this args) (declare (ignore this))
-            (js-throw (make-native-error "TypeError" "Promise constructor requires new"))))
+          (lambda (this args) (declare (ignore this args))
+            (js-throw (make-native-error "TypeError" "Promise constructor cannot be invoked without new"))))
     (setf (js-object-construct ctor)
-          (lambda (args new-target) (declare (ignore new-target))
+          (lambda (args new-target)
+            (when (js-undefined-p new-target)
+              (js-throw (make-native-error "TypeError" "Promise constructor requires new")))
             (let ((executor (if args (car args) *undefined*)))
               (unless (js-callable-p executor)
                 (js-throw (make-native-error "TypeError" "Promise resolver is not a function")))
-              (let ((p (make-promise)))
-                (handler-case
-                    (js-call executor *undefined*
-                             (list (native-fn (lambda (th a) (declare (ignore th))
-                                                (resolve-promise p (if a (car a) *undefined*)) *undefined*))
-                                   (native-fn (lambda (th a) (declare (ignore th))
-                                                (promise-settle p :rejected (if a (car a) *undefined*)) *undefined*))))
-                  (shuttle-error (e) (promise-settle p :rejected (shuttle-error-value e))))
-                p))))
+              ;; OrdinaryCreateFromConstructor(newTarget, %Promise.prototype%)
+              (let ((p (make-promise (get-proto-from-constructor new-target proto))))
+                (promise-executor-run p executor)))))
     (put ctor "length" 1d0 :enumerable nil :writable nil :configurable t)
     (put ctor "name" "Promise" :enumerable nil :writable nil :configurable t)
     (put ctor "prototype" proto :enumerable nil :writable nil :configurable nil)
     (put proto "constructor" ctor :enumerable nil :writable t :configurable t)
+    (push (cons realm ctor) *promise-ctor-cache*)
     (flet ((static (name len fn)
-             (let ((f (make-object :proto (%fn-proto) :class "Function")))
-               (setf (js-object-call f) fn)
-               (put f "name" name :enumerable nil :writable nil :configurable t)
-               (put f "length" (float len 1d0) :enumerable nil :writable nil :configurable t)
-               (put ctor name f :enumerable nil :writable t :configurable t))))
-      (static "resolve" 1 (lambda (this args) (declare (ignore this))
-                            (js-promise-resolve (if args (car args) *undefined*))))
-      (static "reject" 1 (lambda (this args) (declare (ignore this))
-                           (let ((p (make-promise)))
-                             (promise-settle p :rejected (if args (car args) *undefined*)) p)))
-      (static "all" 1 (lambda (this args) (declare (ignore this))
-                        (promise-all (if args (car args) *undefined*) :all)))
-      (static "allSettled" 1 (lambda (this args) (declare (ignore this))
-                               (promise-all (if args (car args) *undefined*) :all-settled)))
-      (static "race" 1 (lambda (this args) (declare (ignore this))
-                         (promise-all (if args (car args) *undefined*) :race)))
-      (static "any" 1 (lambda (this args) (declare (ignore this))
-                        (promise-all (if args (car args) *undefined*) :any))))
+             (put ctor name (native-fn fn len name) :enumerable nil :writable t :configurable t)))
+      (static "resolve" 1 (lambda (this args)
+                            (unless (js-object-p this)
+                              (js-throw (make-native-error "TypeError" "Promise.resolve called on non-object")))
+                            (js-promise-resolve (if args (car args) *undefined*) this)))
+      (static "reject" 1 (lambda (this args)
+                           (let ((cap (new-promise-capability this)))
+                             (cap-reject cap (if args (car args) *undefined*))
+                             (pcap-promise cap))))
+      (static "all" 1 (lambda (this args)
+                        (promise-combine this (if args (car args) *undefined*) :all)))
+      (static "allSettled" 1 (lambda (this args)
+                               (promise-combine this (if args (car args) *undefined*) :all-settled)))
+      (static "race" 1 (lambda (this args)
+                         (promise-combine this (if args (car args) *undefined*) :race)))
+      (static "any" 1 (lambda (this args)
+                        (promise-combine this (if args (car args) *undefined*) :any)))
+      (static "withResolvers" 0 (lambda (this args) (declare (ignore args))
+                                  (let* ((cap (new-promise-capability this))
+                                         (o (make-object :proto (%obj-proto))))
+                                    (put o "promise" (pcap-promise cap))
+                                    (put o "resolve" (pcap-resolve cap))
+                                    (put o "reject" (pcap-reject cap))
+                                    o)))
+      (static "try" 1 (lambda (this args)
+                        (unless (js-object-p this)
+                          (js-throw (make-native-error "TypeError" "Promise.try called on non-object")))
+                        (let* ((cap (new-promise-capability this))
+                               (callback (if args (car args) *undefined*))
+                               (extra (if args (cdr args) '())))
+                          (handler-case
+                              (let ((r (js-call callback *undefined* extra)))
+                                (cap-resolve cap r))
+                            (shuttle-error (e) (cap-reject cap (shuttle-error-value e))))
+                          (pcap-promise cap)))))
+    ;; @@species getter on the constructor: returns `this`.
+    (let ((species-sym (or *symbol-species* (well-known-symbol "species"))))
+      (when species-sym
+        (setf *symbol-species* species-sym)
+        (let ((getter (native-fn (lambda (this args) (declare (ignore args)) this) 0 "get [Symbol.species]")))
+          (put-accessor ctor species-sym :get getter :enumerable nil :configurable t))))
     (define-global realm "Promise" ctor)
     ctor))
 
-(defun promise-all (iterable mode)
-  "Promise.all/allSettled/race/any over ITERABLE."
-  (let* ((result (make-promise))
-         (items (handler-case (iterable-to-list iterable)
-                  (shuttle-error (e) (promise-settle result :rejected (shuttle-error-value e))
-                    (return-from promise-all result))))
-         (n (length items))
-         (values (make-array n :initial-element *undefined*))
-         (errors (make-array n :initial-element *undefined*))
-         (remaining n))
-    (when (zerop n)
-      (case mode
-        (:all (resolve-promise result (make-array-object '())))
-        (:all-settled (resolve-promise result (make-array-object '())))
-        (:any (promise-settle result :rejected (make-native-error "AggregateError" "All promises were rejected")))
-        (:race nil))                        ; race over empty never settles
-      (return-from promise-all result))
-    (loop for item in items for i from 0 do
-      (let ((idx i) (p (js-promise-resolve item)))
-        (promise-then p
-          (lambda (v)
-            (case mode
-              (:race (resolve-promise result v))
-              (:any (resolve-promise result v))
-              (:all (setf (aref values idx) v)
-                    (when (zerop (decf remaining))
-                      (resolve-promise result (make-array-object (coerce values 'list)))))
+(defun promise-combine (c iterable mode)
+  "Promise.all/allSettled/race/any spec algorithm. C is `this` (a constructor).
+   Creates a capability from C, gets C.resolve once, iterates, applies MODE."
+  (let ((cap (new-promise-capability c)))    ; throws TypeError if C not a ctor
+    (handler-case
+        (let ((promise-resolve (js-get c "resolve")))
+          (unless (js-callable-p promise-resolve)
+            (js-throw (make-native-error "TypeError" "Promise.resolve is not callable")))
+          (perform-promise-combine c iterable mode cap promise-resolve))
+      (shuttle-error (e)
+        (cap-reject cap (shuttle-error-value e))))
+    (pcap-promise cap)))
+
+(defun perform-promise-combine (c iterable mode cap promise-resolve)
+  "The Perform* body: iterate ITERABLE, calling C.resolve on each element and
+   subscribing per-mode reactions. Uses a shared remaining counter. Results are
+   stored into growable adjustable slot vectors indexed by natural order."
+  (let ((it (get-iterator iterable))
+        (remaining (list 1))          ; boxed guard: bumped per element, dropped after loop
+        (slots (make-array 0 :adjustable t :fill-pointer 0))  ; result values, natural order
+        (index 0)
+        (iter-done nil))              ; t once next() reported done or itself threw
+    (labels ((slot-set (i v) (setf (aref slots i) v))
+             (settle-if-done ()
+               (when (zerop (decf (car remaining)))
+                 (ecase mode
+                   ((:all :all-settled) (cap-resolve cap (make-array-object (coerce slots 'list))))
+                   (:any (cap-reject cap (make-aggregate-error (coerce slots 'list))))
+                   (:race nil)))))
+      (handler-case
+       (loop
+        (let ((step (handler-case (iterator-step it)
+                      (shuttle-error (e) (setf iter-done t) (error e)))))
+          ;; IteratorComplete / IteratorValue: a throw reading done/value sets
+          ;; the record's [[done]] (so no IteratorClose) — mirror with iter-done.
+          (when (js-truthy (handler-case (js-get step "done")
+                             (shuttle-error (e) (setf iter-done t) (error e))))
+            (setf iter-done t) (return))
+          (let* ((next-value (handler-case (js-get step "value")
+                               (shuttle-error (e) (setf iter-done t) (error e))))
+                 (idx index)
+                 (next-promise (js-call promise-resolve c (list next-value)))
+                 (then (js-get next-promise "then")))
+            (vector-push-extend *undefined* slots)
+            (incf index)
+            (incf (car remaining))
+            (ecase mode
+              (:all
+               (let ((already nil))
+                 (let ((on-full (native-fn
+                                 (lambda (th a) (declare (ignore th))
+                                   (unless already
+                                     (setf already t)
+                                     (slot-set idx (if a (car a) *undefined*))
+                                     (settle-if-done))
+                                   *undefined*) 1)))
+                   (js-call then next-promise (list on-full (pcap-reject cap))))))
               (:all-settled
-               (let ((o (make-object :proto (%obj-proto))))
-                 (put o "status" "fulfilled") (put o "value" v) (setf (aref values idx) o))
-               (when (zerop (decf remaining))
-                 (resolve-promise result (make-array-object (coerce values 'list)))))))
-          (lambda (e)
-            (case mode
-              (:race (promise-settle result :rejected e))
-              (:all (promise-settle result :rejected e))
-              (:any (setf (aref errors idx) e)
-                    (when (zerop (decf remaining))
-                      (promise-settle result :rejected (make-native-error "AggregateError" "All promises were rejected"))))
-              (:all-settled
-               (let ((o (make-object :proto (%obj-proto))))
-                 (put o "status" "rejected") (put o "reason" e) (setf (aref values idx) o))
-               (when (zerop (decf remaining))
-                 (resolve-promise result (make-array-object (coerce values 'list))))))))))
-    result))
+               (let ((already nil))
+                 (let ((on-full (native-fn
+                                 (lambda (th a) (declare (ignore th))
+                                   (unless already
+                                     (setf already t)
+                                     (let ((o (make-object :proto (%obj-proto))))
+                                       (put o "status" "fulfilled")
+                                       (put o "value" (if a (car a) *undefined*))
+                                       (slot-set idx o))
+                                     (settle-if-done))
+                                   *undefined*) 1))
+                       (on-rej (native-fn
+                                (lambda (th a) (declare (ignore th))
+                                  (unless already
+                                    (setf already t)
+                                    (let ((o (make-object :proto (%obj-proto))))
+                                      (put o "status" "rejected")
+                                      (put o "reason" (if a (car a) *undefined*))
+                                      (slot-set idx o))
+                                    (settle-if-done))
+                                  *undefined*) 1)))
+                   (js-call then next-promise (list on-full on-rej)))))
+              (:any
+               (let ((already nil))
+                 (let ((on-rej (native-fn
+                                (lambda (th a) (declare (ignore th))
+                                  (unless already
+                                    (setf already t)
+                                    (slot-set idx (if a (car a) *undefined*))
+                                    (settle-if-done))
+                                  *undefined*) 1)))
+                   (js-call then next-promise (list (pcap-resolve cap) on-rej)))))
+              (:race
+               (js-call then next-promise (list (pcap-resolve cap) (pcap-reject cap))))))))
+       ;; Abrupt completion mid-iteration (Invoke resolve / Get then / then call
+       ;; threw): the iterator is not done, so IteratorClose it, then re-throw so
+       ;; promise-combine rejects the capability.
+       (shuttle-error (e)
+         (unless iter-done (iterator-close it))
+         (error e)))                                       ; handler-case
+      ;; drop the initial guard
+      (settle-if-done))))                                  ; labels let defun
+
+(defun make-aggregate-error (errors)
+  "Build an AggregateError whose errors list is ERRORS (natural order)."
+  (let ((ctor (ignore-errors (js-get (realm-global *current-realm*) "AggregateError"))))
+    (if (and ctor (js-object-p ctor) (js-object-construct ctor))
+        (js-construct ctor (list (make-array-object errors) "All promises were rejected"))
+        (make-native-error "TypeError" "All promises were rejected"))))
 
 (defun iterable-to-list (iterable)
   (let ((it (get-iterator iterable)) (out '()))
@@ -1228,7 +1493,11 @@
             (:typeof-var (push! (env-typeof env (first a))))
             (:set-var (env-set env (first a) (peek!) strictp))
             (:declare-var (env-declare env (first a) (pop!)))
-            (:push-env (setf env (new-env env)))
+            (:declare-var-absent                                    ; B.3.3: create var binding only if absent in var scope
+             (let ((v (pop!)))
+               (unless (env-var-scope-has env (first a)) (env-declare env (first a) v))))
+            (:annexb-var-set (env-var-set env (first a) (peek!)))   ; B.3.3 sync var binding; leaves value
+            (:push-env (setf env (new-block-env env)))
             (:pop-env (setf env (env-parent env)))
             (:to-object (push! (to-object (pop!))))
             (:push-with-env (setf env (new-with-env env (pop!))))

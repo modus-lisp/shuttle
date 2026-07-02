@@ -16,6 +16,7 @@
 (defvar *labels* '())          ; ((NAME break-lbl continue-lbl-or-nil scope-depth) ...)
 (defvar *pending-labels* '())  ; label names attached to the next loop/iteration stmt
 (defvar *scope-depth* 0)                 ; current lexical block-env nesting within the fn
+(defvar *annexb-fn-names* '())           ; block-fn names getting an Annex B B.3.3 var binding
 (defvar *break-depth* 0) (defvar *continue-depth* 0)  ; scope depth at the loop/switch target
 (defun em (op &rest args) (push (cons op args) *out*))
 (defun lbl () (gensym "L"))
@@ -118,8 +119,23 @@
       (unless (member v pnames :test #'string=)
         (em :const *undefined*) (em :declare-var v)))
     ;; function/top-level body: hoist its OWN lexicals into the function env (no extra block)
-    (let ((stmts (if (eq (car body) :block) (second body) (list body))))
-      (dolist (n (block-lexical-names stmts)) (em :tdz-declare n))
+    (let* ((stmts (if (eq (car body) :block) (second body) (list body)))
+           (lexnames (block-lexical-names stmts))
+           ;; Annex B B.3.3 (sloppy only): block-nested fn names get a var binding.
+           (*annexb-fn-names* (if *strict* '()
+                                  (annexb-var-fn-names body pnames lexnames))))
+      ;; pre-declare the Annex B var bindings (undefined) unless already covered by a
+      ;; param, a `var`, or a top-level function declaration (those bind it themselves).
+      (let ((top-fns (hoisted-func-names stmts))
+            (varnames (collect-var-names body)))
+        (dolist (v *annexb-fn-names*)
+          (unless (or (member v pnames :test #'string=)
+                      (member v varnames :test #'string=)
+                      (member v top-fns :test #'string=))
+            ;; only create the var binding if absent (a shared eval env may already
+            ;; have it as a param/outer var — don't clobber it to undefined).
+            (em :const *undefined*) (em :declare-var-absent v))))
+      (dolist (n lexnames) (em :tdz-declare n))
       (dolist (fn (block-lexical-fns stmts)) (compile-expr fn) (em :init-let (second fn)))
       (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s))))
     (unless toplevel (em :const *undefined*) (em :ret))   ; functions default-return undefined
@@ -281,6 +297,107 @@
                   (progn (apply-default (fourth pr)) (assign-to-target val))
                   (assign-elem-with-default val))))))))))
 
+;;; ---- Annex B B.3.3: block-scoped function declarations ----
+;;; In sloppy mode a function declared in a block also creates a var-scoped binding
+;;; in the enclosing function/global scope, assigned (to the current lexical value)
+;;; when the block-level declaration is evaluated.
+(defun annexb-nested-fn-names (stmts &optional acc)
+  "Names of function declarations nested inside blocks/control-structures within
+   STMTS (NOT the direct top-level ones — those are ordinary var-hoisted fns).
+   Does not descend into nested functions."
+  (dolist (s stmts acc)
+    (when (consp s)
+      (setf acc (annexb-fn-names-in s acc '())))))
+
+(defun annexb-fn-names-in (node acc shadowed)
+  "Collect block-level function-declaration names under NODE (a statement),
+   descending through blocks/if/loops/try/switch/labels but not nested functions.
+   SHADOWED is the set of lexical names declared in enclosing blocks between here
+   and the var scope — a candidate whose name is shadowed is skipped (B.3.3.1)."
+  (when (consp node)
+    (case (car node)
+      ((:func :method-func :arrow :genfunc :class :asyncfunc :asyncgenfunc :async-arrow) acc)
+      (:block
+       ;; a nested block introduces its own lexicals into SHADOWED for its body
+       (let ((inner-shadow (append (block-lexical-names (second node)) shadowed)))
+         (dolist (s (second node) acc)
+           (when (and (consp s) (member (car s) '(:func :genfunc :asyncfunc :asyncgenfunc)) (second s)
+                      (not (member (second s) shadowed :test #'string=)))
+             (pushnew (second s) acc :test #'string=))
+           (setf acc (annexb-fn-names-in s acc inner-shadow)))))
+      ((:if) (setf acc (annexb-labeled-collect (third node) acc shadowed))
+             (when (fourth node) (setf acc (annexb-labeled-collect (fourth node) acc shadowed)))
+             acc)
+      ((:label) (annexb-labeled-collect (third node) acc shadowed))
+      ((:while :do-while) (annexb-labeled-collect (third node) acc shadowed))
+      ((:for :for-in :for-of :for-await-of)
+       ;; a `let`/`const` in the loop head lexically binds across the body — shadow it
+       (let ((head-lex (for-head-lexnames node)))
+         (annexb-labeled-collect (car (last node)) acc (append head-lex shadowed))))
+      ((:try)                               ; (:try blk param catch fin) — blk/catch/fin are :block nodes
+       (destructuring-bind (blk param catch fin) (cdr node)
+         (declare (ignore param))
+         (when (consp blk) (setf acc (annexb-fn-names-in blk acc shadowed)))
+         (when (consp catch) (setf acc (annexb-fn-names-in catch acc shadowed)))
+         (when (consp fin) (setf acc (annexb-fn-names-in fin acc shadowed)))
+         acc))
+      ((:switch)                            ; (:switch disc cases default)
+       (let* ((all (append (cdr (third node)) (fourth node)))  ; not exact, but the switch body
+              (sw-shadow (append (switch-lexical-names node) shadowed)))
+         (declare (ignore all))
+         (flet ((scan-stmts (ss)
+                  (dolist (s ss)
+                    (when (and (consp s) (member (car s) '(:func :genfunc :asyncfunc :asyncgenfunc)) (second s)
+                               (not (member (second s) shadowed :test #'string=)))
+                      (pushnew (second s) acc :test #'string=))
+                    (setf acc (annexb-fn-names-in s acc sw-shadow)))))
+           (dolist (clause (third node)) (scan-stmts (cdr clause)))
+           (when (fourth node) (scan-stmts (fourth node)))
+           acc)))
+      (t acc))))
+
+(defun for-head-lexnames (node)
+  "Lexical (let/const) names bound in a for/for-in/for-of loop head."
+  (let ((init (second node)))                ; :for init ...; :for-in/of lhs ...
+    (if (and (consp init) (eq (car init) :var)
+             (member (second init) '("let" "const") :test #'string=))
+        (let ((acc '())) (dolist (d (third init) acc) (setf acc (target-names (car d) acc))))
+        '())))
+
+(defun switch-lexical-names (node)
+  "Lexical (let/const/class) names declared across a switch's clauses+default."
+  (let ((acc '()))
+    (dolist (clause (third node)) (setf acc (append (block-lexical-names (cdr clause)) acc)))
+    (when (fourth node) (setf acc (append (block-lexical-names (fourth node)) acc)))
+    acc))
+
+(defun annexb-labeled-collect (node acc shadowed)
+  "A statement position that is NOT a block: a bare `function` decl there (e.g.
+   `if (x) function f(){}`, `label: function f(){}`) is a labelled/if fn decl —
+   its name also gets an Annex B var binding (unless shadowed)."
+  (when (consp node)
+    (cond
+      ((eq (car node) :block) (annexb-fn-names-in node acc shadowed))
+      ((and (member (car node) '(:func :genfunc :asyncfunc :asyncgenfunc)) (second node))
+       (if (member (second node) shadowed :test #'string=) acc
+           (progn (pushnew (second node) acc :test #'string=) acc)))
+      ((eq (car node) :label) (annexb-labeled-collect (third node) acc shadowed))
+      ((member (car node) '(:if :while :do-while :for :for-in :for-of :for-await-of :try :switch))
+       (annexb-fn-names-in node acc shadowed))
+      (t acc))))
+
+(defun annexb-var-fn-names (body pnames lexnames)
+  "The Annex B B.3.3 candidate names for BODY (a fn/program body): block-nested fn
+   names, minus formal parameters and minus enclosing lexical declarations. Sloppy
+   mode only (caller gates on *strict*)."
+  (let* ((stmts (if (and (consp body) (eq (car body) :block)) (second body) (list body)))
+         (cands (annexb-nested-fn-names stmts)))
+    ;; NB: a name that is ALSO a top-level function declaration is kept — the block
+    ;; fn's evaluation must still update the (already-existing) var binding (B.3.3).
+    (remove-if (lambda (n) (or (member n pnames :test #'string=)
+                               (member n lexnames :test #'string=)))
+               (remove-duplicates cands :test #'string=))))
+
 (defun collect-var-names (node &optional acc)
   "Collect `var`-declared names in NODE, NOT descending into nested functions."
   (when (consp node)
@@ -319,18 +436,25 @@
         collect (second s)))
 
 (defun compile-scoped-block (stmts)
-  "Compile a block that declares let/const: new env, TDZ-hoist lexicals,
-   hoist block-level function decls, run statements, pop env."
-  (let ((lex (block-lexical-names stmts)))
-    (if (null lex)
-        (mapc #'compile-stmt stmts)          ; no lexicals: keep it flat
+  "Compile a block: new env if it declares let/const/class OR block-level functions,
+   TDZ-hoist lexicals, hoist block-level function decls (lexically), and — for names
+   with an Annex B var binding — sync that var binding at the decl's evaluation point.
+   Then run statements, pop env."
+  (let ((lex (block-lexical-names stmts))
+        (fns (block-lexical-fns stmts)))
+    (if (and (null lex) (null fns))
+        (mapc #'compile-stmt stmts)          ; nothing block-scoped: keep it flat
         (progn
           (em :push-env)
           (let ((*scope-depth* (1+ *scope-depth*)))
             (dolist (n lex) (em :tdz-declare n))          ; temporal dead zone
-            ;; hoist block-scoped function declarations (initialized to undefined then defined)
-            (dolist (fn (block-lexical-fns stmts))
-              (compile-expr fn) (em :init-let (second fn)))
+            ;; hoist block-scoped function declarations (lexical binding = the fn),
+            ;; and if the name has an Annex B var binding, assign it now too.
+            (dolist (fn fns)
+              (compile-expr fn)
+              (when (member (second fn) *annexb-fn-names* :test #'string=)
+                (em :annexb-var-set (second fn)))          ; leaves the fn value on the stack
+              (em :init-let (second fn)))
             (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s)))
             (em :pop-env))))))
 
@@ -338,6 +462,11 @@
   "Function declarations directly in STMTS (hoisted at block scope)."
   (remove-if-not #'block-hoisted-fn-p stmts))
 (defun block-hoisted-fn-p (s) (and (consp s) (member (car s) '(:func :genfunc :asyncfunc :asyncgenfunc)) (second s)))
+(defun annexb-wrap-fn-stmt (s)
+  "Annex B B.3.4: a bare `FunctionDeclaration` in a single-statement position (the
+   consequent/alternate of an `if`, a labelled statement) is treated as if enclosed
+   in a block — giving it block scoping plus the Annex B var binding."
+  (if (block-hoisted-fn-p s) (list :block (list s)) s))
 
 ;;; ---- statements ----
 (defun compile-stmt (node)
@@ -370,8 +499,8 @@
     (:throw (compile-expr (second node)) (em :throw-op))
     (:if (let ((l1 (lbl)) (l2 (lbl)))
            (compile-expr (second node)) (em :jmp-if-false l1)
-           (compile-stmt (third node)) (em :jmp l2)
-           (em :label l1) (when (fourth node) (compile-stmt (fourth node)))
+           (compile-stmt (annexb-wrap-fn-stmt (third node))) (em :jmp l2)
+           (em :label l1) (when (fourth node) (compile-stmt (annexb-wrap-fn-stmt (fourth node))))
            (em :label l2)))
     (:while (let ((top (lbl)) (end (lbl)))
               (em :label top) (compile-expr (second node)) (em :jmp-if-false end)
@@ -465,7 +594,7 @@
         (let ((end (lbl)))
           (let ((*labels* (append (mapcar (lambda (nm) (list nm end nil *scope-depth*)) names)
                                   *labels*)))
-            (compile-stmt n))
+            (compile-stmt (annexb-wrap-fn-stmt n)))   ; B.3.4: `label: function f(){}` blocks the fn
           (em :label end)))))
 
 (defun compile-for (node)
