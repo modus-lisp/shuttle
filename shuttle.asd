@@ -36,4 +36,5 @@ host-binding seam a consumer like weft hangs DOM objects + reflow on). Oracle: t
                                            (:file "global-funcs")
                                            (:file "error-extra")
                                            (:file "bigint")
-                                           (:file "annexb-string")))))))
+                                           (:file "annexb-string")
+                                           (:file "disposable")))))))
