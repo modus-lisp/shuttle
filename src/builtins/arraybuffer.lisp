@@ -234,6 +234,17 @@
     (let ((host (make-object :proto (realm-object-proto realm))))
       (def-method realm host "detachArrayBuffer" 1 (this args)
         (ab-detach (arg 0 args)))
+      ;; evalScript: run source in THIS realm (global scope), return completion.
+      (def-method realm host "evalScript" 1 (this args)
+        (let ((*current-realm* realm))
+          (run (compile-toplevel (to-string (arg 0 args)))
+               (realm-global-env realm) (realm-global realm))))
+      ;; createRealm: a fresh realm; return ITS $262 (has .global + its own
+      ;; createRealm/evalScript). Enables the proto-from-ctor-realm cluster —
+      ;; the newTarget-honoring construct path uses the child realm's intrinsics.
+      (def-method realm host "createRealm" 0 (this args)
+        (let ((child (make-realm)))
+          (js-get (realm-global child) "$262")))
       (def-value host "global" (realm-global realm))
       (define-global realm "$262" host))))
 

@@ -1430,7 +1430,7 @@
 (define-condition shuttle-timeout (error) ()   ; distinct from a JS throw
   (:report (lambda (c s) (declare (ignore c)) (format s "shuttle: instruction budget exceeded"))))
 (declaim (type fixnum *steps* *max-steps*))
-(defparameter *steps* 0) (defparameter *max-steps* 2000000)   ; per-run budget (guards infinite loops)
+(defparameter *steps* 0) (defparameter *max-steps* 20000000)  ; per-run budget; the 5s wall-clock is the real infinite-loop backstop, so keep this high enough for legit 64k-iteration harness loops
 
 (defvar *run-depth* 0)    ; 0 = top-level script run; drain microtasks when it unwinds
 
