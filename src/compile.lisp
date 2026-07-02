@@ -11,6 +11,7 @@
   (constructable t))      ; NIL for arrows and concise/accessor methods (new'ing them is a TypeError)
 
 (defvar *strict* nil)     ; compile-time: are we lexically inside strict code? (inherited by nested fns)
+(defvar *in-function* nil) ; compile-time: inside a function body? (`new.target` early error outside one)
 (defvar *out*)
 (defvar *break-target* nil) (defvar *continue-target* nil)
 (defvar *labels* '())          ; ((NAME break-lbl continue-lbl-or-nil scope-depth) ...)
@@ -27,7 +28,7 @@
     (dolist (in instrs) (if (eq (car in) :label) (setf (gethash (cadr in) pos) idx) (incf idx)))
     (dolist (in instrs)
       (unless (eq (car in) :label)
-        (push (if (member (car in) '(:jmp :jmp-if-false :jmp-if-true :and-jmp :or-jmp :nullish-jmp :nullish-short :push-handler))
+        (push (if (member (car in) '(:jmp :jmp-if-false :jmp-if-true :and-jmp :or-jmp :nullish-jmp :nullish-short :nullish-short-2 :push-handler))
                   (list (car in) (gethash (cadr in) pos)) in) out)))
     (coerce (nreverse out) 'vector)))
 
@@ -105,7 +106,8 @@
   ;; strict is triggered by the body's own "use strict" prologue OR inherited from
   ;; enclosing strict code. sloppy substitution is the default. (Arrows keep
   ;; :lexical regardless — they inherit `this` from the definition site.)
-  (let ((*strict* (or *strict* (directive-prologue-strict-p body))))
+  (let ((*strict* (or *strict* (directive-prologue-strict-p body)))
+        (*in-function* (if toplevel *in-function* t)))  ; top-level program/eval: not a function body
   (when (and (eq this-mode :normal) *strict*)
     (setf this-mode :strict))
   (let ((*out* '()) (pnames (param-names params)))
@@ -168,7 +170,7 @@
       ;; :global-instantiate / :eval-var-decl). Inside an ordinary function body they
       ;; are hoisted into the function's declarative record via :init-let.
       (dolist (fn (block-lexical-fns stmts))
-        (compile-expr fn)
+        (compile-fn-decl-closure fn)
         (if toplevel (em :declare-var (second fn)) (em :init-let (second fn))))
       (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s))))
     (unless toplevel (em :const *undefined*) (em :ret))   ; functions default-return undefined
@@ -180,7 +182,8 @@
    (param binding + var/lexical/fn hoisting — run synchronously at the call) from the
    deferred body. Returns a CODE whose INST-INSTRS is the instantiation stream and
    INSTRS is the body; both run against the SAME function environment."
-  (let ((*strict* (or *strict* (directive-prologue-strict-p body))))
+  (let ((*strict* (or *strict* (directive-prologue-strict-p body)))
+        (*in-function* t))
   (when (and (eq this-mode :normal) *strict*)
     (setf this-mode :strict))
   (let ((pnames (param-names params)) (inst nil))
@@ -191,7 +194,7 @@
           (em :const *undefined*) (em :declare-var v)))
       (let ((stmts (if (eq (car body) :block) (second body) (list body))))
         (dolist (n (block-lexical-names stmts)) (em :tdz-declare n))
-        (dolist (fn (block-lexical-fns stmts)) (compile-expr fn) (em :init-let (second fn))))
+        (dolist (fn (block-lexical-fns stmts)) (compile-fn-decl-closure fn) (em :init-let (second fn))))
       (em :const *undefined*) (em :ret)              ; instantiation stream returns undefined
       (setf inst (assemble *out*)))
     (let ((*out* '()))
@@ -202,38 +205,67 @@
                  :this-mode this-mode :strict *strict*)))))
 
 (defun compile-array-destructure (pat)
-  "Value on stack is the iterable. Destructure per (:apat ELEMS)."
-  (let ((it (string (gensym "IT"))) (elems (second pat)))
+  "Value on stack is the iterable. Destructure per (:apat ELEMS). Tracks the
+   iterator's done-state and, when the pattern has no rest element and does not
+   exhaust the iterator, performs IteratorClose (calls .return())."
+  (let* ((it (string (gensym "IT"))) (done (string (gensym "DN")))
+         (elems (second pat))
+         (has-rest (some (lambda (e) (and (consp e) (eq (car e) :rest))) elems)))
     (em :get-iterator) (em :declare-var it)
-    (dolist (e elems)
-      (cond
-        ((null e)                            ; hole: step iterator, discard
-         (em :get-var it) (em :iter-next) (em :pop))
-        ((and (consp e) (eq (car e) :rest))
-         (em :get-var it) (em :iter-rest)    ; collect remaining into an array
-         (bind-target (second e)))
-        ((and (consp e) (eq (car e) :default))
-         (em :get-var it) (em :iter-next) (em :get-prop-c "value")
-         (apply-default (third e))
-         (bind-target (second e)))
-        (t (em :get-var it) (em :iter-next) (em :get-prop-c "value")
-           (bind-target e))))))
+    (em :const *false*) (em :declare-var done)
+    (let ((close (lbl)) (after (lbl)))
+      (em :push-handler close)               ; a throw while binding => IteratorClose then rethrow
+      (dolist (e elems)
+        (cond
+          ((null e)                            ; hole: step iterator (respecting done), discard
+           (em :iter-step-checked done it) (em :pop))
+          ((and (consp e) (eq (car e) :rest))
+           (em :get-var it) (em :iter-rest)    ; collect remaining into an array (exhausts iterator)
+           (em :const *true*) (em :set-var done) (em :pop)
+           (bind-target (second e)))
+          ((and (consp e) (eq (car e) :default))
+           (em :iter-step-checked done it)
+           (apply-default (third e) (and (stringp (second e)) (second e)))
+           (bind-target (second e)))
+          (t (em :iter-step-checked done it)
+             (bind-target e))))
+      (em :pop-handler)
+      (unless has-rest (em :iter-close-normal done it))
+      (em :jmp after)
+      (em :label close)                      ; thrown value on stack
+      (em :iter-close-abrupt done it)        ; close (swallowing return errors), leave the thrown value
+      (em :throw-op)                         ; rethrow the original
+      (em :label after))))
 
 (defun compile-object-destructure (pat)
   "Value on stack is the source object. Destructure per (:opat PROPS)."
-  (let ((src (string (gensym "SRC"))) (props (second pat)) (seen '()))
+  (let* ((src (string (gensym "SRC"))) (props (second pat)) (seen '())
+         (has-rest (some (lambda (p) (eq (car p) :rest)) props))
+         ;; a { ...rest } with computed keys needs a RUNTIME exclusion set (the
+         ;; computed keys are only known at evaluation time, in source order).
+         (dyn-excl (and has-rest (some (lambda (p) (and (not (eq (car p) :rest))
+                                                        (consp (car p)) (eq (car (car p)) :computed)))
+                                       props)))
+         (excl (and dyn-excl (string (gensym "EXCL")))))
+    (em :require-coercible)                   ; { } = null / undefined still throws (RequireObjectCoercible)
     (em :declare-var src)
+    (when dyn-excl (em :new-array) (em :declare-var excl))
     (dolist (pr props)
       (cond
         ((eq (car pr) :rest)
-         ;; { ...rest }: copy own enumerable keys not already taken
-         (em :get-var src) (em :object-rest (reverse seen)) (em :declare-var (second pr)))
+         (em :get-var src)
+         (if dyn-excl (progn (em :get-var excl) (em :swap) (em :object-rest-dyn))
+             (em :object-rest (reverse seen)))
+         (em :declare-var (second pr)))
         (t (destructuring-bind (key tgt &optional default) pr
              (push (and (eq (car key) :lit) (second key)) seen)
-             (em :get-var src)
-             (if (eq (car key) :computed) (progn (compile-expr (second key)) (em :get-prop))
-                 (em :get-prop-c (second key)))
-             (when default (apply-default default))
+             (cond
+               ((eq (car key) :computed)
+                (compile-expr (second key)) (em :to-prop-key)   ; key value on stack
+                (when dyn-excl (em :array-append excl))          ; record for exclusion (peeks, leaves key)
+                (em :get-var src) (em :swap) (em :get-prop))
+               (t (em :get-var src) (em :get-prop-c (second key))))
+             (when default (apply-default default (and (stringp tgt) tgt)))
              (bind-target tgt)))))))
 
 (defun compile-params (params)
@@ -244,14 +276,17 @@
       ((and (consp p) (eq (car p) :rest))
        (em :load-rest i) (bind-target (second p)))
       ((and (consp p) (eq (car p) :default))
-       (em :load-arg i) (apply-default (third p)) (bind-target (second p)))
+       (em :load-arg i) (apply-default (third p) (and (stringp (second p)) (second p))) (bind-target (second p)))
       (t (em :load-arg i) (bind-target p)))))
 
-(defun apply-default (default-expr)
-  "Top of stack is a value; if it is undefined, replace with DEFAULT-EXPR."
+(defun apply-default (default-expr &optional name)
+  "Top of stack is a value; if it is undefined, replace with DEFAULT-EXPR. When the
+   binding target is a plain NAME and DEFAULT-EXPR is an anonymous fn/class, the
+   default value is named after the binding (NamedEvaluation)."
   (let ((skip (lbl)))
     (em :dup) (em :const *undefined*) (em :bin "!==") (em :jmp-if-true skip)
     (em :pop) (compile-expr default-expr)
+    (when (and (stringp name) (anonymous-fn-value-p default-expr)) (em :set-fn-name name))
     (em :label skip)))
 
 (defun bind-lexical (tgt kind)
@@ -291,7 +326,9 @@
   "ELEM may be (:assign \"=\" TGT DEFAULT). Applies default if value is undefined,
    then assigns. Value on top of stack."
   (if (and (consp elem) (eq (car elem) :assign) (string= (second elem) "="))
-      (progn (apply-default (fourth elem)) (assign-to-target (third elem)))
+      (let ((tgt (third elem)))
+        (apply-default (fourth elem) (and (consp tgt) (eq (car tgt) :ident) (second tgt)))
+        (assign-to-target tgt))
       (assign-to-target elem)))
 
 (defun compile-assign-pattern (pat)
@@ -299,35 +336,63 @@
    Consumes the value."
   (ecase (car pat)
     (:array
-     (let ((it (string (gensym "IT"))) (elems (second pat)))
+     (let* ((it (string (gensym "IT"))) (done (string (gensym "DN"))) (elems (second pat))
+            (has-rest (some (lambda (e) (and (consp e) (eq (car e) :spread))) elems)))
        (em :get-iterator) (em :declare-var it)
-       (dolist (e elems)
-         (cond
-           ((null e) (em :get-var it) (em :iter-next) (em :pop))       ; hole
-           ((and (consp e) (eq (car e) :spread))
-            (em :get-var it) (em :iter-rest) (assign-to-target (second e)))
-           (t (em :get-var it) (em :iter-next) (em :get-prop-c "value")
-              (assign-elem-with-default e))))))
+       (em :const *false*) (em :declare-var done)
+       (let ((close (lbl)) (after (lbl)))
+         (em :push-handler close)
+         (dolist (e elems)
+           (cond
+             ((null e) (em :iter-step-checked done it) (em :pop))       ; hole
+             ((and (consp e) (eq (car e) :spread))
+              (em :get-var it) (em :iter-rest) (em :const *true*) (em :set-var done) (em :pop)
+              (assign-to-target (second e)))
+             (t (em :iter-step-checked done it)
+                (assign-elem-with-default e))))
+         (em :pop-handler)
+         (unless has-rest (em :iter-close-normal done it))
+         (em :jmp after)
+         (em :label close)
+         (em :iter-close-abrupt done it)
+         (em :throw-op)
+         (em :label after))))
     (:object
-     (let ((src (string (gensym "SRC"))) (seen '()))
+     (let* ((src (string (gensym "SRC"))) (seen '())
+            (has-rest (some (lambda (p) (eq (car p) :spread)) (second pat)))
+            (dyn-excl (and has-rest (some (lambda (p) (and (eq (car p) :init)
+                                                           (eq (car (second p)) :computed)))
+                                          (second pat))))
+            (excl (and dyn-excl (string (gensym "EXCL")))))
+       (em :require-coercible)                 ; ({} = null) still throws
        (em :declare-var src)
+       (when dyn-excl (em :new-array) (em :declare-var excl))
        (dolist (pr (second pat))
          (ecase (car pr)
            (:spread
-            (em :get-var src) (em :object-rest (reverse seen)) (assign-to-target (second pr)))
+            (em :get-var src)
+            (if dyn-excl (progn (em :get-var excl) (em :swap) (em :object-rest-dyn))
+                (em :object-rest (reverse seen)))
+            (assign-to-target (second pr)))
            (:proto                                   ; treat like a normal key __proto__
             (push "__proto__" seen)
+            (when dyn-excl (em :const "__proto__") (em :array-append excl) (em :pop))
             (em :get-var src) (em :get-prop-c "__proto__") (assign-to-target (second pr)))
            (:init
             (let ((key (second pr)) (val (third pr)))
               (when (eq (car key) :lit) (push (second key) seen))
-              (em :get-var src)
-              (if (eq (car key) :computed) (progn (compile-expr (second key)) (em :get-prop))
-                  (em :get-prop-c (second key)))
+              (cond
+                ((eq (car key) :computed)
+                 (compile-expr (second key)) (em :to-prop-key)
+                 (when dyn-excl (em :array-append excl))
+                 (em :get-var src) (em :swap) (em :get-prop))
+                (t (when dyn-excl (em :const (second key)) (em :array-append excl) (em :pop))
+                   (em :get-var src) (em :get-prop-c (second key))))
               ;; val is the target expression (possibly (:assign = tgt default) for {k: t = d}
               ;; or (:ident name) for shorthand {k}, or (:ident name)+default stored in 4th)
               (if (fourth pr)                        ; shorthand-with-default {x = d}
-                  (progn (apply-default (fourth pr)) (assign-to-target val))
+                  (progn (apply-default (fourth pr) (and (consp val) (eq (car val) :ident) (second val)))
+                         (assign-to-target val))
                   (assign-elem-with-default val))))))))))
 
 ;;; ---- Annex B B.3.3: block-scoped function declarations ----
@@ -374,10 +439,8 @@
          (when (consp catch) (setf acc (annexb-fn-names-in catch acc shadowed)))
          (when (consp fin) (setf acc (annexb-fn-names-in fin acc shadowed)))
          acc))
-      ((:switch)                            ; (:switch disc cases default)
-       (let* ((all (append (cdr (third node)) (fourth node)))  ; not exact, but the switch body
-              (sw-shadow (append (switch-lexical-names node) shadowed)))
-         (declare (ignore all))
+      ((:switch)                            ; (:switch disc clauses) — clause = (TEST-or-:default . body)
+       (let ((sw-shadow (append (switch-lexical-names node) shadowed)))
          (flet ((scan-stmts (ss)
                   (dolist (s ss)
                     (when (and (consp s) (member (car s) '(:func :genfunc :asyncfunc :asyncgenfunc)) (second s)
@@ -385,7 +448,6 @@
                       (pushnew (second s) acc :test #'string=))
                     (setf acc (annexb-fn-names-in s acc sw-shadow)))))
            (dolist (clause (third node)) (scan-stmts (cdr clause)))
-           (when (fourth node) (scan-stmts (fourth node)))
            acc)))
       (t acc))))
 
@@ -398,10 +460,9 @@
         '())))
 
 (defun switch-lexical-names (node)
-  "Lexical (let/const/class) names declared across a switch's clauses+default."
+  "Lexical (let/const/class) names declared across a switch's clauses."
   (let ((acc '()))
     (dolist (clause (third node)) (setf acc (append (block-lexical-names (cdr clause)) acc)))
-    (when (fourth node) (setf acc (append (block-lexical-names (fourth node)) acc)))
     acc))
 
 (defun annexb-labeled-collect (node acc shadowed)
@@ -484,12 +545,50 @@
             ;; hoist block-scoped function declarations (lexical binding = the fn),
             ;; and if the name has an Annex B var binding, assign it now too.
             (dolist (fn fns)
-              (compile-expr fn)
+              (compile-fn-decl-closure fn)
               (when (member (second fn) *annexb-fn-names* :test #'string=)
                 (em :annexb-var-set (second fn)))          ; leaves the fn value on the stack
               (em :init-let (second fn)))
             (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s)))
             (em :pop-env))))))
+
+(defun compile-switch (node)
+  "SwitchStatement: CaseBlockEvaluation with source-order clauses & fall-through.
+   The whole CaseBlock is one lexical scope (let/const/fns shared across clauses)."
+  (destructuring-bind (disc clauses) (cdr node)
+    (let* ((dv (string (gensym "SW"))) (end (lbl))
+           (labels (mapcar (lambda (c) (cons c (lbl))) clauses))
+           (default-entry (find :default clauses :key #'car))
+           (deflabel (if default-entry (cdr (assoc default-entry labels)) end))
+           ;; all statements across every clause body form ONE lexical scope
+           (all-body (loop for c in clauses append (cdr c)))
+           (lex (block-lexical-names all-body))
+           (fns (block-lexical-fns all-body))
+           (scoped (or lex fns)))
+      (compile-expr disc) (em :declare-var dv)
+      (when scoped
+        (em :push-env)
+        (incf *scope-depth*)
+        (dolist (n lex) (em :tdz-declare n))
+        (dolist (fn fns)
+          (compile-fn-decl-closure fn)
+          (when (member (second fn) *annexb-fn-names* :test #'string=)
+            (em :annexb-var-set (second fn)))
+          (em :init-let (second fn))))
+      (em :comp-clear)
+      ;; Test cases in physical order (A before default, then B). First === match
+      ;; jumps to that clause's body; fall-through then runs the rest in order.
+      (dolist (cl labels)
+        (unless (eq (car (car cl)) :default)
+          (em :get-var dv) (compile-expr (car (car cl))) (em :bin "===") (em :jmp-if-true (cdr cl))))
+      (em :jmp deflabel)
+      (let ((*break-target* end) (*break-depth* *scope-depth*))
+        (dolist (cl labels)
+          (em :label (cdr cl))
+          (dolist (s (cdr (car cl)))
+            (unless (block-hoisted-fn-p s) (compile-stmt s)))))
+      (when scoped (em :pop-env) (decf *scope-depth*))
+      (em :label end) (em :comp-default-undef))))
 
 (defun block-lexical-fns (stmts)
   "Function declarations directly in STMTS (hoisted at block scope)."
@@ -501,6 +600,35 @@
    in a block — giving it block scoping plus the Annex B var binding."
   (if (block-hoisted-fn-p s) (list :block (list s)) s))
 
+(defun compile-fn-decl-closure (node)
+  "Emit the closure object for a FunctionDeclaration/GeneratorDeclaration/etc.
+   Unlike a named function EXPRESSION, a declaration gets NO immutable inner
+   self-binding of its own name — the name is provided by the (mutable) outer
+   binding created by the enclosing scope (fn/global var, block let, etc.), so
+   `function f(){ f = 1; }` reassigns that outer binding rather than throwing."
+  (ecase (car node)
+    (:func         (em :closure         (compile-fn (second node) (third node) (fourth node))))
+    (:genfunc      (em :genclosure      (compile-fn-split (second node) (third node) (fourth node))))
+    (:asyncfunc    (em :asyncclosure    (compile-fn-split (second node) (third node) (fourth node))))
+    (:asyncgenfunc (em :asyncgenclosure (compile-fn-split (second node) (third node) (fourth node))))))
+
+(defun anonymous-fn-value-p (node)
+  "T if NODE is an expression that produces an anonymous function/class (one with
+   no name of its own) — eligible for NamedEvaluation (`.name` := binding name)."
+  (and (consp node)
+       (case (car node)
+         ((:func :genfunc :asyncfunc :asyncgenfunc) (null (second node)))   ; function(){} with no id
+         ((:arrow :async-arrow) t)                                          ; arrows are always anonymous
+         (:class (null (second node)))                                      ; class {} with no id
+         (t nil))))
+
+(defun compile-named-init (value name)
+  "Compile VALUE onto the stack; if it is an anonymous function/class and NAME is a
+   plain string binding name, apply NamedEvaluation so its .name becomes NAME."
+  (compile-expr value)
+  (when (and (stringp name) (anonymous-fn-value-p value))
+    (em :set-fn-name name)))
+
 ;;; ---- statements ----
 (defun compile-stmt (node)
   (ecase (car node)
@@ -509,15 +637,15 @@
     (:expr (compile-expr (second node)) (em :save-completion))
     (:var (let ((kind (second node)))
             (loop for (tgt . init) in (third node)
-                  do (if init (compile-expr init) (em :const *undefined*))
+                  do (if init (compile-named-init init (and (stringp tgt) tgt)) (em :const *undefined*))
                      (cond
                        ((string= kind "const") (bind-lexical tgt :const))
                        ((string= kind "let")   (bind-lexical tgt :let))
                        (t (if (stringp tgt) (em :declare-var tgt) (bind-target tgt)))))))
-    (:func (compile-expr node) (em :declare-var (second node)))
-    (:genfunc (compile-expr node) (em :declare-var (second node)))
-    (:asyncfunc (compile-expr node) (em :declare-var (second node)))
-    (:asyncgenfunc (compile-expr node) (em :declare-var (second node)))
+    (:func (compile-fn-decl-closure node) (em :declare-var (second node)))
+    (:genfunc (compile-fn-decl-closure node) (em :declare-var (second node)))
+    (:asyncfunc (compile-fn-decl-closure node) (em :declare-var (second node)))
+    (:asyncgenfunc (compile-fn-decl-closure node) (em :declare-var (second node)))
     (:class (compile-expr node) (em :init-let (second node)))   ; class decl: lexical binding
     (:private-field-init
      ;; this.#name = INIT ; add a fresh private field to `this`'s brand table
@@ -531,29 +659,32 @@
     (:return (compile-expr (second node)) (em :ret))
     (:throw (compile-expr (second node)) (em :throw-op))
     (:if (let ((l1 (lbl)) (l2 (lbl)))
+           (em :comp-clear)
            (compile-expr (second node)) (em :jmp-if-false l1)
            (compile-stmt (annexb-wrap-fn-stmt (third node))) (em :jmp l2)
            (em :label l1) (when (fourth node) (compile-stmt (annexb-wrap-fn-stmt (fourth node))))
-           (em :label l2)))
+           (em :label l2) (em :comp-default-undef)))
     (:while (let ((top (lbl)) (end (lbl)))
+              (em :comp-clear)
               (em :label top) (compile-expr (second node)) (em :jmp-if-false end)
               (let ((*break-target* end) (*continue-target* top)
                     (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
                     (*labels* (loop-label-entries end top *scope-depth*)) (*pending-labels* '()))
                 (compile-stmt (third node)))
-              (em :jmp top) (em :label end)))
+              (em :jmp top) (em :label end) (em :comp-default-undef)))
     (:do-while (let ((top (lbl)) (cont (lbl)) (end (lbl)))
+                 (em :comp-clear)
                  (em :label top)
                  (let ((*break-target* end) (*continue-target* cont)
                        (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
                        (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
                    (compile-stmt (third node)))
                  (em :label cont) (compile-expr (second node)) (em :jmp-if-true top)
-                 (em :label end)))
-    (:for (compile-for node))
-    (:for-in (compile-scoped-loop node #'compile-for-in))
-    (:for-of (compile-scoped-loop node #'compile-for-of))
-    (:for-await-of (compile-scoped-loop node #'compile-for-await-of))
+                 (em :label end) (em :comp-default-undef)))
+    (:for (em :comp-clear) (compile-for node) (em :comp-default-undef))
+    (:for-in (em :comp-clear) (compile-scoped-loop node #'compile-for-in) (em :comp-default-undef))
+    (:for-of (em :comp-clear) (compile-scoped-loop node #'compile-for-of) (em :comp-default-undef))
+    (:for-await-of (em :comp-clear) (compile-scoped-loop node #'compile-for-await-of) (em :comp-default-undef))
     (:label (compile-labeled node))
     (:break (let ((lbl (second node)))
               (if lbl
@@ -570,17 +701,7 @@
                        (pop-envs (- *scope-depth* (fourth entry))) (em :jmp (third entry)))
                      (if *continue-target* (progn (pop-envs (- *scope-depth* *continue-depth*)) (em :jmp *continue-target*))
                          (js-throw (make-native-error "SyntaxError" "illegal continue"))))))
-    (:switch (destructuring-bind (disc cases default) (cdr node)
-               (let ((dv (string (gensym "SW"))) (end (lbl)) (deflabel (lbl))
-                     (clabels (mapcar (lambda (c) (cons c (lbl))) cases)))
-                 (compile-expr disc) (em :declare-var dv)
-                 (dolist (cl clabels)
-                   (em :get-var dv) (compile-expr (car (car cl))) (em :bin "===") (em :jmp-if-true (cdr cl)))
-                 (em :jmp deflabel)
-                 (let ((*break-target* end) (*break-depth* *scope-depth*))
-                   (dolist (cl clabels) (em :label (cdr cl)) (mapc #'compile-stmt (cdr (car cl))))
-                   (em :label deflabel) (when default (mapc #'compile-stmt default)))
-                 (em :label end))))
+    (:switch (compile-switch node))
     (:with
      (when *strict*
        (js-throw (make-native-error "SyntaxError" "'with' statements are not allowed in strict mode")))
@@ -590,10 +711,12 @@
        (compile-stmt (third node)))
      (em :pop-env))
     (:try (destructuring-bind (blk param catch fin) (cdr node)
+            (em :comp-clear)
             (if catch
                 (let ((lc (lbl)) (after (lbl)))
                   (em :push-handler lc) (compile-stmt blk) (em :pop-handler) (em :jmp after)
                   (em :label lc)                                  ; thrown value on stack
+                  (em :comp-clear)                                ; catch clause: fresh completion
                   (em :push-env)                                  ; catch parameter scope
                   (let ((*scope-depth* (1+ *scope-depth*)))
                     (cond ((null param) (em :pop))
@@ -603,7 +726,12 @@
                   (em :pop-env)
                   (em :label after))
                 (compile-stmt blk))
-            (when fin (compile-stmt fin))))))   ; v0: finally runs on the normal/caught path
+            (when fin                                             ; finally: if it completes normally, keep the try/catch value
+              (let ((saved (string (gensym "FINV"))))
+                (em :comp-default-undef) (em :get-completion) (em :declare-var saved)
+                (em :comp-clear) (compile-stmt fin)
+                (em :get-var saved) (em :save-completion)))
+            (em :comp-default-undef)))))   ; v0: finally runs on the normal/caught path
 
 (defun loop-label-entries (break-lbl continue-lbl depth)
   "Register any *pending-labels* (labels attached to this loop) as label entries
@@ -735,6 +863,10 @@
     (:null (em :const *null*))
     (:undefined (em :const *undefined*))
     (:this (em :get-this))
+    (:new-target
+     (unless *in-function*
+       (js-throw (make-native-error "SyntaxError" "new.target expression is not allowed here")))
+     (em :new-target))
     (:ident (em :get-var (second node)))
     (:bin (if (and (string= (second node) "in")
                    (consp (third node)) (eq (car (third node)) :private-ref))
@@ -767,15 +899,21 @@
                 do (compile-expr e) (when more (em :pop))))
     (:assign (compile-assign (second node) (third node) (fourth node)))
     (:update (compile-update (second node) (third node) (fourth node)))
-    (:member (compile-expr (second node))
-             (if (fourth node) (progn (compile-expr (third node)) (em :get-prop))
-                 (em :get-prop-c (second (third node)))))   ; non-computed key node is (:str name)
+    (:member (if (chain-contains-optional-p (second node))
+                 (compile-optional-chain node)              ; e.g. a?.b.c — one chain, one short-circuit
+                 (progn (compile-expr (second node))
+                        (if (fourth node) (progn (compile-expr (third node)) (em :get-prop))
+                            (em :get-prop-c (second (third node)))))))  ; non-computed key node is (:str name)
     (:private-member                                        ; obj.#name (brand-checked read)
-     (compile-expr (second node))
-     (em :private-get (resolve-private-name (third node))))
+     (if (chain-contains-optional-p (second node))
+         (compile-optional-chain node)
+         (progn (compile-expr (second node))
+                (em :private-get (resolve-private-name (third node))))))
     (:oprivate-member                                       ; obj?.#name (standalone)
      (compile-optional-chain node))
-    (:call (compile-call (second node) (third node)))
+    (:call (if (chain-contains-optional-p (second node))
+               (compile-optional-chain node)               ; e.g. a?.b() — call inside an optional chain
+               (compile-call (second node) (third node))))
     (:new (compile-expr (second node))
           (if (some (lambda (a) (and (consp a) (eq (car a) :spread))) (third node))
               (progn (compile-arg-array (third node)) (em :new-spread))
@@ -992,9 +1130,19 @@
     (ecase (car pr)
       (:init
        (let ((key (second pr)) (val (third pr)))
-         (if (eq (car key) :computed) (compile-expr (second key)) (em :const (second key)))
-         (compile-expr val)
-         (em :def-prop)))                    ; obj key val -> obj
+         (cond
+           ((eq (car key) :computed)
+            (compile-expr (second key))
+            (if (anonymous-fn-value-p val)
+                (progn (em :dup)                 ; [obj key key] — extra copy for NamedEvaluation
+                       (compile-expr val)        ; [obj key key val]
+                       (em :set-fn-name-dyn))    ; names val from the key copy -> [obj key val]
+                (compile-expr val))
+            (em :def-prop))
+           (t
+            (em :const (second key))
+            (compile-named-init val (and (stringp (second key)) (second key)))
+            (em :def-prop)))))                ; obj key val -> obj
       ((:get :set)
        (let ((key (second pr)) (fn (third pr)))
          (if (eq (car key) :computed) (compile-expr (second key)) (em :const (second key)))
@@ -1029,17 +1177,9 @@
                  (if (fourth tag) (progn (compile-expr (third tag)) (em :get-prop))
                      (em :get-prop-c (second (third tag)))))
           (progn (em :const *undefined*) (compile-expr tag)))
-      ;; build the strings array (cooked) with a .raw array
-      (em :new-array)
-      (loop for s in cooked for i from 0 do
-        (em :dup) (em :const (princ-to-string i)) (em :const s) (em :set-prop) (em :pop))
-      (em :dup) (em :const "length") (em :const (float (length cooked) 1d0)) (em :set-prop) (em :pop)
-      ;; .raw
-      (em :dup) (em :const "raw") (em :new-array)
-      (loop for s in raw for i from 0 do
-        (em :dup) (em :const (princ-to-string i)) (em :const s) (em :set-prop) (em :pop))
-      (em :dup) (em :const "length") (em :const (float (length raw) 1d0)) (em :set-prop) (em :pop)
-      (em :set-prop) (em :pop)
+      ;; the frozen, cached template object (same call site => same object identity,
+      ;; per GetTemplateObject). SITE-KEY is a fresh cons unique to this AST node.
+      (em :template-object (list :site (list :key (cons nil nil)) :cooked cooked :raw raw))
       ;; substitutions as remaining args
       (dolist (e exprs) (compile-expr e))
       (em :call (1+ (length exprs))))))
@@ -1047,6 +1187,17 @@
 ;;; ---- optional chaining ----
 (defun optional-chain-p (node)
   (and (consp node) (member (car node) '(:omember :ocall :oprivate-member))))
+
+(defun chain-contains-optional-p (node)
+  "T if NODE is a member/call/optional access whose chain of bases contains at
+   least one ?. link. A plain `.b`/`b()` that wraps an optional sub-chain must be
+   compiled as ONE optional chain (a short-circuit skips the whole rest)."
+  (and (consp node)
+       (case (car node)
+         ((:omember :ocall :oprivate-member) t)
+         ((:member :private-member) (chain-contains-optional-p (second node)))
+         (:call (chain-contains-optional-p (second node)))
+         (t nil))))
 
 (defun compile-optional-chain (node)
   "Compile a chain containing at least one ?. link. If any optional link's base
@@ -1059,47 +1210,71 @@
       (em :label done))))
 
 (defun compile-chain-link (node short)
-  "Emit code leaving the link's value on the stack; on an optional null/undefined
-   base, jump to SHORT (with the base value still on the stack to be popped)."
+  "Emit code leaving the link's value (exactly one) on the stack. STACK INVARIANT:
+   a link consumes its base and leaves one value; on an optional nullish base, jump
+   to SHORT with exactly ONE value on the stack (the SHORT handler pops it and
+   pushes undefined). `:nullish-short` PEEKS (leaves the value), so no dup is needed."
   (ecase (car node)
     (:omember
      (compile-chain-base (second node) short)
-     (em :dup) (em :nullish-short short)      ; if base nullish, jump to short (base on stack)
+     (em :nullish-short short)                 ; base nullish -> SHORT (base still on stack)
      (if (fourth node) (progn (compile-expr (third node)) (em :get-prop))
          (em :get-prop-c (second (third node)))))
     (:oprivate-member
      (compile-chain-base (second node) short)
-     (em :dup) (em :nullish-short short)
+     (em :nullish-short short)
      (em :private-get (resolve-private-name (third node))))
     (:private-member
      (compile-chain-base (second node) short)
      (em :private-get (resolve-private-name (third node))))
     (:ocall
-     (compile-chain-base (second node) short)
-     (em :dup) (em :nullish-short short)
-     ;; optional call: callee on stack; call with this=undefined
-     (compile-call-on-stack (third node)))
+     ;; obj?.() — evaluate the callee; if nullish short-circuit, else call it.
+     ;; When the callee is a member access (a.b?.() / a?.b?.()), preserve `this`
+     ;; = the member's base object; otherwise this = undefined.
+     (let ((callee (second node)))
+       (if (member (car callee) '(:member :omember :private-member :oprivate-member))
+           (progn
+             (compile-chain-base (second callee) short)   ; base object (thisv) -> stack
+             (when (member (car callee) '(:omember :oprivate-member))
+               (em :nullish-short short))                 ; base nullish: SHORT pops the 1 base
+             (em :dup)                                     ; [thisv thisv] — read the fn off the 2nd copy
+             (case (car callee)
+               ((:private-member :oprivate-member) (em :private-get (resolve-private-name (third callee))))
+               (t (if (fourth callee) (progn (compile-expr (third callee)) (em :get-prop))
+                      (em :get-prop-c (second (third callee))))))
+             ;; stack: [thisv fn]; if fn nullish, drop fn and SHORT (thisv is the 1 base popped)
+             (em :nullish-short-2 short)
+             (mapc #'compile-expr (third node)) (em :call (length (third node))))
+           (progn
+             (compile-chain-base callee short)            ; the fn -> stack
+             (em :nullish-short short)                     ; fn nullish: SHORT pops the 1 fn
+             (compile-call-on-stack (third node))))))
     (:member
      (compile-chain-base (second node) short)
      (if (fourth node) (progn (compile-expr (third node)) (em :get-prop))
          (em :get-prop-c (second (third node)))))
     (:call
-     ;; a normal call inside an optional chain (e.g. a?.b())
+     ;; a normal call inside an optional chain (e.g. a?.b()); preserve `this` for
+     ;; a member callee.
      (let ((callee (second node)))
-       (if (member (car callee) '(:member :omember))
+       (if (member (car callee) '(:member :omember :private-member :oprivate-member))
            (progn (compile-chain-base (second callee) short)
-                  (when (eq (car callee) :omember) (em :dup) (em :nullish-short short))
-                  (em :dup)
-                  (if (fourth callee) (progn (compile-expr (third callee)) (em :get-prop))
-                      (em :get-prop-c (second (third callee))))
+                  (when (member (car callee) '(:omember :oprivate-member))
+                    (em :nullish-short short))
+                  (em :dup)                                ; [thisv thisv]
+                  (case (car callee)
+                    ((:private-member :oprivate-member) (em :private-get (resolve-private-name (third callee))))
+                    (t (if (fourth callee) (progn (compile-expr (third callee)) (em :get-prop))
+                           (em :get-prop-c (second (third callee))))))
                   (mapc #'compile-expr (third node)) (em :call (length (third node))))
            (progn (compile-chain-base callee short) (em :const *undefined*) (em :swap)
                   (mapc #'compile-expr (third node)) (em :call (length (third node)))))))))
 
 (defun compile-chain-base (node short)
   "Compile a sub-expression that is part of the optional chain (recurse) or a
-   plain expression (leaf)."
-  (if (optional-chain-p node)
+   plain expression (leaf). Recurse while the base still contains a ?. link — a
+   plain `.b`/`b()` between two optional links is still part of the same chain."
+  (if (chain-contains-optional-p node)
       (compile-chain-link node short)
       (compile-expr node)))
 
@@ -1209,7 +1384,18 @@
          (em :label short)
          (em :label end))))))
 
+(defun assert-not-optional-target (target ctx)
+  "Assignment / update targets may not be optional chains (early SyntaxError):
+   `a?.b = 1`, `--a?.b`, `[a?.b] = x`, etc."
+  (when (and (consp target)
+             (or (member (car target) '(:omember :ocall :oprivate-member))
+                 (and (member (car target) '(:member :private-member :call))
+                      (chain-contains-optional-p target))))
+    (js-throw (make-native-error "SyntaxError"
+                (format nil "Invalid ~a target: optional chain is not a valid assignment target" ctx)))))
+
 (defun compile-assign (op target value)
+  (assert-not-optional-target target "assignment")
   (when (logical-assign-op op)
     (return-from compile-assign (compile-logical-assign (logical-assign-op op) target value)))
   ;; destructuring assignment: [a,b] = v / ({x} = v). Only plain `=`.
@@ -1221,7 +1407,7 @@
   (let ((base (and (> (length op) 1) (subseq op 0 (1- (length op))))))  ; "+=" -> "+"
     (ecase (car target)
       (:ident (if base (progn (em :get-var (second target)) (compile-expr value) (em :bin base))
-                  (compile-expr value))
+                  (compile-named-init value (second target)))   ; x = function(){} -> x.name = "x"
               (em :set-var (second target)))
       (:member
        (compile-expr (second target))                                       ; obj
@@ -1244,6 +1430,7 @@
          (em :get-var obj) (em :swap) (em :private-set pn))))))
 
 (defun compile-update (op prefix target)
+  (assert-not-optional-target target "update")
   (let ((binop (if (string= op "++") "+" "-")))
     (ecase (car target)
       (:ident

@@ -148,15 +148,20 @@
 
 (defun parse-switch ()
   (adv) (eat "(") (let ((disc (parse-expr 1))) (eat ")") (eat "{")
-    (let ((cases '()) (default nil))
+    ;; Clauses are kept in SOURCE ORDER — fall-through (incl. default-before-case)
+    ;; needs the physical clause sequence. A clause is (TEST-or-:default . BODY).
+    (let ((clauses '()) (seen-default nil))
       (loop until (punct? "}") do
         (flet ((body () (let ((s '()))
                           (loop until (or (kw? "case") (kw? "default") (punct? "}")) do (push (parse-stmt) s))
                           (nreverse s))))
-          (cond ((kw? "case") (adv) (let ((e (parse-expr 1))) (eat ":") (push (cons e (body)) cases)))
-                ((kw? "default") (adv) (eat ":") (setf default (body)))
+          (cond ((kw? "case") (adv) (let ((e (parse-expr 1))) (eat ":") (push (cons e (body)) clauses)))
+                ((kw? "default")
+                 (when seen-default (js-throw (make-native-error "SyntaxError" "more than one default clause in switch")))
+                 (setf seen-default t)
+                 (adv) (eat ":") (push (cons :default (body)) clauses))
                 (t (js-throw (make-native-error "SyntaxError" "malformed switch"))))))
-      (eat "}") (list :switch disc (nreverse cases) default))))
+      (eat "}") (list :switch disc (nreverse clauses)))))
 
 (defun parse-try ()
   (adv) (let ((blk (parse-block)) (param nil) (catch nil) (fin nil))
@@ -423,9 +428,17 @@
       ((kw? "typeof") (adv) (list :unary "typeof" (parse-unary)))
       ((kw? "void") (adv) (list :unary "void" (parse-unary)))
       ((kw? "delete") (adv) (list :delete (parse-unary)))
-      ((kw? "new") (adv) (let* ((callee (parse-member (parse-primary) nil)) ; member, but NOT the call
-                                (newexpr (list :new callee (if (punct? "(") (parse-args) '()))))
-                           (parse-member newexpr)))    ; trailing .m() / [k] / () after new
+      ((kw? "new")
+       (adv)
+       (if (punct? ".")                              ; new.target meta-property
+           (progn (adv)
+                  (unless (and (eq (cur-type) :ident) (equal (cur-val) "target"))
+                    (js-throw (make-native-error "SyntaxError" "expected 'target' after 'new.'")))
+                  (adv)
+                  (parse-member (list :new-target)))  ; new.target can be a member base: new.target.foo
+           (let* ((callee (parse-member (parse-primary) nil)) ; member, but NOT the call
+                  (newexpr (list :new callee (if (punct? "(") (parse-args) '()))))
+             (parse-member newexpr))))    ; trailing .m() / [k] / () after new
       ((or (punct? "++") (punct? "--")) (let ((op tv)) (adv) (list :update op t (parse-unary))))
       (t (parse-postfix)))))
 

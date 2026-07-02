@@ -585,15 +585,17 @@
 ;;; ---- [[Call]] / [[Construct]] ----
 (defun js-callable-p (f) (and (js-object-p f) (js-object-call f)))
 (defparameter *max-depth* 900) (defvar *depth* 0)   ; bound JS recursion before the CL stack overflows
+(defvar *new-target* *undefined*)   ; [[NewTarget]] of the running fn env: the ctor when `new`'d, undefined on a plain [[Call]]
 (defun js-call (f this args)
   (unless (js-callable-p f) (js-throw (make-native-error "TypeError" (format nil "~a is not a function" (to-string f)))))
-  (let ((*depth* (1+ *depth*)))
+  (let ((*depth* (1+ *depth*)) (*new-target* *undefined*))   ; an ordinary [[Call]] => new.target is undefined
     (when (> *depth* *max-depth*) (js-throw (make-native-error "RangeError" "Maximum call stack size exceeded")))
     (funcall (js-object-call f) this args)))
 (defun js-construct (f args &optional (new-target f))
   (unless (and (js-object-p f) (js-object-construct f))
     (js-throw (make-native-error "TypeError" (format nil "~a is not a constructor" (to-string f)))))
-  (funcall (js-object-construct f) args new-target))
+  (let ((*new-target* new-target))    ; [[Construct]] => new.target is the newTarget ctor
+    (funcall (js-object-construct f) args new-target)))
 
 ;;; ===========================================================================
 ;;; Abstract operations (spec coercions)

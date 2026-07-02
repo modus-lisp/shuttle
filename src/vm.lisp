@@ -48,6 +48,7 @@
 ;;; A binding value of the TDZ sentinel means "declared but not yet initialized"
 ;;; (let/const temporal dead zone). CONSTS holds names that may not be reassigned.
 (defvar *tdz* '#:tdz)                    ; unique uninitialized marker
+(defvar *empty-completion* '#:empty)     ; the [[value]]:empty completion sentinel (eval completion-value tracking)
 ;; global-obj: when non-nil, this env is THE global Environment Record. Its VARS
 ;; hash-table is the *declarative* record (holds only let/const/class + built-in
 ;; declarative bindings); var/function bindings live as own properties of the
@@ -56,7 +57,7 @@
 ;; var-names: the global env's [[VarNames]] — names introduced by global `var`/
 ;; function declarations (distinct from arbitrary own properties of globalThis).
 ;; Used by GlobalDeclarationInstantiation's HasVarDeclaration / HasRestrictedGlobalProperty.
-(defstruct env vars parent consts with-obj block global-obj (var-names (make-hash-table :test 'equal)))
+(defstruct env vars parent consts with-obj block global-obj nfe (var-names (make-hash-table :test 'equal)))
 (defun new-env (parent) (make-env :vars (make-hash-table :test 'equal) :parent parent))
 (defun new-global-env (obj) (make-env :vars (make-hash-table :test 'equal) :parent nil :global-obj obj))
 ;; --- global-object var-binding helpers (spec CreateGlobalVarBinding etc.) ---
@@ -152,6 +153,13 @@
         do (when (and (env-with-obj e) (with-binds-p (env-with-obj e) name))
              (js-set (env-with-obj e) name val) (return-from env-set val))
            (when (nth-value 1 (gethash name (env-vars e)))
+             ;; Named-function-expression self-binding: an immutable binding. Strict
+             ;; assignment -> TypeError; sloppy -> silent no-op (per SetMutableBinding).
+             (when (and (env-nfe e) (member name (env-nfe e) :test #'string=))
+               (when strict
+                 (js-throw (make-native-error "TypeError"
+                             (format nil "Cannot assign to read only property '~a'" name))))
+               (return-from env-set val))
              (when (and (env-consts e) (member name (env-consts e) :test #'string=))
                (js-throw (make-native-error "TypeError" (format nil "Assignment to constant variable."))))
              (setf (gethash name (env-vars e)) val) (return-from env-set val))
@@ -292,6 +300,32 @@
     (put o "length" (float (length elems) 1d0)
          :enumerable nil :writable t :configurable nil)
     o))
+(defun %frozen-string-array (strings)
+  "A frozen array of STRINGS: each element non-writable/non-configurable, length
+   non-writable/non-configurable, and the array itself non-extensible."
+  (let ((o (make-object :proto (%arr-proto) :class "Array")))
+    (loop for s in strings for i from 0
+          do (put o (princ-to-string i) (or s *undefined*) :writable nil :configurable nil :enumerable t))
+    (put o "length" (float (length strings) 1d0) :enumerable nil :writable nil :configurable nil)
+    (setf (js-object-extensible o) nil)
+    o))
+
+(defun get-template-object (spec)
+  "GetTemplateObject: the frozen strings array (with frozen .raw) for a tagged
+   template call site. Cached per site-key on the current realm so the SAME site
+   yields the SAME object across evaluations (SPEC 13.2.8.4)."
+  (destructuring-bind (&key site cooked raw) spec
+    (let* ((key (getf site :key))
+           (cache (or (getf (realm-intrinsics *current-realm*) :template-cache)
+                      (setf (getf (realm-intrinsics *current-realm*) :template-cache)
+                            (make-hash-table :test 'eq)))))
+      (or (gethash key cache)
+          (let ((obj (%frozen-string-array cooked))
+                (rawarr (%frozen-string-array raw)))
+            (put obj "raw" rawarr :writable nil :configurable nil :enumerable nil)
+            (setf (js-object-extensible obj) nil)
+            (setf (gethash key cache) obj))))))
+
 (defun make-plain-object (pairs)
   (let ((o (make-object :proto (%obj-proto))))
     (loop for (k . v) in pairs do (put o (if (stringp k) k (to-string k)) v)) o))
@@ -307,6 +341,22 @@
     (when (js-object-p src)
       (dolist (k (js-own-keys src))
         (when (and (stringp k) (not (member k taken :test #'string=)))
+          (let ((d (js-get-own-property src k)))
+            (when (and d (prop-enumerable d))
+              (put o k (js-get src k)))))))
+    o))
+
+(defun object-rest-copy-keys (src taken)
+  "CopyDataProperties: copy own enumerable keys (string AND symbol) of SRC into a
+   fresh object, excluding those in TAKEN (each already a property key: string or
+   symbol). TAKEN entries that are numbers/etc. are coerced to property keys."
+  (let ((o (make-object :proto (%obj-proto))) (src (to-object src))
+        (excluded (mapcar #'prop-key taken)))
+    (when (js-object-p src)
+      (dolist (k (js-own-keys src))
+        (unless (member k excluded :test (lambda (a b)
+                                           (if (and (js-symbol-p a) (js-symbol-p b)) (eq a b)
+                                               (and (stringp a) (stringp b) (string= a b)))))
           (let ((d (js-get-own-property src k)))
             (when (and d (prop-enumerable d))
               (put o k (js-get src k)))))))
@@ -350,6 +400,17 @@
     (let ((ret (ignore-errors (js-get it "return"))))
       (when (js-callable-p ret)
         (ignore-errors (js-call ret it '()))))))
+(defun iterator-close-normal (it)
+  "IteratorClose on a NORMAL completion: call it.return(); if it is not callable,
+   fine; if it returns a non-object, TypeError; a thrown return() propagates."
+  (when (js-object-p it)
+    (let ((ret (js-get it "return")))
+      (when (and ret (not (eq ret *undefined*)) (not (eq ret *null*)))
+        (unless (js-callable-p ret)
+          (js-throw (make-native-error "TypeError" "iterator return is not a function")))
+        (let ((r (js-call ret it '())))
+          (unless (js-object-p r)
+            (js-throw (make-native-error "TypeError" "iterator return result is not an object"))))))))
 
 (defun make-arguments-object (args)
   "A minimal (unmapped) arguments object: indexed elements + length + @@iterator."
@@ -381,7 +442,10 @@
    :generator = a generator function; :class-base / :class-derived = a class ctor.
    LEXICAL-THIS: for an arrow (:lexical this-mode), the `this` captured at the
    arrow's DEFINITION site — the arrow ignores its caller's `this` and uses it."
-  (let ((fn (make-object :proto (%fn-proto) :class "Function")))
+  (let ((fn (make-object :proto (%fn-proto) :class "Function"))
+        ;; arrows (:lexical) have no [[NewTarget]] of their own — new.target inside an
+        ;; arrow resolves to the enclosing function's, captured here at definition.
+        (lexical-nt (and (eq (code-this-mode code) :lexical) *new-target*)))
     (put fn "length" (float (fn-declared-length (code-params code)) 1d0) :enumerable nil :writable nil)
     (put fn "name" (or (code-name code) "") :enumerable nil :writable nil :configurable t)
     (setf (js-object-call fn)
@@ -403,7 +467,8 @@
                                 (promise-settle p :rejected (shuttle-error-value e)) p))))))
               (:async-generator (lambda (this args) (make-async-generator-object code env (bind this) args fn)))
               (t (lambda (this args)
-                   (let ((fenv (new-env env)))
+                   (let ((fenv (new-env env))
+                         (*new-target* (if (eq (code-this-mode code) :lexical) lexical-nt *new-target*)))
                      (env-declare fenv "arguments" (make-arguments-object args))
                      (run code fenv (bind this) args fn)))))))
     ;; class constructors: only callable via `new`; the [[Construct]] initializes
@@ -1632,7 +1697,7 @@
   (let ((instrs (code-instrs code)) (pc 0)
         (strictp (code-strict code))
         (call-args (coerce call-args 'vector))
-        (stack (make-array 64 :adjustable t :fill-pointer 0)) (completion *undefined*)
+        (stack (make-array 64 :adjustable t :fill-pointer 0)) (completion *empty-completion*)
         (home (and fn-obj (fn-home fn-obj)))          ; [[HomeObject]] for super
         (super-ctor (and fn-obj (fn-super-ctor fn-obj)))
         (handlers '()))                      ; ((catch-pc . saved-sp) ...) for try/catch
@@ -1642,7 +1707,8 @@
       (loop
        (handler-case
         (loop
-        (when (>= pc (length instrs)) (return-from %run completion))
+        (when (>= pc (length instrs))
+          (return-from %run (if (eq completion *empty-completion*) *undefined* completion)))
         (when (>= (incf *steps*) *max-steps*) (error 'shuttle-timeout))
         (let* ((in (aref instrs pc)) (op (car in)) (a (cdr in)))
           (incf pc)
@@ -1663,11 +1729,34 @@
             (:push-env (setf env (new-block-env env)))
             (:pop-env (setf env (env-parent env)))
             (:to-object (push! (to-object (pop!))))
+            (:to-prop-key (push! (prop-key (pop!))))     ; ToPropertyKey (string or symbol)
+            (:array-append (let ((v (peek!)) (arr (env-get-checked env (first a))))  ; push V onto ARR (var), leave V
+                             (let ((len (to-number (js-get arr "length"))))
+                               (js-set arr (to-string len) v)
+                               (js-set arr "length" (+ len 1d0)))))
+            (:require-coercible                          ; RequireObjectCoercible: null/undefined -> TypeError (leaves value)
+             (let ((v (peek!)))
+               (when (or (eq v *null*) (eq v *undefined*))
+                 (js-throw (make-native-error "TypeError"
+                             (format nil "Cannot destructure '~a' as it is ~a."
+                                     (to-string v) (to-string v)))))))
             (:push-with-env (setf env (new-with-env env (pop!))))
             (:tdz-declare (env-declare-lexical env (first a) *tdz*))
             (:init-let (env-declare-lexical env (first a) (pop!)))
             (:init-const (env-declare-const env (first a) (pop!)))
             (:get-this (push! this))
+            (:new-target (push! *new-target*))
+            (:set-fn-name                                 ; NamedEvaluation: name an anonymous fn/class after its binding
+             (let ((v (peek!)) (name (first a)))
+               (when (and (js-object-p v)
+                          (js-object-call v)               ; it's callable (function or class ctor)
+                          (equal "" (js-get v "name")))    ; still anonymous
+                 (put v "name" name :enumerable nil :writable nil :configurable t))))
+            (:set-fn-name-dyn                             ; [.. key val] -> [.. val]; name val from key (computed prop)
+             (let ((v (pop!)) (k (prop-key (pop!))))
+               (when (and (js-object-p v) (js-object-call v) (equal "" (js-get v "name")))
+                 (put v "name" (js-key-name k) :enumerable nil :writable nil :configurable t))
+               (push! v)))
             (:load-arg (let ((n (first a))) (push! (if (< n (length call-args)) (aref call-args n) *undefined*))))
             (:load-rest (let ((n (first a)))
                           (push! (make-array-object
@@ -1692,7 +1781,13 @@
                              (aref stack (- n 1)) a))))
             (:nullish-short (let ((v (peek!)))   ; if top is null/undefined, jump to SHORT (leave it)
                               (when (or (eq v *null*) (eq v *undefined*)) (setf pc (first a)))))
+            (:nullish-short-2 (let ((v (peek!)))  ; if top nullish, DROP it then jump to SHORT (value below survives)
+                                (when (or (eq v *null*) (eq v *undefined*)) (pop!) (setf pc (first a)))))
             (:save-completion (setf completion (pop!)))
+            (:comp-clear (setf completion *empty-completion*))            ; enter a compound stmt: [[value]] := empty
+            (:get-completion (push! (if (eq completion *empty-completion*) *undefined* completion)))
+            (:comp-default-undef                                          ; leave a compound stmt: UpdateEmpty(., undefined)
+             (when (eq completion *empty-completion*) (setf completion *undefined*)))
             (:bin (let ((b (pop!)) (x (pop!))) (push! (js-binop (first a) x b))))
             (:unary (push! (js-unop (first a) (pop!))))
             (:get-prop (let ((k (pop!)) (o (pop!))) (push! (js-get o k))))
@@ -1771,13 +1866,36 @@
             (:for-in-keys (push! (for-in-key-array (pop!))))
             (:get-iterator (push! (get-iterator (pop!))))
             (:iter-next (push! (iterator-step (pop!))))
+            (:iter-step-checked                          ; done-var IT-var -> pushes element VALUE (or undefined)
+             (let ((donev (first a)) (itv (second a)))
+               (if (js-truthy (env-get-checked env donev))
+                   (push! *undefined*)                    ; iterator already exhausted: value is undefined
+                   ;; .next() (or reading its result) throwing marks the iterator done
+                   ;; per spec (no IteratorClose then) — set done BEFORE the throw escapes.
+                   (let ((r (handler-case (iterator-step (env-get-checked env itv))
+                              (shuttle-error (e) (env-set env donev *true*) (error e)))))
+                     (if (js-truthy (js-get r "done"))
+                         (progn (env-set env donev *true*) (push! *undefined*))
+                         (push! (js-get r "value")))))))
+            (:iter-close-normal                          ; if not done, IteratorClose (normal-completion semantics)
+             (let ((donev (first a)) (itv (second a)))
+               (unless (js-truthy (env-get-checked env donev))
+                 (env-set env donev *true*)
+                 (iterator-close-normal (env-get-checked env itv)))))
+            (:iter-close-abrupt                          ; unwinding a throw: close swallowing return() errors (leaves stack)
+             (let ((donev (first a)) (itv (second a)))
+               (unless (js-truthy (env-get-checked env donev))
+                 (iterator-close (env-get-checked env itv)))))
             (:iter-rest (let ((it (pop!)) (out '()))
                           (loop (let ((r (iterator-step it)))
                                   (when (js-truthy (js-get r "done")) (return))
                                   (push (js-get r "value") out)))
                           (push! (make-array-object (nreverse out)))))
             (:object-rest (let ((src (pop!)) (taken (first a)))
-                            (push! (object-rest-copy src taken))))
+                            (push! (object-rest-copy-keys src taken))))
+            (:object-rest-dyn (let* ((src (pop!)) (excl-arr (pop!))   ; [exclKeys src] -> rest
+                                     (taken (array-object-to-list excl-arr)))
+                                (push! (object-rest-copy-keys src taken))))
             (:eval-direct
              ;; Direct eval: stack has [evalFn arg0 arg1 ...]. If evalFn is the
              ;; realm's %eval% intrinsic and arg0 is a string, run the code in
@@ -1816,7 +1934,8 @@
                                                   (:named-asyncclosure :async)
                                                   (:named-asyncgenclosure :async-generator))
                                           :lexical-this this)))
-               (env-declare-const fenv (second a) fn)
+               (setf (gethash (second a) (env-vars fenv)) fn)
+               (pushnew (second a) (env-nfe fenv) :test #'string=)
                (push! fn)))
             (:yield (push! (gen-yield (pop!))))
             (:yield-star (push! (yield-star-delegate (pop!))))
@@ -1857,6 +1976,7 @@
                              (nreverse (loop repeat (first a) collect (let ((v (pop!)) (k (pop!))) (cons k v)))))))
             (:new-object (push! (make-object :proto (%obj-proto))))
             (:new-array (push! (make-array-object '())))
+            (:template-object (push! (get-template-object (first a))))
             (:def-prop (let ((v (pop!)) (k (pop!)))     ; obj key val -> obj
                          (js-define-own-property (peek!) (prop-key k)
                            (list :value v :writable t :enumerable t :configurable t))))
