@@ -62,7 +62,7 @@
     (let ((*steps* 0) (*standard-output* (make-broadcast-stream)))
       (let ((outcome
               (handler-case
-                  (sb-ext:with-timeout 5
+                  (sb-ext:with-timeout 20
                     (let ((realm (make-realm)))
                       (unless (fm-flag fm "raw")
                         (install-262 realm)

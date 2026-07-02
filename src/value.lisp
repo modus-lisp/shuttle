@@ -47,7 +47,9 @@
 
 (defstruct (js-object (:constructor %make-object))
   (props (make-hash-table :test 'equal))
-  (key-order '())           ; own keys in insertion order (reversed); ordinary-own-keys re-sorts
+  (key-order '())           ; own keys in insertion order (reversed); ordinary-own-keys re-sorts. May carry tombstones (keys since forgotten); KEY-SET is the source of truth for membership and %own-keys-in-order filters through it.
+  (key-set nil)             ; lazily-created EQUAL membership set mirroring the LIVE keys — keeps %key-touch / %key-forget O(1) instead of scanning/deleting key-order (which is O(n) → O(n^2) for big arrays: bulk index writes and .length truncation)
+  (key-tombstones 0)        ; count of forgotten-but-still-in-key-order entries; trigger a compaction of KEY-ORDER once they dominate
   (proto *null*)            ; [[Prototype]]
   (extensible t)
   (class "Object")          ; loosely [[Class]] / internal kind
@@ -107,13 +109,50 @@
                      (js-throw (make-native-error "TypeError" "Private member was defined without a setter")))))))
 
 (declaim (inline %key-touch %key-forget %own-keys-in-order))
+(defun %key-set-of (o)
+  "The membership hash for O's live own keys, built lazily from KEY-ORDER."
+  (or (js-object-key-set o)
+      (setf (js-object-key-set o)
+            (let ((h (make-hash-table :test 'equal
+                                      :size (max 8 (length (js-object-key-order o))))))
+              (dolist (ek (js-object-key-order o)) (setf (gethash ek h) t))
+              h))))
+(defun %key-compact (o)
+  "Drop tombstoned (forgotten) entries from KEY-ORDER, keeping only live keys in
+   their original relative order."
+  (let ((set (js-object-key-set o)))
+    (setf (js-object-key-order o)
+          (delete-if-not (lambda (k) (gethash k set)) (js-object-key-order o))
+          (js-object-key-tombstones o) 0)))
 (defun %key-touch (o k)
-  "Record K as an own key of O (idempotent, preserves first-insertion order)."
-  (unless (member k (js-object-key-order o) :test #'equal)
-    (push k (js-object-key-order o))))
+  "Record K as an own key of O (idempotent, preserves first-insertion order).
+   Membership is tested against KEY-SET (an EQUAL hash mirroring the live keys) so
+   a large object/array stays O(1) per insert rather than O(n) scanning KEY-ORDER."
+  (let ((set (%key-set-of o)))
+    (unless (gethash k set)
+      ;; A re-added key may still linger as a tombstone in KEY-ORDER. Compact
+      ;; BEFORE marking K live (compaction keys off SET membership; if K were
+      ;; already in SET the stale tombstone couldn't be told apart and would
+      ;; survive, duplicating K and corrupting enumeration order).
+      (when (plusp (js-object-key-tombstones o)) (%key-compact o))
+      (setf (gethash k set) t)
+      (push k (js-object-key-order o)))))
 (defun %key-forget (o k)
-  (setf (js-object-key-order o) (delete k (js-object-key-order o) :test #'equal)))
-(defun %own-keys-in-order (o) (reverse (js-object-key-order o)))  ; insertion order
+  "Remove K from the live key set in O(1); leave a tombstone in KEY-ORDER that
+   %own-keys-in-order filters out, compacting once tombstones dominate. This keeps
+   bulk deletion (e.g. Array length truncation) O(n) overall instead of O(n^2)."
+  (let ((set (js-object-key-set o)))
+    (when (and set (gethash k set))
+      (remhash k set)
+      (when (> (incf (js-object-key-tombstones o))
+               (hash-table-count set))
+        (%key-compact o)))))
+(defun %own-keys-in-order (o)          ; insertion order, tombstones filtered out
+  (if (plusp (js-object-key-tombstones o))
+      (let ((set (js-object-key-set o)))
+        (loop for k in (reverse (js-object-key-order o))
+              when (or (null set) (gethash k set)) collect k))
+      (reverse (js-object-key-order o))))
 
 (defun make-object (&key (proto *null*) (class "Object") call construct internal)
   (%make-object :proto proto :class class :call call :construct construct :internal internal))
