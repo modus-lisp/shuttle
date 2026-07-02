@@ -347,7 +347,7 @@
     (make-typed-array ty buf 0 len proto)))
 
 (defun ta-from-buffer (ty buffer byte-offset length-arg proto)
-  (unless (array-buffer-p buffer)
+  (unless (any-array-buffer-p buffer)
     (js-throw (make-native-error "TypeError" "First argument must be an ArrayBuffer")))
   (let* ((size (ta-type-size ty))
          (offset (to-index byte-offset)))
@@ -357,7 +357,7 @@
       (js-throw (make-native-error "TypeError" "buffer is detached")))
     (let ((buflen (length (ab-bytes buffer))))
       (if (js-undefined-p length-arg)
-          (if (ab-resizable-p buffer)
+          (if (buffer-resizable-p buffer)  ; resizable AB or growable SAB
               ;; length-tracking view over a resizable buffer: length auto-updates.
               (progn
                 (when (> offset buflen)
@@ -475,7 +475,7 @@
                        ;; NewTarget.prototype, so coerce the length first.
                        (let ((len (if (js-undefined-p a0) 0 (to-index a0))))
                          (ta-from-length ty len (ab-proto-from-newtarget nt proto))))
-                      ((array-buffer-p a0)
+                      ((any-array-buffer-p a0)
                        (ta-from-buffer ty a0 (arg 1 args) (arg 2 args)
                                        (ab-proto-from-newtarget nt proto)))
                       ((typed-array-p a0)

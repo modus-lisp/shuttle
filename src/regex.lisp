@@ -15,9 +15,11 @@
 ;;;; simple-vector of (start . end) conses (or NIL for unmatched groups), index 0
 ;;;; being the whole match.
 ;;;;
-;;;; Deferred (see report): full \p{...} Unicode property escapes (only the common
-;;;; ASCII/BMP predefined classes handled), the `v`-flag set notation, and
-;;;; astral/surrogate-aware advancement under /u (BMP is handled).
+;;;; \p{...} / \P{...} Unicode property escapes are supported under /u and /v
+;;;; (General_Category, Script, Script_Extensions, and the ES2025 binary
+;;;; properties), backed by the vendored Unicode 17 tables in unicode-props.lisp
+;;;; (sb-unicode's data is Unicode 10, too old for test262). Deferred: the
+;;;; `v`-flag set notation and properties-of-strings (\p{RGI_Emoji} etc.).
 
 (in-package #:shuttle)
 
@@ -367,6 +369,12 @@
     (cond
       ((member c '(#\d #\D #\w #\W #\s #\S))
        (rp-next p) (list :class-escape c))
+      ;; \p{...} / \P{...} Unicode property escape — only under /u (or /v).
+      ;; In non-unicode mode \p stays the Annex B identity escape (handled by
+      ;; the general case below).
+      ((and (member c '(#\p #\P)) (rx-parser-unicode p))
+       (rp-next p)
+       (parse-unicode-property p (char= c #\P)))
       ;; \c followed by an ASCII letter is a control escape; otherwise, in
       ;; non-/u mode, the '\' is a literal character and 'c' is parsed as an
       ;; ordinary atom next (Annex B ControlEscape fallback: \cД, \c9, ...).
@@ -410,6 +418,42 @@
             (let ((d (rp-peek p 1))) (and d (char<= #\0 d #\7))))
        (parse-legacy-octal-or-digit p))
       (t (list :char (parse-char-escape-value p))))))
+
+(defun parse-unicode-property (p negated)
+  "Parse the {Name} / {Name=Value} tail of a \\p / \\P escape (the p/P is already
+   consumed; unicode mode only). Property names/values are matched EXACTLY
+   against the UCD alias tables — no loose matching (case/space/hyphen variants
+   are SyntaxErrors), per UnicodeMatchProperty / UnicodeMatchPropertyValue.
+   Returns (:uprop negated range-vector)."
+  (unless (rp-eat p #\{)
+    (regex-syntax-error "\\p must be followed by {...} in unicode mode"))
+  (flet ((scan (value-p)
+           ;; UnicodePropertyName: ControlLetter | '_'. UnicodePropertyValue
+           ;; additionally allows DecimalDigit. Anything else ends the token
+           ;; (and if it isn't '=' or '}', the escape is malformed).
+           (let ((out (make-string-output-stream)))
+             (loop for c = (rp-peek p)
+                   while (and c (or (ascii-letter-p c) (char= c #\_)
+                                    (and value-p (char<= #\0 c #\9))))
+                   do (write-char (rp-next p) out))
+             (get-output-stream-string out))))
+    (let ((name (scan nil)))
+      (cond
+        ((rp-eat p #\=)
+         (let ((value (scan t)))
+           (unless (rp-eat p #\})
+             (regex-syntax-error "malformed \\p{...} property escape"))
+           (let ((table (unicode-property-table name value)))
+             (unless table
+               (regex-syntax-error
+                (format nil "unknown property in \\p{~a=~a}" name value)))
+             (list :uprop negated table))))
+        ((rp-eat p #\})
+         (let ((table (and (string/= name "") (unicode-property-table name nil))))
+           (unless table
+             (regex-syntax-error (format nil "unknown property in \\p{~a}" name)))
+           (list :uprop negated table)))
+        (t (regex-syntax-error "malformed \\p{...} property escape"))))))
 
 (defun parse-legacy-octal-or-digit (p)
   (let ((c (rp-peek p)))
@@ -513,9 +557,11 @@
                    (not (eql (rp-peek p 1) #\]))
                    (consp atom)
                    ;; A range needs a low bound. In /u the low bound must be a
-                   ;; single char (a class-escape as bound is a SyntaxError).
+                   ;; single char (a class-escape / property escape as a bound
+                   ;; is a SyntaxError, diagnosed below).
                    (or (eq (car atom) :ch)
-                       (and (rx-parser-unicode p) (eq (car atom) :class-escape))))
+                       (and (rx-parser-unicode p)
+                            (member (car atom) '(:class-escape :uprop)))))
               (progn
                 (rp-next p)
                 (let ((hi (parse-class-atom p)))
@@ -545,6 +591,11 @@
               ((null e) (regex-syntax-error "trailing backslash in class"))
               ((member e '(#\d #\D #\w #\W #\s #\S))
                (rp-next p) (list :class-escape e))
+              ;; \p{...} / \P{...} inside a class (unicode mode only; in
+              ;; non-unicode mode it's the identity escape via the fall-through).
+              ((and (member e '(#\p #\P)) (rx-parser-unicode p))
+               (rp-next p)
+               (parse-unicode-property p (char= e #\P)))
               ((char= e #\b) (rp-next p) (list :ch (code-char 8)))
               ;; Annex B ClassControlLetter also accepts a DecimalDigit or '_'
               ;; after \c (non-/u). In /u mode only ASCII letters are valid.
@@ -688,6 +739,7 @@
     (:wordb (compile-wordb nil))
     (:not-wordb (compile-wordb t))
     (:class-escape (compile-class-escape (cadr node)))
+    (:uprop (compile-uprop (cadr node) (caddr node)))
     (:char-class (compile-char-class (cadr node) (caddr node)))
     (:group (compile-group (cadr node) (cadddr node)))
     (:backref (compile-backref (cadr node)))
@@ -839,6 +891,28 @@
              (class-escape-member-p esc (char (mctx-input mc) pos))
              (funcall k (1+ pos))))))
 
+(declaim (inline uprop-match-p))
+(defun uprop-match-p (negated table c)
+  "Does code-point char C satisfy the \\p (or, NEGATED, \\P) escape whose range
+   table is TABLE?"
+  (let ((in (ucp-range-member-p (char-code c) table)))
+    (if negated (not in) in)))
+
+(defun compile-uprop (negated table)
+  "\\p{...} / \\P{...} in atom position: match one full code point (a surrogate
+   pair counts once under /u) whose property membership matches."
+  (if (minusp *compile-direction*)
+      (lambda (mc pos k)
+        (and (> pos 0)
+             (multiple-value-bind (c w) (class-input-cp-back mc pos)
+               (and (uprop-match-p negated table c)
+                    (funcall k (- pos w))))))
+      (lambda (mc pos k)
+        (and (< pos (mctx-len mc))
+             (multiple-value-bind (c w) (class-input-cp mc pos)
+               (and (uprop-match-p negated table c)
+                    (funcall k (+ pos w))))))))
+
 (defun class-input-cp (mc pos)
   "Return (values code-point-char width) for the code point starting at POS,
    combining a surrogate pair into one astral char under /u."
@@ -882,6 +956,7 @@
     (ecase (car item)
       (:ch (when (rx-char-eq mc c (cadr item)) (return t)))
       (:class-escape (when (class-escape-member-p (cadr item) c) (return t)))
+      (:uprop (when (uprop-match-p (cadr item) (caddr item) c) (return t)))
       (:range
        (let ((lo (cadr item)) (hi (caddr item)))
          (if (mctx-ignore-case mc)
@@ -1023,6 +1098,17 @@
                (when (and (< pos (mctx-len mc))
                           (class-escape-member-p esc (char (mctx-input mc) pos)))
                  (1+ pos))))))
+      (:uprop
+       (let ((negated (cadr body)) (table (caddr body)))
+         (if backward
+             (lambda (mc pos)
+               (when (> pos 0)
+                 (multiple-value-bind (c w) (class-input-cp-back mc pos)
+                   (when (uprop-match-p negated table c) (- pos w)))))
+             (lambda (mc pos)
+               (when (< pos (mctx-len mc))
+                 (multiple-value-bind (c w) (class-input-cp mc pos)
+                   (when (uprop-match-p negated table c) (+ pos w))))))))
       (:char-class
        (let ((negated (cadr body)) (items (caddr body)))
          (if backward

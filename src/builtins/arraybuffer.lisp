@@ -14,6 +14,19 @@
 (defun ab-detached-p (o)
   (and (array-buffer-p o) (null (js-object-primitive o))))
 
+;;; SharedArrayBuffer shares the byte-vector representation (see
+;;; sharedarraybuffer.lisp); these predicates let TypedArray/DataView accept
+;;; either backing kind. A SAB is never :array-buffer (the two brands are
+;;; disjoint: ArrayBuffer.prototype getters must reject SABs and vice versa).
+(defun shared-array-buffer-p (o)
+  (and (js-object-p o) (getf (js-object-internal o) :shared-array-buffer)))
+(defun any-array-buffer-p (o)
+  (or (array-buffer-p o) (shared-array-buffer-p o)))
+(defun buffer-resizable-p (o)
+  "Resizable ArrayBuffer OR growable SharedArrayBuffer (either way views with
+   no explicit length become length-tracking)."
+  (and (any-array-buffer-p o) (getf (js-object-internal o) :max-byte-length) t))
+
 (defun make-byte-vector (n)
   (make-array n :element-type '(unsigned-byte 8) :initial-element 0))
 

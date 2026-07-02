@@ -98,7 +98,7 @@
     (setf (js-object-construct ctor)
           (lambda (args nt)
             (let ((buffer (arg 0 args)))
-              (unless (array-buffer-p buffer)
+              (unless (any-array-buffer-p buffer)
                 (js-throw (make-native-error "TypeError" "First argument must be an ArrayBuffer")))
               (let* ((offset (to-index (arg 1 args)))
                      (len-arg (arg 2 args))
@@ -114,7 +114,7 @@
                     (js-throw (make-native-error "RangeError" "length out of range")))
                   ;; A DataView with no explicit length over a resizable buffer is
                   ;; length-tracking; otherwise it is fixed-length.
-                  (let* ((track (and (null explicit-len) (ab-resizable-p buffer)))
+                  (let* ((track (and (null explicit-len) (buffer-resizable-p buffer)))
                          (view-len (or explicit-len (- buflen offset)))
                          ;; OrdinaryCreateFromConstructor reads nt.prototype (may run user
                          ;; code that detaches/resizes the buffer) BEFORE the final re-checks.
