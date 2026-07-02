@@ -31,9 +31,9 @@
                   (list (car in) (gethash (cadr in) pos)) in) out)))
     (coerce (nreverse out) 'vector)))
 
-(defun compile-toplevel (src)
+(defun compile-toplevel (src &optional eval-code)
   ;; top-level falls off the end so RUN returns the completion value (eval semantics)
-  (compile-fn nil '() (parse-program src) t))
+  (compile-fn nil '() (parse-program src) (if eval-code :eval t)))
 
 (defun check-no-duplicate-params (params)
   "Strict-mode early error: a duplicate binding name in a parameter list is a
@@ -115,9 +115,35 @@
     (compile-params params)
     ;; hoist: pre-declare all `var` names (as undefined) so forward reads don't
     ;; ReferenceError. Function declarations are hoisted by :func handling below.
-    (dolist (v (collect-var-names body))
-      (unless (member v pnames :test #'string=)
-        (em :const *undefined*) (em :declare-var v)))
+    ;; At GLOBAL scope, GlobalDeclarationInstantiation instead runs the spec early
+    ;; checks and creates var/function bindings as own properties of the global
+    ;; object (configurable:false) — emitted as a single :global-instantiate op.
+    (when (eq toplevel t)
+      (let* ((tstmts (if (eq (car body) :block) (second body) (list body)))
+             (tfns   (hoisted-func-names tstmts))
+             (tlex   (block-lexical-names tstmts))
+             ;; Annex B B.3.3 block-nested fn names also become global VAR bindings
+             ;; (sloppy only), so they land as own properties of the global object.
+             (tannexb (if *strict* '() (annexb-var-fn-names body pnames tlex)))
+             (tvars  (union (collect-var-names body) tannexb :test #'string=)))
+        (em :global-instantiate (list tvars tfns tlex))))
+    ;; eval code (direct/indirect): EvalDeclarationInstantiation — var/fn bindings
+    ;; go into the running variable environment. At global scope that means a global
+    ;; object property (but NOT the genv [[VarNames]], so a later `let` isn't blocked).
+    (when (eq toplevel :eval)
+      (let* ((estmts (if (eq (car body) :block) (second body) (list body)))
+             (efns   (hoisted-func-names estmts))
+             (elex   (block-lexical-names estmts))
+             ;; Annex B B.3.3 block-nested fn names also become eval var bindings (sloppy).
+             (eannexb (if *strict* '() (annexb-var-fn-names body pnames elex))))
+        (dolist (v (union (union (collect-var-names body) efns :test #'string=)
+                          eannexb :test #'string=))
+          (unless (member v pnames :test #'string=)
+            (em :eval-var-decl v)))))
+    (unless toplevel
+      (dolist (v (collect-var-names body))
+        (unless (member v pnames :test #'string=)
+          (em :const *undefined*) (em :declare-var v))))
     ;; function/top-level body: hoist its OWN lexicals into the function env (no extra block)
     (let* ((stmts (if (eq (car body) :block) (second body) (list body)))
            (lexnames (block-lexical-names stmts))
@@ -136,7 +162,14 @@
             ;; have it as a param/outer var — don't clobber it to undefined).
             (em :const *undefined*) (em :declare-var-absent v))))
       (dolist (n lexnames) (em :tdz-declare n))
-      (dolist (fn (block-lexical-fns stmts)) (compile-expr fn) (em :init-let (second fn)))
+      ;; Top-level function declarations: at global/eval scope they are VAR-scoped
+      ;; (CreateGlobalFunctionBinding / EvalDeclarationInstantiation) — bind them onto
+      ;; the global object via :declare-var (the property was pre-created by
+      ;; :global-instantiate / :eval-var-decl). Inside an ordinary function body they
+      ;; are hoisted into the function's declarative record via :init-let.
+      (dolist (fn (block-lexical-fns stmts))
+        (compile-expr fn)
+        (if toplevel (em :declare-var (second fn)) (em :init-let (second fn))))
       (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s))))
     (unless toplevel (em :const *undefined*) (em :ret))   ; functions default-return undefined
     (make-code :name name :params params :instrs (assemble *out*)

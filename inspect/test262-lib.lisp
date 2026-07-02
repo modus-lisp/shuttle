@@ -37,6 +37,24 @@
 (defun run-code (code realm)
   (let ((*current-realm* realm)) (with-js-floats (run code (realm-global-env realm) (realm-global realm)))))
 
+(defun install-262 (realm)
+  "Install a fallback test262 `$262` (evalScript + global) ONLY if the realm
+   doesn't already have one. make-realm installs the full $262 (with createRealm +
+   detachArrayBuffer via install-262-hooks); this must not clobber it."
+  (when (js-truthy* (js-has (realm-global realm) "$262"))
+    (return-from install-262))
+  (let ((*current-realm* realm)
+        (o (make-object :proto (realm-object-proto realm))))
+    (put o "global" (realm-global realm) :enumerable t)
+    (put o "evalScript"
+         (native-function realm "evalScript"
+           (lambda (this args) (declare (ignore this))
+             (let ((src (if args (to-string (first args)) "")))
+               (run-code (compile-toplevel src) realm)))
+           1)
+         :enumerable t)
+    (define-global realm "$262" o)))
+
 (defun run-test (path)
   "Score one test file: :pass / :fail / :skip (module/async/CanBlockIsFalse)."
   (let* ((src (slurp path)) (fm (frontmatter src)) (neg (fm-negative fm)))
@@ -47,6 +65,7 @@
                   (sb-ext:with-timeout 5
                     (let ((realm (make-realm)))
                       (unless (fm-flag fm "raw")
+                        (install-262 realm)
                         (run-code *default-harness* realm)
                         (dolist (inc (fm-list fm "includes")) (run-code (include-code inc) realm)))
                       ;; onlyStrict tests must run in strict mode — prepend the directive

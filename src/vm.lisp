@@ -48,8 +48,32 @@
 ;;; A binding value of the TDZ sentinel means "declared but not yet initialized"
 ;;; (let/const temporal dead zone). CONSTS holds names that may not be reassigned.
 (defvar *tdz* '#:tdz)                    ; unique uninitialized marker
-(defstruct env vars parent consts with-obj block)
+;; global-obj: when non-nil, this env is THE global Environment Record. Its VARS
+;; hash-table is the *declarative* record (holds only let/const/class + built-in
+;; declarative bindings); var/function bindings live as own properties of the
+;; global object (globalThis) so `var x` and `globalThis.x` alias, per spec
+;; (8.1.1.4 Global Environment Records).
+;; var-names: the global env's [[VarNames]] — names introduced by global `var`/
+;; function declarations (distinct from arbitrary own properties of globalThis).
+;; Used by GlobalDeclarationInstantiation's HasVarDeclaration / HasRestrictedGlobalProperty.
+(defstruct env vars parent consts with-obj block global-obj (var-names (make-hash-table :test 'equal)))
 (defun new-env (parent) (make-env :vars (make-hash-table :test 'equal) :parent parent))
+(defun new-global-env (obj) (make-env :vars (make-hash-table :test 'equal) :parent nil :global-obj obj))
+;; --- global-object var-binding helpers (spec CreateGlobalVarBinding etc.) ---
+(defun global-var-defined-p (obj name)
+  "Does the global object have an own property NAME (a global var/fn binding, or a
+   host-defined global property)?"
+  (and (js-object-p obj) (js-get-own-property obj name) t))
+(defun create-global-var-binding (obj name val &optional (overwrite t))
+  "Define/set NAME as an own property of the global object. New bindings are
+   configurable:false (global var/fn semantics); if the property already exists we
+   only overwrite its value (var re-decl / fn re-decl over a var)."
+  (let ((d (js-get-own-property obj name)))
+    (cond ((null d)
+           (put obj name val :enumerable t :writable t :configurable nil))
+          (overwrite
+           (js-set obj name val obj)))
+    val))
 (defun new-block-env (parent) (make-env :vars (make-hash-table :test 'equal) :parent parent :block t))
 (defun env-var-scope-has (env name)
   "Is NAME already bound in the nearest var scope (skipping block envs, stopping at
@@ -57,7 +81,12 @@
    avoid clobbering an existing param/var when creating a block-fn's var binding."
   (loop for e = env then (env-parent e) while e
         do (when (nth-value 1 (gethash name (env-vars e))) (return-from env-var-scope-has t))
-           (unless (env-block e) (return-from env-var-scope-has nil)))
+           (unless (env-block e)
+             ;; the var scope is the global environment: its var bindings are
+             ;; own properties of the global object, not the declarative record.
+             (when (env-global-obj e)
+               (return-from env-var-scope-has (global-var-defined-p (env-global-obj e) name)))
+             (return-from env-var-scope-has nil)))
   nil)
 (defun env-var-set (env name val)
   "Assign an existing var-scoped binding of NAME, skipping block-scoped lexical
@@ -66,9 +95,16 @@
   (loop for e = env then (env-parent e) while e
         do (unless (env-block e)
              (when (nth-value 1 (gethash name (env-vars e)))
-               (setf (gethash name (env-vars e)) val) (return-from env-var-set val))))
+               (setf (gethash name (env-vars e)) val) (return-from env-var-set val))
+             (when (and (env-global-obj e) (global-var-defined-p (env-global-obj e) name))
+               (js-set (env-global-obj e) name val (env-global-obj e))
+               (return-from env-var-set val))))
   ;; no var binding found (shouldn't happen if pre-declared) — set on root
-  (setf (gethash name (env-vars (env-root env))) val) val)
+  (let ((root (env-root env)))
+    (if (env-global-obj root)
+        (js-set (env-global-obj root) name val (env-global-obj root))
+        (setf (gethash name (env-vars root)) val)))
+  val)
 (defun new-with-env (parent obj) (make-env :vars (make-hash-table :test 'equal) :parent parent :with-obj obj))
 (defun env-root (e) (loop while (env-parent e) do (setf e (env-parent e))) e)
 (defun with-binds-p (obj name)
@@ -84,7 +120,11 @@
   (loop for e = env then (env-parent e) while e
         do (when (and (env-with-obj e) (with-binds-p (env-with-obj e) name))
              (return-from env-get (values (js-get (env-with-obj e) name) t)))
-           (multiple-value-bind (v p) (gethash name (env-vars e)) (when p (return-from env-get (values v t)))))
+           ;; declarative record (let/const/class + built-in declarative bindings)
+           (multiple-value-bind (v p) (gethash name (env-vars e)) (when p (return-from env-get (values v t))))
+           ;; global env: fall back to the global object (var/fn + host globals)
+           (when (and (env-global-obj e) (global-var-defined-p (env-global-obj e) name))
+             (return-from env-get (values (js-get (env-global-obj e) name) t))))
   (values *undefined* nil))
 (defun env-get-checked (env name)
   "Read a binding, throwing ReferenceError if not declared, or if still in TDZ."
@@ -114,14 +154,135 @@
            (when (nth-value 1 (gethash name (env-vars e)))
              (when (and (env-consts e) (member name (env-consts e) :test #'string=))
                (js-throw (make-native-error "TypeError" (format nil "Assignment to constant variable."))))
-             (setf (gethash name (env-vars e)) val) (return-from env-set val)))
+             (setf (gethash name (env-vars e)) val) (return-from env-set val))
+           ;; global env: an own property of the global object is a resolvable binding
+           (when (and (env-global-obj e) (global-var-defined-p (env-global-obj e) name))
+             (let ((ok (js-set (env-global-obj e) name val (env-global-obj e))))
+               (when (and strict (not (js-truthy* ok)))       ; strict: failed [[Set]] -> TypeError
+                 (js-throw (make-native-error "TypeError"
+                             (format nil "Cannot assign to read-only property '~a' of the global object" name)))))
+             (return-from env-set val)))
   ;; unresolvable reference: strict -> ReferenceError; sloppy -> create an implicit global
   (when strict
     (js-throw (make-native-error "ReferenceError" (format nil "~a is not defined" name))))
-  (setf (gethash name (env-vars (env-root env))) val) val)              ; sloppy implicit global
-(defun env-declare (env name val) (setf (gethash name (env-vars env)) val))
+  (let ((root (env-root env)))                                          ; sloppy implicit global
+    (if (env-global-obj root)
+        (js-set (env-global-obj root) name val (env-global-obj root))   ; -> writable/enumerable/configurable global property
+        (setf (gethash name (env-vars root)) val)))
+  val)
+(defun env-declare (env name val)
+  ;; On the global environment, a var/function binding that already exists as an
+  ;; own property of the global object (pre-created by GlobalDeclarationInstantiation,
+  ;; or a host global) is updated there — so function-declaration values and var
+  ;; re-decls flow onto globalThis. Otherwise (compiler temps, block/fn scopes) the
+  ;; binding lives in the declarative record.
+  (if (and (env-global-obj env) (global-var-defined-p (env-global-obj env) name))
+      (js-set (env-global-obj env) name val (env-global-obj env))
+      (setf (gethash name (env-vars env)) val)))
 (defun env-declare-const (env name val) (setf (gethash name (env-vars env)) val)
   (pushnew name (env-consts env) :test #'string=))
+;; Lexical (let/const/class/TDZ) bindings ALWAYS live in the declarative record,
+;; even at global scope where they shadow (but don't touch) a same-named global
+;; object property. env-declare is only for var/function bindings.
+(defun env-declare-lexical (env name val) (setf (gethash name (env-vars env)) val))
+
+;;; ---- GlobalDeclarationInstantiation (ECMA-262 §16.1.7) ----
+;;; Find the global environment record on the env chain (env-root, if it's global).
+(defun global-env-of (env)
+  (let ((r (env-root env))) (and (env-global-obj r) r)))
+(defun genv-has-lexical (genv name)
+  "HasLexicalDeclaration: NAME in the declarative record."
+  (nth-value 1 (gethash name (env-vars genv))))
+(defun genv-has-var (genv name)
+  "HasVarDeclaration: NAME is in [[VarNames]] (a prior global var/fn decl)."
+  (nth-value 1 (gethash name (env-var-names genv))))
+(defun genv-restricted-global-p (genv name)
+  "HasRestrictedGlobalProperty: an existing own property of the global object that
+   is non-configurable (a `var`/fn already put it there configurable:false, or the
+   host defined it non-configurable — either way a `let` collides)."
+  (let ((d (js-get-own-property (env-global-obj genv) name)))
+    (and d (not (prop-configurable d)))))
+(defun genv-can-declare-global-var (genv name)
+  (let ((obj (env-global-obj genv)))
+    (or (global-var-defined-p obj name) (js-extensible-p obj))))
+(defun genv-can-declare-global-function (genv name)
+  (let* ((obj (env-global-obj genv)) (d (js-get-own-property obj name)))
+    (cond ((null d) (js-extensible-p obj))
+          ((prop-configurable d) t)
+          ;; existing writable+enumerable data property is redefinable
+          ((and (not (prop-accessor d)) (prop-writable d) (prop-enumerable d)) t)
+          (t nil))))
+(defun create-global-function-binding (genv name val)
+  "CreateGlobalFunctionBinding: define NAME as a data property of the global object.
+   If it already exists and is configurable, redefine fully (writable/enumerable,
+   configurable:false); else just set its value."
+  (let* ((obj (env-global-obj genv)) (d (js-get-own-property obj name)))
+    (if (or (null d) (prop-configurable d))
+        (ordinary-define-own-property obj name
+          (list :value val :writable t :enumerable t :configurable nil))
+        (js-set obj name val obj))
+    (setf (gethash name (env-var-names genv)) t)
+    val))
+(defun env-var-scope (env)
+  "The nearest var scope: skip block envs, stop at the first non-block env (a
+   function or the global environment record)."
+  (loop for e = env then (env-parent e) while e
+        do (unless (env-block e) (return-from env-var-scope e)))
+  (env-root env))
+(defun eval-var-decl (env name)
+  "EvalDeclarationInstantiation for one var/fn NAME. When the eval's variable
+   environment is the GLOBAL environment the binding becomes a *deletable*
+   (configurable:true) own property of the global object, NOT recorded in
+   [[VarNames]] (so a later global `let` isn't blocked). Otherwise (eval sharing a
+   function's var scope) it's an ordinary absent-safe var binding in that scope.
+   Never clobbers an existing binding."
+  (let ((vscope (env-var-scope env)))
+    (if (env-global-obj vscope)
+        (let ((obj (env-global-obj vscope)))
+          (unless (global-var-defined-p obj name)
+            (put obj name *undefined* :enumerable t :writable t :configurable t)))
+        (unless (env-var-scope-has env name)
+          (env-declare vscope name *undefined*)))))
+(defun global-declaration-instantiation (env decls)
+  "Run the spec early checks + create global var/function bindings on the global
+   object. DECLS = (var-names function-names lexical-names). SyntaxError on a
+   lex/var collision or restricted-global collision; TypeError if a name is not
+   definable (non-extensible global object)."
+  (destructuring-bind (var-names fn-names lex-names) decls
+    (let ((genv (global-env-of env)))
+      (unless genv (return-from global-declaration-instantiation))   ; direct-eval etc. share a non-global env
+      ;; 1. lexical-declaration early errors (SyntaxError) — run BEFORE any binding
+      ;;    is created, so a failure leaves the global env untouched.
+      (dolist (n lex-names)
+        (when (or (genv-has-var genv n) (genv-has-lexical genv n) (genv-restricted-global-p genv n))
+          (js-throw (make-native-error "SyntaxError"
+                      (format nil "Identifier '~a' has already been declared" n)))))
+      ;; 2. var/function-declaration collides with a lexical declaration -> SyntaxError
+      (dolist (n (union var-names fn-names :test #'string=))
+        (when (genv-has-lexical genv n)
+          (js-throw (make-native-error "SyntaxError"
+                      (format nil "Identifier '~a' has already been declared" n)))))
+      ;; 3. CanDeclareGlobalFunction / CanDeclareGlobalVar -> TypeError if not definable
+      (dolist (n fn-names)
+        (unless (genv-can-declare-global-function genv n)
+          (js-throw (make-native-error "TypeError"
+                      (format nil "Cannot declare global function '~a'" n)))))
+      (dolist (n var-names)
+        (unless (member n fn-names :test #'string=)
+          (unless (genv-can-declare-global-var genv n)
+            (js-throw (make-native-error "TypeError"
+                        (format nil "Cannot declare global variable '~a'" n))))))
+      ;; 4. create global VAR bindings (undefined). Function-declaration bindings are
+      ;;    created/assigned by the body's :func -> :declare-var (env-declare finds the
+      ;;    pre-created property, or create-global-function-binding via the fn set).
+      ;;    Pre-create fn property slots too so :declare-var writes onto globalThis.
+      (dolist (n fn-names)
+        (create-global-function-binding genv n *undefined*))
+      (dolist (n var-names)
+        (unless (member n fn-names :test #'string=)
+          (unless (global-var-defined-p (env-global-obj genv) n)
+            (create-global-var-binding (env-global-obj genv) n *undefined*))
+          (setf (gethash n (env-var-names genv)) t))))))
 
 ;;; ---- object builders ----
 (defun make-array-object (elems)
@@ -1447,7 +1608,7 @@
    and — when the calling context is strict OR the eval code has its own
    \"use strict\" — a fresh child env so declarations don't leak (strict eval).
    A SyntaxError in the eval source is thrown as a JS SyntaxError."
-  (let* ((code (handler-case (compile-toplevel source)
+  (let* ((code (handler-case (compile-toplevel source t)  ; direct eval = eval code
                  (shuttle-error (e) (error e))
                  (error (e)
                    (js-throw (make-native-error "SyntaxError"
@@ -1492,6 +1653,8 @@
             (:get-var (push! (env-get-checked env (first a))))
             (:typeof-var (push! (env-typeof env (first a))))
             (:set-var (env-set env (first a) (peek!) strictp))
+            (:global-instantiate (global-declaration-instantiation env (first a)))
+            (:eval-var-decl (eval-var-decl env (first a)))
             (:declare-var (env-declare env (first a) (pop!)))
             (:declare-var-absent                                    ; B.3.3: create var binding only if absent in var scope
              (let ((v (pop!)))
@@ -1501,8 +1664,8 @@
             (:pop-env (setf env (env-parent env)))
             (:to-object (push! (to-object (pop!))))
             (:push-with-env (setf env (new-with-env env (pop!))))
-            (:tdz-declare (env-declare env (first a) *tdz*))
-            (:init-let (env-declare env (first a) (pop!)))
+            (:tdz-declare (env-declare-lexical env (first a) *tdz*))
+            (:init-let (env-declare-lexical env (first a) (pop!)))
             (:init-const (env-declare-const env (first a) (pop!)))
             (:get-this (push! this))
             (:load-arg (let ((n (first a))) (push! (if (< n (length call-args)) (aref call-args n) *undefined*))))

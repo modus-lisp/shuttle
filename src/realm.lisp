@@ -29,16 +29,17 @@
                              :boolean-proto bool-proto :symbol-proto sym-proto
                              :symbol-registry (make-hash-table :test 'equal))))
     (let ((*current-realm* realm))
-      (setf (realm-global realm) (make-object :proto obj-proto)
-            (realm-global-env realm) (new-env nil))
+      (setf (realm-global realm) (make-object :proto obj-proto))
+      (setf (realm-global-env realm) (new-global-env (realm-global realm)))
       (install-intrinsics realm)
       (define-global realm "globalThis" (realm-global realm))
       realm)))
 
 (defun define-global (realm name value)
   ;; Built-in globals (Object, Array, eval, parseInt, …) are non-enumerable,
-  ;; writable, configurable per spec (unlike global `var` bindings).
-  (env-declare (realm-global-env realm) name value)
+  ;; writable, configurable per spec (unlike global `var` bindings). They live as
+  ;; own properties of the global object; unqualified name resolution falls back to
+  ;; the global object, so no separate declarative-record entry is needed.
   (put (realm-global realm) name value :enumerable nil)
   value)
 
@@ -882,9 +883,6 @@
   (put (realm-global realm) "NaN" *nan* :enumerable nil :writable nil :configurable nil)
   (put (realm-global realm) "Infinity" *inf* :enumerable nil :writable nil :configurable nil)
   (put (realm-global realm) "undefined" *undefined* :enumerable nil :writable nil :configurable nil)
-  (env-declare (realm-global-env realm) "NaN" *nan*)
-  (env-declare (realm-global-env realm) "Infinity" *inf*)
-  (env-declare (realm-global-env realm) "undefined" *undefined*)
   (define-global realm "isNaN"
     (native-function realm "isNaN" (lambda (this args) (declare (ignore this)) (js-bool (js-nan-p (to-number (arg 0 args))))) 1))
   (define-global realm "isFinite"
@@ -1022,7 +1020,7 @@
             (lambda (this args) (declare (ignore this))
               (let ((s (arg 0 args)))
                 (if (stringp s)
-                    (let ((code (handler-case (compile-toplevel s)
+                    (let ((code (handler-case (compile-toplevel s t)  ; indirect eval = eval code
                                   (shuttle-error (e) (error e))
                                   (error (e)
                                     (js-throw (make-native-error "SyntaxError"

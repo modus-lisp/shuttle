@@ -135,6 +135,50 @@
                     ;; bound target (spec 10.4.1.2 step 5).
                     (js-construct target (append bound-args call-args)
                                   (if (eq new-target f) target new-target)))))
-          f)))))
+          f)))
+
+    ;; ---- Function constructor (override kernel install-function-ctor) ----
+    ;; CreateDynamicFunction (spec 20.2.1.1.1). Two spec-correctness fixes over
+    ;; the kernel:
+    ;;   1. ToString order: the parameter arguments are stringified *in order*
+    ;;      BEFORE the body argument (kernel did the body first). Observable when
+    ;;      a param's toString has a side effect / throws (S15.3.2.1_A3_T1/T3).
+    ;;   2. A parse failure must surface as a JS SyntaxError object (the parser
+    ;;      raises a shuttle-error carrying a bare STRING, and some raw Lisp
+    ;;      READ/parse errors escape entirely); either way `e instanceof
+    ;;      SyntaxError` must hold (S15.3.2.1_A3_T6 style).
+    (install-function-ctor-override realm fp)))
+
+(defun install-function-ctor-override (realm fp)
+  (labels ((build (args)
+             (let* ((*current-realm* realm)
+                    (n (length args))
+                    ;; ToString params first (in order), then body — the arg
+                    ;; evaluation order the spec mandates.
+                    (params (format nil "~{~a~^,~}"
+                                    (mapcar #'to-string (butlast args))))
+                    (body (if (zerop n) "" (to-string (car (last args)))))
+                    (src (format nil "(function anonymous(~a~%) {~%~a~%})" params body))
+                    (code (handler-case (compile-toplevel src)
+                            ;; parser threw a JS value already — re-raise it if it
+                            ;; is a proper error object, else wrap a bare string.
+                            (shuttle-error (e)
+                              (let ((v (shuttle-error-value e)))
+                                (if (js-object-p v)
+                                    (error e)
+                                    (js-throw (make-native-error "SyntaxError"
+                                                (if (stringp v) v "invalid Function body"))))))
+                            ;; a raw CL error escaping the reader/parser -> SyntaxError.
+                            (error (e)
+                              (js-throw (make-native-error "SyntaxError"
+                                          (format nil "~a" (ignore-errors (princ-to-string e)))))))))
+               (run code (realm-global-env realm) (realm-global realm)))))
+    (let ((ctor (native-function realm "Function"
+                  (lambda (this args) (declare (ignore this)) (build args)) 1)))
+      (setf (js-object-construct ctor)
+            (lambda (args nt) (declare (ignore nt)) (build args)))
+      (def-value ctor "prototype" fp :writable nil :configurable nil)
+      (def-value fp "constructor" ctor)
+      (define-global realm "Function" ctor))))
 
 (register-builtin-installer 'install-function-extra)
