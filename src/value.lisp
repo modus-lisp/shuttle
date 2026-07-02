@@ -569,6 +569,63 @@
            (or (ignore-errors (float (parse-integer s :start 2 :radix 2) 1d0)) *nan*))
           (t (or (parse-js-decimal s) *nan*)))))
 
+(defun %round-half-to-even (num den)
+  "Round the exact rational NUM/DEN (DEN > 0) to the nearest integer, ties to even."
+  (multiple-value-bind (q rem) (floor num den)
+    (let ((twice (* 2 rem)))
+      (cond ((< twice den) q)
+            ((> twice den) (1+ q))
+            (t (if (evenp q) q (1+ q)))))))
+
+(defun rational->double (r)
+  "Convert a NON-NEGATIVE exact rational R to the closest double-float, ties to
+   even. Correct across normals AND subnormals (unlike CL:COERCE/the reader, which
+   mis-round subnormals in SBCL)."
+  (when (zerop r) (return-from rational->double 0d0))
+  (let* ((num (numerator r)) (den (denominator r))
+         ;; approximate floor(log2 r); the loops below correct any off-by-one
+         (log2r (- (integer-length num) (integer-length den)))
+         (e (max (- log2r 52) -1074)))
+    (multiple-value-bind (n d)
+        (if (>= e 0) (values num (* den (expt 2 e)))
+            (values (* num (expt 2 (- e))) den))
+      (let ((sig (%round-half-to-even n d)))
+        ;; significand overflowed 2^53 (rounded up): shift right, bump exponent
+        (loop while (>= sig (ash 1 53)) do
+          (setf d (* d 2) sig (%round-half-to-even n d) e (1+ e)))
+        ;; significand too small for a normalized double: shift left (until the
+        ;; subnormal floor E = -1074), re-round
+        (loop while (and (> e -1074) (< sig (ash 1 52))) do
+          (setf e (1- e) n (* n 2) sig (%round-half-to-even n d)))
+        ;; overflow: exponent above the max for a finite double -> +Infinity
+        (if (> e 971) *inf*
+            (handler-case (scale-float (coerce sig 'double-float) e)
+              (floating-point-overflow () *inf*)))))))
+
+(defun decimal-string->rational (s)
+  "Parse a syntactically-valid JS decimal literal S (sign/digits/'.'/exponent)
+   into an exact RATIONAL (or NIL for an all-zero magnitude). No rounding."
+  (let ((n (length s)) (i 0) (sign 1) (int-part 0) (frac-digits 0) (frac 0) (exp 0))
+    (when (and (< i n) (member (char s i) '(#\+ #\-)))
+      (when (char= (char s i) #\-) (setf sign -1)) (incf i))
+    (loop while (and (< i n) (digit-char-p (char s i)))
+          do (setf int-part (+ (* int-part 10) (digit-char-p (char s i)))) (incf i))
+    (when (and (< i n) (char= (char s i) #\.))
+      (incf i)
+      (loop while (and (< i n) (digit-char-p (char s i)))
+            do (setf frac (+ (* frac 10) (digit-char-p (char s i)))) (incf frac-digits) (incf i)))
+    (when (and (< i n) (member (char s i) '(#\e #\E)))
+      (incf i)
+      (let ((esign 1))
+        (when (and (< i n) (member (char s i) '(#\+ #\-)))
+          (when (char= (char s i) #\-) (setf esign -1)) (incf i))
+        (loop while (and (< i n) (digit-char-p (char s i)))
+              do (setf exp (+ (* exp 10) (digit-char-p (char s i)))) (incf i))
+        (setf exp (* esign exp))))
+    (let* ((mant (+ int-part (/ frac (expt 10 frac-digits))))
+           (val (* mant (expt 10 exp))))
+      (if (zerop val) nil (* sign val)))))
+
 (defun parse-js-decimal (s)
   "Parse a JS decimal StringNumericLiteral (optional sign, digits, '.', exponent).
    Returns a double-float or NIL. Rejects trailing junk; '' handled by caller."
@@ -590,18 +647,16 @@
             (loop while (and (< i n) (digit-char-p (char s i))) do (incf i) (setf exp-digit t))
             (unless exp-digit (return-from parse-js-decimal nil))))
         (unless (= i n) (return-from parse-js-decimal nil))
-        (let ((*read-default-float-format* 'double-float))
-          (with-js-floats
-            ;; The literal was already syntax-validated above, so a reader /
-            ;; overflow error here means the magnitude overflowed a double ->
-            ;; +/-Infinity per spec (StringNumericLiteral), not NaN.
-            (handler-case
-                (* sign (float (let ((body (subseq s (if (char= (char s 0) #\+) 1 (if (char= (char s 0) #\-) 1 0)))))
-                                 (read-from-string (if (char= (char body 0) #\.) (concatenate 'string "0" body) body)))
-                               1d0))
-              (floating-point-overflow () (* sign *inf*))
-              (reader-error () (* sign *inf*))
-              (arithmetic-error () (* sign *inf*)))))))))
+        ;; Build an exact rational from the (already syntax-validated) digits and
+        ;; exponent, then round-to-nearest-even to a double. This is correctly
+        ;; rounded across the whole range INCLUDING subnormals, where SBCL's own
+        ;; reader / rational->float coercion mis-rounds. Overflow -> +/-Infinity.
+        (with-js-floats
+          (let ((r (decimal-string->rational s)))
+            (if (null r) (* sign 0d0)
+                (let ((mag (rational->double (abs r))))
+                  (if (> mag most-positive-double-float) (* sign *inf*)
+                      (* sign mag))))))))))
 
 (defun number-to-string (n)
   (cond ((js-nan-p n) "NaN") ((= n *inf*) "Infinity") ((= n *-inf*) "-Infinity")
@@ -811,6 +866,14 @@
 (defun to-symbol-string (sym)
   "String(Symbol) -> \"Symbol(desc)\" (used by String() and description access)."
   (format nil "Symbol(~a)" (or (js-symbol-desc sym) "")))
+
+(defun js-key-name (k)
+  "The function-name string for a property key K (already a key: string or symbol).
+   A symbol key names the function \"[desc]\" (empty desc -> \"\") per spec; a string
+   key passes through. Anything else is ToString'd defensively."
+  (cond ((stringp k) k)
+        ((js-symbol-p k) (let ((d (js-symbol-desc k))) (if d (format nil "[~a]" d) "")))
+        (t (to-string k))))
 
 (defun to-property-key (v)
   "ToPropertyKey: symbols pass through; everything else -> ToString.

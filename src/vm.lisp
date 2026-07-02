@@ -77,12 +77,15 @@
           ((eq v *tdz*) (js-throw (make-native-error "ReferenceError"
                           (format nil "Cannot access '~a' before initialization" name))))
           (t (js-typeof v)))))
-(defun env-set (env name val)
+(defun env-set (env name val &optional strict)
   (loop for e = env then (env-parent e) while e
         do (when (nth-value 1 (gethash name (env-vars e)))
              (when (and (env-consts e) (member name (env-consts e) :test #'string=))
                (js-throw (make-native-error "TypeError" (format nil "Assignment to constant variable."))))
              (setf (gethash name (env-vars e)) val) (return-from env-set val)))
+  ;; unresolvable reference: strict -> ReferenceError; sloppy -> create an implicit global
+  (when strict
+    (js-throw (make-native-error "ReferenceError" (format nil "~a is not defined" name))))
   (setf (gethash name (env-vars (env-root env))) val) val)              ; sloppy implicit global
 (defun env-declare (env name val) (setf (gethash name (env-vars env)) val))
 (defun env-declare-const (env name val) (setf (gethash name (env-vars env)) val)
@@ -980,6 +983,12 @@
                   (when (js-object-internal r)
                     (setf (js-object-internal this)
                           (append (js-object-internal r) (js-object-internal this))))
+                  ;; adopt the base's exotic class (Array/Error/Map/...) so the
+                  ;; instance carries the base exotic behavior (Object.prototype.toString
+                  ;; tag, Array [[DefineOwnProperty]] length maintenance, etc.).
+                  (when (and (js-object-class r)
+                             (not (string= (js-object-class r) "Object")))
+                    (setf (js-object-class this) (js-object-class r)))
                   this)
                 this)))
          (t
@@ -1156,6 +1165,7 @@
 
 (defun %run (code env this &optional call-args fn-obj)
   (let ((instrs (code-instrs code)) (pc 0)
+        (strictp (code-strict code))
         (call-args (coerce call-args 'vector))
         (stack (make-array 64 :adjustable t :fill-pointer 0)) (completion *undefined*)
         (home (and fn-obj (fn-home fn-obj)))          ; [[HomeObject]] for super
@@ -1177,7 +1187,7 @@
             (:const (push! (first a)))
             (:get-var (push! (env-get-checked env (first a))))
             (:typeof-var (push! (env-typeof env (first a))))
-            (:set-var (env-set env (first a) (peek!)))
+            (:set-var (env-set env (first a) (peek!) strictp))
             (:declare-var (env-declare env (first a) (pop!)))
             (:push-env (setf env (new-env env)))
             (:pop-env (setf env (env-parent env)))
@@ -1214,16 +1224,32 @@
             (:unary (push! (js-unop (first a) (pop!))))
             (:get-prop (let ((k (pop!)) (o (pop!))) (push! (js-get o k))))
             (:get-prop-c (push! (js-get (pop!) (first a))))
-            (:set-prop (let ((v (pop!)) (k (pop!)) (o (pop!))) (js-set o k v) (push! v)))
+            (:set-prop (let ((v (pop!)) (k (pop!)) (o (pop!)))
+                         (let ((ok (js-set o k v)))
+                           (when (and strictp (not (js-truthy* ok)))
+                             (js-throw (make-native-error "TypeError"
+                               (format nil "Cannot assign to read-only property '~a' of ~a"
+                                       (if (js-symbol-p k) (to-symbol-string k) (to-string k))
+                                       (js-typeof o))))))
+                         (push! v)))
             (:del-prop (let ((k (pop!)) (o (pop!)))
-                         (push! (if (js-object-p o) (js-delete o k) *true*))))
+                         (let ((ok (if (js-object-p o) (js-delete o k) *true*)))
+                           (when (and strictp (not (js-truthy* ok)))
+                             (js-throw (make-native-error "TypeError"
+                               (format nil "Cannot delete property '~a'"
+                                       (if (js-symbol-p k) (to-symbol-string k) (to-string k))))))
+                           (push! ok))))
             (:update-prop (let* ((delta (first a)) (prefix (second a))
                                  (k (pop!)) (o (pop!))
                                  (old (to-numeric (js-get o k)))
                                  (new (if (js-bigint-p old)
                                           (+ old (truncate delta))
                                           (with-js-floats (+ old delta)))))
-                            (js-set o k new)
+                            (let ((ok (js-set o k new)))
+                              (when (and strictp (not (js-truthy* ok)))
+                                (js-throw (make-native-error "TypeError"
+                                  (format nil "Cannot assign to read-only property '~a'"
+                                          (if (js-symbol-p k) (to-symbol-string k) (to-string k)))))))
                             (push! (if prefix new old))))
             (:for-in-keys (push! (for-in-key-array (pop!))))
             (:get-iterator (push! (get-iterator (pop!))))
@@ -1262,7 +1288,7 @@
                                   (kind (first a)) (static (second a))
                                   (target (if static ctor (js-get ctor "prototype"))))
                              (setf (fn-home fn) target)     ; [[HomeObject]] for super
-                             (put fn "name" (if (stringp k) k (to-string k)) :enumerable nil :writable nil)
+                             (put fn "name" (js-key-name k) :enumerable nil :writable nil)
                              (case kind
                                (:get (js-define-own-property target (prop-key k)
                                        (list :get fn :accessor t :enumerable nil :configurable t)))

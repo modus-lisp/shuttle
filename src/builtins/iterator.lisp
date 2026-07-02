@@ -14,6 +14,12 @@
 ;;;; This file loads last (asd :serial t), so these redefinitions win.
 (in-package #:shuttle)
 
+;;; Symbol.dispose well-known symbol — the special var is (re)defined here so
+;;; iterator.lisp (which loads before disposable.lisp) can bind @@dispose on
+;;; %IteratorPrototype%.  DEFVAR is idempotent, so disposable.lisp's own defvar
+;;; and its (or *symbol-dispose* ...) reuse the SAME symbol object.
+(defvar *symbol-dispose* nil)
+
 ;;; The shared %IteratorPrototype% for the current realm (set at install time).
 (defvar *iterator-prototype* nil)
 ;;; %ArrayIteratorPrototype% / %StringIteratorPrototype% — one level below
@@ -425,6 +431,29 @@
                     1)))
       (put-accessor iproto tostag :get getter :set setter :enumerable nil :configurable t))
 
+    ;; ---- %IteratorPrototype% [ @@dispose ] () ----
+    ;; A data method (writable, non-enumerable, configurable) named
+    ;; "[Symbol.dispose]", length 0.  Calls GetMethod(this,"return") and, if
+    ;; present, invokes it; always returns undefined.  We reuse (or create) the
+    ;; Symbol.dispose well-known symbol so the later disposable installer shares
+    ;; the SAME symbol object (and exposes it as Symbol.dispose).
+    (let ((dispose-sym
+            (or *symbol-dispose*
+                (well-known-symbol "dispose")
+                (setf *symbol-dispose* (make-js-symbol "Symbol.dispose")))))
+      (setf *symbol-dispose* dispose-sym)
+      (put iproto dispose-sym
+           (native-function realm "[Symbol.dispose]"
+             (lambda (this args) (declare (ignore args))
+               (let ((ret (and (js-object-p this) (js-get this "return"))))
+                 (unless (js-null-or-undef ret)
+                   (unless (js-callable-p ret)
+                     (js-throw (make-native-error "TypeError" "return is not a function")))
+                   (js-call ret this '())))
+               *undefined*)
+             0)
+           :enumerable nil :writable t :configurable t))
+
     ;; ---- Iterator.prototype.constructor getter/setter ----
     ;; (set below once ctor exists — placeholder replaced after ctor is built)
 
@@ -489,11 +518,13 @@
 (defun %get-iterator-flattenable (obj string-handling)
   "GetIteratorFlattenable(obj, stringHandling).  Returns the iterator object
    (with a usable .next).  STRING-HANDLING t = iterate-string-primitives
-   (Iterator.from), nil = reject-primitives (flatMap)."
+   (Iterator.from), nil = reject-primitives (flatMap).
+   Per spec, primitive strings are NOT boxed here: GetMethod(obj, @@iterator)
+   and the @@iterator call both receive the primitive string as `this` (so a
+   strict @@iterator getter observes typeof this === 'string')."
   (when (not (js-object-p obj))
-    (if (and string-handling (stringp obj))
-        (setf obj (to-object obj))
-        (js-throw (make-native-error "TypeError" "not an object"))))
+    (unless (and string-handling (stringp obj))
+      (js-throw (make-native-error "TypeError" "not an object"))))
   (let* ((itf (and *symbol-iterator* (js-get obj *symbol-iterator*)))
          (iterator
           (cond ((js-null-or-undef itf) obj)          ; fall back to treating obj as the iterator

@@ -39,7 +39,7 @@
     (js-throw (make-native-error "RangeError" "Array buffer allocation failed")))
   n)
 
-(defun proto-from-newtarget (nt default-proto)
+(defun ab-proto-from-newtarget (nt default-proto)
   "GetPrototypeFromConstructor: nt.prototype if an object, else DEFAULT-PROTO."
   (if (js-object-p nt)
       (let ((p (js-get nt "prototype")))
@@ -63,7 +63,7 @@
                 (js-throw (make-native-error "RangeError" "length exceeds maxByteLength")))
               ;; OrdinaryCreateFromConstructor reads nt.prototype (may throw) BEFORE
               ;; CreateByteDataBlock allocates / range-checks the size.
-              (let ((rproto (proto-from-newtarget nt proto)))
+              (let ((rproto (ab-proto-from-newtarget nt proto)))
                 (when maxlen (guard-alloc maxlen))
                 (guard-alloc len)
                 (make-array-buffer (make-byte-vector len) rproto maxlen)))))

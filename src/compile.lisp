@@ -7,7 +7,10 @@
 (defstruct code name params instrs inst-instrs
   (this-mode :normal)     ; :normal = OrdinaryCallBindThis (sloppy: undefined/null -> globalThis, primitive -> boxed);
                           ; :lexical = arrow (inherit caller's this, no rebind)
+  (strict nil)            ; T iff this code runs in strict mode (own "use strict" prologue or inherited)
   (constructable t))      ; NIL for arrows and concise/accessor methods (new'ing them is a TypeError)
+
+(defvar *strict* nil)     ; compile-time: are we lexically inside strict code? (inherited by nested fns)
 (defvar *out*)
 (defvar *break-target* nil) (defvar *continue-target* nil)
 (defvar *scope-depth* 0)                 ; current lexical block-env nesting within the fn
@@ -76,6 +79,8 @@
   ;; so sloppy substitution is the default. (Arrows keep :lexical regardless.)
   (when (and (eq this-mode :normal) (directive-prologue-strict-p body))
     (setf this-mode :strict))
+  ;; strict is inherited from enclosing code OR triggered by our own "use strict".
+  (let ((*strict* (or *strict* (directive-prologue-strict-p body))))
   (let ((*out* '()) (pnames (param-names params)))
     ;; bind parameters from incoming call args
     (compile-params params)
@@ -91,13 +96,14 @@
       (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s))))
     (unless toplevel (em :const *undefined*) (em :ret))   ; functions default-return undefined
     (make-code :name name :params params :instrs (assemble *out*)
-               :this-mode this-mode :constructable constructable)))
+               :this-mode this-mode :strict *strict* :constructable constructable))))
 
 (defun compile-fn-split (name params body &optional (this-mode :normal))
   "Compile a generator/async/async-generator: split FunctionDeclarationInstantiation
    (param binding + var/lexical/fn hoisting — run synchronously at the call) from the
    deferred body. Returns a CODE whose INST-INSTRS is the instantiation stream and
    INSTRS is the body; both run against the SAME function environment."
+  (let ((*strict* (or *strict* (directive-prologue-strict-p body))))
   (let ((pnames (param-names params)) (inst nil))
     (let ((*out* '()))
       (compile-params params)
@@ -114,7 +120,7 @@
         (dolist (s stmts) (unless (block-hoisted-fn-p s) (compile-stmt s))))
       (em :const *undefined*) (em :ret)
       (make-code :name name :params params :instrs (assemble *out*) :inst-instrs inst
-                 :this-mode this-mode))))
+                 :this-mode this-mode :strict *strict*)))))
 
 (defun compile-array-destructure (pat)
   "Value on stack is the iterable. Destructure per (:apat ELEMS)."
@@ -467,6 +473,9 @@
                 (em :typeof-var (second (third node)))     ; typeof of a NAME never throws
                 (progn (compile-expr (third node)) (em :unary (second node)))))
     (:delete (let ((tgt (second node)))
+               (when (and *strict* (eq (car tgt) :ident))
+                 (js-throw (make-native-error "SyntaxError"
+                   "Delete of an unqualified identifier in strict mode.")))
                (if (eq (car tgt) :member)
                    (progn (compile-expr (second tgt))
                           (if (fourth tgt) (compile-expr (third tgt)) (em :const (second (third tgt))))

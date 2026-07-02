@@ -477,6 +477,9 @@
 ;;; Array.prototype (kernel; src/builtins/ adds the rest)
 ;;; ---------------------------------------------------------------------------
 (defun install-array (realm ap)
+  ;; Array.prototype is itself an Array exotic object with an own "length"
+  ;; (writable, non-enumerable, non-configurable), initially 0.
+  (put ap "length" 0d0 :enumerable nil :writable t :configurable nil)
   (let ((actor (native-function realm "Array"
                  (lambda (this args) (declare (ignore this)) (array-construct realm args)) 1)))
     (setf (js-object-construct actor) (lambda (args nt) (declare (ignore nt)) (array-construct realm args)))
@@ -554,18 +557,48 @@
   (if (js-undefined-p v) default
       (let ((i (to-int-index v))) (cond ((< i 0) (max 0 (+ len i))) ((> i len) len) (t i)))))
 
+(defun ensure-iterator-proto (realm)
+  "%IteratorPrototype%: the shared prototype whose only method is
+   [Symbol.iterator]() { return this; }. Memoized in the realm intrinsics."
+  (or (getf (realm-intrinsics realm) :iterator-proto)
+      (let ((ip (make-object :proto (realm-object-proto realm))))
+        (when *symbol-iterator*
+          (put ip *symbol-iterator*
+               (native-function realm "[Symbol.iterator]" (lambda (this args) (declare (ignore args)) this) 0)
+               :enumerable nil))
+        (setf (getf (realm-intrinsics realm) :iterator-proto) ip)
+        ip)))
+
+(defun ensure-array-iterator-proto (realm)
+  "%ArrayIteratorPrototype%: shared prototype carrying `next` (and inheriting
+   [Symbol.iterator] from %IteratorPrototype%). Instances hold only their cursor
+   state, so `next` is NOT an own property of an array-iterator instance."
+  (or (getf (realm-intrinsics realm) :array-iterator-proto)
+      (let ((aip (make-object :proto (ensure-iterator-proto realm) :class "Array Iterator")))
+        (def-method realm aip "next" 0 (this args) (declare (ignore args)) (array-iterator-next this))
+        (setf (getf (realm-intrinsics realm) :array-iterator-proto) aip)
+        aip)))
+
+(defun array-iterator-next (this)
+  "The %ArrayIteratorPrototype%.next step, reading the cursor state stored in the
+   iterator instance's internal slots."
+  (let* ((state (and (js-object-p this) (js-object-internal this)))
+         (arr (getf state :array-iterator-target))
+         (res (make-object :proto (%obj-proto))))
+    (unless (and arr (getf state :array-iterator-p))
+      (js-throw (make-native-error "TypeError" "next called on a non-ArrayIterator")))
+    (let ((i (getf state :array-iterator-index))
+          (len (to-int-index (js-get arr "length"))))
+      (if (< i len)
+          (progn (put res "value" (js-get arr (princ-to-string i))) (put res "done" *false*)
+                 (setf (getf (js-object-internal this) :array-iterator-index) (1+ i)))
+          (progn (put res "value" *undefined*) (put res "done" *true*)))
+      res)))
+
 (defun make-array-iterator (realm arr)
-  (let ((i 0) (it (make-object :proto (realm-object-proto realm) :class "Array Iterator")))
-    (def-method realm it "next" 0 (this args)
-      (let ((len (to-int-index (js-get arr "length")))
-            (res (make-object :proto (realm-object-proto realm))))
-        (if (< i len)
-            (progn (put res "value" (js-get arr (princ-to-string i))) (put res "done" *false*) (incf i))
-            (progn (put res "value" *undefined*) (put res "done" *true*)))
-        res))
-    (when *symbol-iterator*
-      (put it *symbol-iterator* (native-function realm "[Symbol.iterator]" (lambda (this args) (declare (ignore args)) this) 0)
-           :enumerable nil))
+  (let ((it (make-object :proto (ensure-array-iterator-proto realm) :class "Array Iterator")))
+    (setf (js-object-internal it)
+          (list :array-iterator-p t :array-iterator-target arr :array-iterator-index 0))
     it))
 
 ;;; ---------------------------------------------------------------------------
@@ -759,20 +792,36 @@
                                    (t (push (subseq s start p) out) (setf start (+ p (length seps)))))))))
                (make-array-object (nreverse out)))))))
 
+(defun ensure-string-iterator-proto (realm)
+  "%StringIteratorPrototype%: shared prototype carrying `next`, inheriting
+   [Symbol.iterator] from %IteratorPrototype%."
+  (or (getf (realm-intrinsics realm) :string-iterator-proto)
+      (let ((sip (make-object :proto (ensure-iterator-proto realm) :class "String Iterator")))
+        (def-method realm sip "next" 0 (this args) (declare (ignore args)) (string-iterator-next this))
+        (setf (getf (realm-intrinsics realm) :string-iterator-proto) sip)
+        sip)))
+
+(defun string-iterator-next (this)
+  ;; iterate by CODE POINT — a surrogate pair yields a single 2-unit substring;
+  ;; a lone surrogate yields its 1-unit substring.
+  (let* ((state (and (js-object-p this) (js-object-internal this)))
+         (s (getf state :string-iterator-target))
+         (res (make-object :proto (%obj-proto))))
+    (unless (getf state :string-iterator-p)
+      (js-throw (make-native-error "TypeError" "next called on a non-StringIterator")))
+    (let ((i (getf state :string-iterator-index)))
+      (if (< i (length s))
+          (multiple-value-bind (cp units) (code-point-at s i)
+            (declare (ignore cp))
+            (put res "value" (subseq s i (+ i units))) (put res "done" *false*)
+            (setf (getf (js-object-internal this) :string-iterator-index) (+ i units)))
+          (progn (put res "value" *undefined*) (put res "done" *true*)))
+      res)))
+
 (defun make-string-iterator (realm s)
-  ;; %StringIteratorPrototype%: iterate by CODE POINT — a surrogate pair yields a
-  ;; single 2-unit substring; a lone surrogate yields its 1-unit substring.
-  (let ((i 0) (it (make-object :proto (realm-object-proto realm) :class "String Iterator")))
-    (def-method realm it "next" 0 (this args)
-      (let ((res (make-object :proto (realm-object-proto realm))))
-        (if (< i (length s))
-            (multiple-value-bind (cp units) (code-point-at s i)
-              (declare (ignore cp))
-              (put res "value" (subseq s i (+ i units))) (put res "done" *false*) (incf i units))
-            (progn (put res "value" *undefined*) (put res "done" *true*)))
-        res))
-    (when *symbol-iterator*
-      (put it *symbol-iterator* (native-function realm "[Symbol.iterator]" (lambda (this args) (declare (ignore args)) this) 0) :enumerable nil))
+  (let ((it (make-object :proto (ensure-string-iterator-proto realm) :class "String Iterator")))
+    (setf (js-object-internal it)
+          (list :string-iterator-p t :string-iterator-target s :string-iterator-index 0))
     it))
 
 ;;; ---------------------------------------------------------------------------

@@ -258,14 +258,12 @@
                              ((eql radix 16) (float (parse-integer text :start 2 :radix 16) 1d0))
                              ((eql radix 8)  (float (parse-integer text :start 2 :radix 8) 1d0))
                              ((eql radix 2)  (float (parse-integer text :start 2 :radix 2) 1d0))
-                             (t (let ((*read-default-float-format* 'double-float))
-                                  ;; An overflowing numeric literal (e.g. 1E+309) is
-                                  ;; Infinity per spec, not a reader error.
-                                  (with-js-floats
-                                    (handler-case (float (read-from-string text) 1d0)
-                                      (floating-point-overflow () *inf*)
-                                      (reader-error () *inf*)
-                                      (arithmetic-error () *inf*)))))))))))
+                             ;; Correctly-rounded decimal->double via an exact
+                             ;; rational (right across subnormals, where the reader
+                             ;; mis-rounds). Overflow (e.g. 1E+309) -> Infinity.
+                             (t (with-js-floats
+                                  (let ((r (decimal-string->rational text)))
+                                    (if (null r) 0d0 (rational->double r)))))))))))
             ;; identifier / keyword  (also #private-name as a lexeme)
             ((or (id-start-p c) (and (char= c #\#) (< (1+ i) n) (id-start-p (char src (1+ i)))))
              (let ((start i)) (when (char= c #\#) (incf i))

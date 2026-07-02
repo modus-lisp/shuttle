@@ -87,7 +87,7 @@
                                 l))))
                     ;; OrdinaryCreateFromConstructor reads nt.prototype (may run user
                     ;; code that detaches the buffer) BEFORE the final detach re-check.
-                    (let ((rproto (proto-from-newtarget nt proto)))
+                    (let ((rproto (ab-proto-from-newtarget nt proto)))
                       (when (ab-detached-p buffer)
                         (js-throw (make-native-error "TypeError" "buffer is detached")))
                     (let ((o (make-object :proto rproto :class "DataView")))

@@ -9,12 +9,12 @@
 ;;;;
 ;;;; The core INTERNAL dispatch (value.lisp) covers get/set/has/delete/own-keys/
 ;;;; get-own-property/define-own-property + [[Call]]/[[Construct]] (via the CALL/
-;;;; CONSTRUCT slots). getPrototypeOf/setPrototypeOf/isExtensible/preventExtensions
-;;;; are NOT yet dispatched through INTERNAL by core (they read js-object-proto /
-;;;; js-object-extensible directly), so those four traps are wired into the
-;;;; :get-proto/:set-proto/:is-extensible/:prevent-extensions internal keys and
-;;;; will activate once core learns to consult them (see report proposals). Until
-;;;; then the proxy's own slots mirror the target well enough for identity checks.
+;;;; CONSTRUCT slots), plus getPrototypeOf/setPrototypeOf/isExtensible/
+;;;; preventExtensions via js-get-proto/js-set-proto/js-extensible-p/
+;;;; js-prevent-extensions (wired to the :get-proto/:set-proto/:is-extensible/
+;;;; :prevent-extensions internal keys). Every default-forwarding branch calls
+;;;; those dispatchers on the target (never the raw struct slots) so nested-proxy
+;;;; targets forward correctly.
 (in-package #:shuttle)
 
 ;;; ---------------------------------------------------------------------------
@@ -34,6 +34,13 @@
   "Throw if this proxy has been revoked (handler cleared)."
   `(when (car ,revoked-cell)
      (%proxy-throw "Cannot perform operation on a revoked proxy")))
+
+(defun %pk (key)
+  "Normalize a property key to a String or Symbol (ToPropertyKey). A trap always
+   receives a String|Symbol per spec, but core's internal-method dispatch may
+   hand us a raw number (e.g. `proxy[10]`) — coerce it so the trap sees \"10\",
+   not the number 10. Strings and Symbols pass through unchanged."
+  (if (or (stringp key) (js-symbol-p key)) key (prop-key key)))
 
 (defun %prop-to-desc-plist (prop)
   "PROP struct -> a to-property-descriptor-style plist (all fields present)."
@@ -55,6 +62,7 @@
           (lambda (o key &optional receiver)
             (declare (ignore o))
             (%proxy-guard revoked-cell)
+            (setf key (%pk key))
             (let ((tr (%get-trap handler "get")) (rcv (or receiver o)))
               (if (null tr)
                   (js-get target key rcv)
@@ -75,6 +83,7 @@
           (lambda (o key v &optional receiver)
             (declare (ignore o))
             (%proxy-guard revoked-cell)
+            (setf key (%pk key))
             (let ((tr (%get-trap handler "set")) (rcv (or receiver o)))
               (if (null tr)
                   ;; default [[Set]] = OrdinarySet(target,key,v,receiver=proxy).
@@ -95,6 +104,7 @@
           (lambda (o key)
             (declare (ignore o))
             (%proxy-guard revoked-cell)
+            (setf key (%pk key))
             (let ((tr (%get-trap handler "has")))
               (if (null tr)
                   ;; return a CL boolean to match ordinary-has (the `in` operator
@@ -106,7 +116,7 @@
                         (when td
                           (when (not (prop-configurable td))
                             (%proxy-throw "proxy has: cannot report non-configurable property as non-existent"))
-                          (unless (js-object-extensible target)
+                          (unless (js-extensible-p target)
                             (%proxy-throw "proxy has: cannot report existing property of non-extensible target as non-existent")))))
                     present)))))
     ;; ---- [[Delete]] ----
@@ -114,6 +124,7 @@
           (lambda (o key)
             (declare (ignore o))
             (%proxy-guard revoked-cell)
+            (setf key (%pk key))
             (let ((tr (%get-trap handler "deleteProperty")))
               (if (null tr)
                   (js-delete target key)
@@ -123,7 +134,7 @@
                         (when td
                           (when (not (prop-configurable td))
                             (%proxy-throw "proxy deleteProperty: cannot delete non-configurable property"))
-                          (unless (js-object-extensible target)
+                          (unless (js-extensible-p target)
                             (%proxy-throw "proxy deleteProperty: cannot delete property of non-extensible target")))))
                     (js-bool ok))))))
     ;; ---- [[OwnPropertyKeys]] ----
@@ -143,6 +154,7 @@
           (lambda (o key)
             (declare (ignore o))
             (%proxy-guard revoked-cell)
+            (setf key (%pk key))
             (let ((tr (%get-trap handler "getOwnPropertyDescriptor")))
               (if (null tr)
                   (js-get-own-property target key)
@@ -153,7 +165,7 @@
                        (when td
                          (when (not (prop-configurable td))
                            (%proxy-throw "proxy getOwnPropertyDescriptor: cannot report non-configurable property as non-existent"))
-                         (unless (js-object-extensible target)
+                         (unless (js-extensible-p target)
                            (%proxy-throw "proxy getOwnPropertyDescriptor: cannot report existing property of non-extensible target as non-existent")))
                        nil)
                       ((js-object-p res)
@@ -167,6 +179,7 @@
           (lambda (o key desc)
             (declare (ignore o))
             (%proxy-guard revoked-cell)
+            (setf key (%pk key))
             (let ((tr (%get-trap handler "defineProperty")))
               (if (null tr)
                   (js-define-own-property target key desc)
@@ -176,20 +189,26 @@
                       (%proxy-check-define target key desc))
                     ok)))))
     ;; ---- getPrototypeOf / setPrototypeOf / isExtensible / preventExtensions ----
-    ;; (core does not dispatch these through INTERNAL yet; the keys are present so
-    ;;  a future core hook activates them — see report proposals.)
+    ;; Core now dispatches these via js-get-proto/js-set-proto/js-extensible-p/
+    ;; js-prevent-extensions (Reflect/Object/instanceof route through them), so these
+    ;; traps fire. The default-forwarding branches call the SAME dispatchers on the
+    ;; target so a nested-proxy target forwards correctly. NOTE: Object.setPrototypeOf
+    ;; is currently overridden in object-extras.lisp to touch struct slots directly
+    ;; and does NOT go through js-set-proto — so the setPrototypeOf trap only fires
+    ;; via Reflect.setPrototypeOf / __proto__ assignment until that override is fixed
+    ;; (see report proposals).
     (setf (getf internal :get-proto)
           (lambda (o)
             (declare (ignore o))
             (%proxy-guard revoked-cell)
             (let ((tr (%get-trap handler "getPrototypeOf")))
               (if (null tr)
-                  (js-object-proto target)
+                  (js-get-proto target)
                   (let ((res (js-call tr handler (list target))))
                     (unless (or (js-object-p res) (eq res *null*))
                       (%proxy-throw "proxy getPrototypeOf: trap must return object or null"))
-                    (unless (js-object-extensible target)
-                      (unless (same-value res (or (js-object-proto target) *null*))
+                    (unless (js-extensible-p target)
+                      (unless (same-value res (or (js-get-proto target) *null*))
                         (%proxy-throw "proxy getPrototypeOf: non-extensible target prototype mismatch")))
                     res)))))
     (setf (getf internal :set-proto)
@@ -198,11 +217,11 @@
             (%proxy-guard revoked-cell)
             (let ((tr (%get-trap handler "setPrototypeOf")))
               (if (null tr)
-                  (progn (setf (js-object-proto target) v) t)
+                  (js-set-proto target v)
                   (let ((ok (js-truthy (js-call tr handler (list target v)))))
                     (when ok
-                      (unless (js-object-extensible target)
-                        (unless (same-value v (or (js-object-proto target) *null*))
+                      (unless (js-extensible-p target)
+                        (unless (same-value v (or (js-get-proto target) *null*))
                           (%proxy-throw "proxy setPrototypeOf: non-extensible target prototype mismatch"))))
                     ok)))))
     (setf (getf internal :is-extensible)
@@ -211,9 +230,9 @@
             (%proxy-guard revoked-cell)
             (let ((tr (%get-trap handler "isExtensible")))
               (if (null tr)
-                  (js-object-extensible target)
+                  (js-extensible-p target)
                   (let ((res (js-truthy (js-call tr handler (list target)))))
-                    (unless (eq res (and (js-object-extensible target) t))
+                    (unless (eq res (js-extensible-p target))
                       (%proxy-throw "proxy isExtensible: result must match target extensibility"))
                     res)))))
     (setf (getf internal :prevent-extensions)
@@ -222,9 +241,9 @@
             (%proxy-guard revoked-cell)
             (let ((tr (%get-trap handler "preventExtensions")))
               (if (null tr)
-                  (progn (setf (js-object-extensible target) nil) t)
+                  (js-prevent-extensions target)
                   (let ((ok (js-truthy (js-call tr handler (list target)))))
-                    (when (and ok (js-object-extensible target))
+                    (when (and ok (js-extensible-p target))
                       (%proxy-throw "proxy preventExtensions: cannot report extensible target as non-extensible"))
                     ok)))))
     internal))
@@ -243,7 +262,7 @@
   ;; We must NOT delegate the whole set to a parent (its ordinary-set would write
   ;; to the proxy receiver via %create-data-on-receiver, bypassing the traps);
   ;; instead find the effective descriptor, then apply on the proxy receiver.
-  (let ((own (loop for cur = target then (js-object-proto cur)
+  (let ((own (loop for cur = target then (js-get-proto cur)
                    while (js-object-p cur)
                    for d = (js-get-own-property cur key)
                    when d return d)))
@@ -294,7 +313,7 @@
       (when (gethash k seen) (%proxy-throw "proxy ownKeys: duplicate keys are not allowed"))
       (setf (gethash k seen) t)))
   (let* ((target-keys (js-own-keys target))
-         (extensible (js-object-extensible target))
+         (extensible (js-extensible-p target))
          (nonconfig '())
          (present (make-hash-table :test 'equal)))
     (dolist (k keys) (setf (gethash k present) t))
@@ -338,7 +357,7 @@
 (defun %proxy-check-goopd (target key prop td)
   "[[GetOwnProperty]] invariants for a returned descriptor PROP (target desc TD)."
   (declare (ignore key))
-  (let ((extensible (js-object-extensible target)))
+  (let ((extensible (js-extensible-p target)))
     (unless (prop-configurable prop)
       ;; a non-configurable descriptor may only be reported for a matching target
       ;; non-configurable property.
@@ -359,7 +378,7 @@
 (defun %proxy-check-define (target key desc)
   "[[DefineOwnProperty]] invariants after the trap reports success."
   (let ((td (js-get-own-property target key))
-        (extensible (js-object-extensible target))
+        (extensible (js-extensible-p target))
         (setting-nonconfig (and (present-p desc :configurable)
                                 (not (getf desc :configurable)))))
     (cond

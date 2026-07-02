@@ -94,9 +94,39 @@
   (and (js-object-p o) (getf (js-object-internal o) :typed-array)))
 (defun ta-type-of (o) (getf (js-object-internal o) :ta-type))
 (defun ta-buffer (o) (getf (js-object-internal o) :ta-buffer))
-(defun ta-byte-offset (o) (getf (js-object-internal o) :ta-offset))
-(defun ta-elt-length (o) (getf (js-object-internal o) :ta-length))
+(defun ta-track-p (o)
+  "A length-tracking view: no explicit length over a resizable buffer."
+  (getf (js-object-internal o) :ta-track))
+(defun ta-raw-offset (o) (getf (js-object-internal o) :ta-offset))
+(defun ta-raw-length (o) (getf (js-object-internal o) :ta-length))
 (defun ta-detached-p (o) (ab-detached-p (ta-buffer o)))
+
+(defun ta-out-of-bounds-p (o)
+  "IsTypedArrayOutOfBounds: the view no longer fits in the current buffer.
+   Detached counts as out of bounds."
+  (let ((buf (ta-buffer o)))
+    (or (ab-detached-p buf)
+        (let ((buflen (length (ab-bytes buf)))
+              (offset (ta-raw-offset o)))
+          (cond
+            ((ta-track-p o) (> offset buflen))    ; auto-length: only OOB if offset past end
+            (t (> (+ offset (* (ta-raw-length o) (ta-type-size (ta-type-of o))))
+                  buflen)))))))
+
+(defun ta-elt-length (o)
+  "Current element length of O against the CURRENT buffer size.
+   0 if out of bounds; auto-length views recompute; fixed views keep their length."
+  (cond
+    ((ta-out-of-bounds-p o) 0)
+    ((ta-track-p o)
+     (let ((buf (ta-buffer o)))
+       (floor (- (length (ab-bytes buf)) (ta-raw-offset o))
+              (ta-type-size (ta-type-of o)))))
+    (t (ta-raw-length o))))
+
+(defun ta-byte-offset (o)
+  "Current byteOffset: 0 if out of bounds, else the stored offset."
+  (if (ta-out-of-bounds-p o) 0 (ta-raw-offset o)))
 
 (defun ta-bytes (o) (ab-bytes (ta-buffer o)))
 
@@ -162,7 +192,7 @@
 
 (defun ta-valid-index-p (o n)
   "IsValidIntegerIndex: N (a double) is an in-bounds integer index of O."
-  (and (floatp n) (not (js-nan-p n)) (not (ta-detached-p o))
+  (and (floatp n) (not (js-nan-p n)) (not (ta-out-of-bounds-p o))
        (not (js-negative-zero-p n))
        (= n (ftruncate n))
        (<= 0 n) (< n (ta-elt-length o))))
@@ -289,13 +319,14 @@
 (defvar *typedarray-proto* nil)
 (defvar *ta-proto-by-name* nil)  ; hash name -> concrete prototype
 
-(defun make-typed-array (ty buffer offset length proto)
+(defun make-typed-array (ty buffer offset length proto &optional track)
   (let ((o (make-object :proto proto :class (ta-type-name ty))))
     (setf (getf (js-object-internal o) :typed-array) t
           (getf (js-object-internal o) :ta-type) ty
           (getf (js-object-internal o) :ta-buffer) buffer
           (getf (js-object-internal o) :ta-offset) offset
-          (getf (js-object-internal o) :ta-length) length)
+          (getf (js-object-internal o) :ta-length) length
+          (getf (js-object-internal o) :ta-track) track)
     (ta-install-traps o)
     o))
 
@@ -316,12 +347,18 @@
       (js-throw (make-native-error "TypeError" "buffer is detached")))
     (let ((buflen (length (ab-bytes buffer))))
       (if (js-undefined-p length-arg)
-          (progn
-            (unless (zerop (mod buflen size))
-              (js-throw (make-native-error "RangeError" "buffer length not a multiple of element size")))
-            (when (> offset buflen)
-              (js-throw (make-native-error "RangeError" "byteOffset out of range")))
-            (make-typed-array ty buffer offset (truncate (- buflen offset) size) proto))
+          (if (ab-resizable-p buffer)
+              ;; length-tracking view over a resizable buffer: length auto-updates.
+              (progn
+                (when (> offset buflen)
+                  (js-throw (make-native-error "RangeError" "byteOffset out of range")))
+                (make-typed-array ty buffer offset (truncate (- buflen offset) size) proto t))
+              (progn
+                (unless (zerop (mod buflen size))
+                  (js-throw (make-native-error "RangeError" "buffer length not a multiple of element size")))
+                (when (> offset buflen)
+                  (js-throw (make-native-error "RangeError" "byteOffset out of range")))
+                (make-typed-array ty buffer offset (truncate (- buflen offset) size) proto)))
           (let* ((newlen (to-index length-arg))
                  (bytes-needed (* newlen size)))
             (when (> (+ offset bytes-needed) buflen)
@@ -423,13 +460,13 @@
                        ;; and per test262 runs BEFORE GetPrototypeFromConstructor reads
                        ;; NewTarget.prototype, so coerce the length first.
                        (let ((len (if (js-undefined-p a0) 0 (to-index a0))))
-                         (ta-from-length ty len (proto-from-newtarget nt proto))))
+                         (ta-from-length ty len (ab-proto-from-newtarget nt proto))))
                       ((array-buffer-p a0)
                        (ta-from-buffer ty a0 (arg 1 args) (arg 2 args)
-                                       (proto-from-newtarget nt proto)))
+                                       (ab-proto-from-newtarget nt proto)))
                       ((typed-array-p a0)
-                       (ta-from-typedarray ty a0 (proto-from-newtarget nt proto)))
-                      (t (ta-from-iterable ty a0 (proto-from-newtarget nt proto))))))))
+                       (ta-from-typedarray ty a0 (ab-proto-from-newtarget nt proto)))
+                      (t (ta-from-iterable ty a0 (ab-proto-from-newtarget nt proto))))))))
         (def-value ctor "prototype" proto :writable nil :configurable nil)
         (def-value proto "constructor" ctor)
         (def-value ctor "BYTES_PER_ELEMENT" (float size 1d0) :writable nil :configurable nil)
@@ -451,16 +488,17 @@
      ,@body))
 
 (defmacro with-ta-v ((var this) &body body)
-  "Like WITH-TA but also runs ValidateTypedArray (throws on detached buffer)."
+  "Like WITH-TA but also runs ValidateTypedArray (throws when detached or the
+   view is out of bounds w.r.t. the current resizable-buffer size)."
   `(let ((,var ,this))
      (unless (typed-array-p ,var)
        (js-throw (make-native-error "TypeError" "not a TypedArray")))
-     (when (ta-detached-p ,var)
-       (js-throw (make-native-error "TypeError" "TypedArray is backed by a detached ArrayBuffer")))
+     (when (ta-out-of-bounds-p ,var)
+       (js-throw (make-native-error "TypeError" "TypedArray is out of bounds or backed by a detached ArrayBuffer")))
      ,@body))
 
 (defun ta-length-checked (o)
-  (if (ta-detached-p o) 0 (ta-elt-length o)))
+  (ta-elt-length o))                    ; ta-elt-length already yields 0 when OOB/detached
 
 (defun ta-species-proto (o name)
   "Prototype for a new same-type array created by slice/subarray/map/filter."
@@ -475,11 +513,11 @@
   (def-getter realm tp "byteLength"
     (lambda (this args) (declare (ignore args))
       (with-ta (o this)
-        (if (ta-detached-p o) 0d0
+        (if (ta-out-of-bounds-p o) 0d0
             (float (* (ta-elt-length o) (ta-type-size (ta-type-of o))) 1d0)))))
   (def-getter realm tp "byteOffset"
     (lambda (this args) (declare (ignore args))
-      (with-ta (o this) (if (ta-detached-p o) 0d0 (float (ta-byte-offset o) 1d0)))))
+      (with-ta (o this) (float (ta-byte-offset o) 1d0))))
   (def-getter realm tp "buffer"
     (lambda (this args) (declare (ignore args))
       (with-ta (o this) (ta-buffer o))))
@@ -499,7 +537,12 @@
                (v (ta-coerce-element o (arg 0 args)))
                (start (clamp-idx (arg 1 args) l 0))
                (end (if (js-undefined-p (arg 2 args)) l (clamp-idx (arg 2 args) l l))))
-          (when (ta-detached-p o) (js-throw (make-native-error "TypeError" "detached")))
+          ;; Coercions may have resized the buffer: re-validate, then clamp the
+          ;; range to the CURRENT length (a length-tracking view may have shrunk).
+          (when (ta-out-of-bounds-p o)
+            (js-throw (make-native-error "TypeError" "TypedArray is out of bounds")))
+          (let ((cur (len o)))
+            (setf start (min start cur) end (min end cur)))
           (loop for i from start below end do (ta-write o i v))
           o)))
     ;; copyWithin(target, start, end)
@@ -511,9 +554,13 @@
                (end (if (js-undefined-p (arg 2 args)) l (clamp-idx (arg 2 args) l l)))
                (count (min (- end from) (- l to))))
           (when (> count 0)
-            ;; The index coercions above may have detached the buffer.
-            (when (ta-detached-p o)
-              (js-throw (make-native-error "TypeError" "TypedArray is backed by a detached ArrayBuffer")))
+            ;; The index coercions above may have resized/detached the buffer.
+            (when (ta-out-of-bounds-p o)
+              (js-throw (make-native-error "TypeError" "TypedArray is out of bounds")))
+            ;; Re-clamp against the CURRENT length (a length-tracking view may
+            ;; have shrunk); drop any indices now past the end.
+            (let ((cur (len o)))
+              (setf count (max 0 (min count (- cur to) (- cur from)))))
             (let ((tmp (make-array count)))
               (dotimes (i count) (setf (aref tmp i) (ta-read o (+ from i))))
               (dotimes (i count) (ta-write o (+ to i) (aref tmp i)))))
