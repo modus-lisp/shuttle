@@ -238,6 +238,14 @@
             (put o "length" (float newlen 1d0) :enumerable nil))
         *true*))))
 
+(defun array-index-inherited-blocker-p (o k)
+  "T if K resolves on O's prototype chain to an accessor or a non-writable data
+   property — cases where OrdinarySet must NOT just create an own data prop."
+  (loop for p = (js-object-proto o) then (js-object-proto p)
+        while (js-object-p p)
+        for d = (gethash k (js-object-props p))
+        when d do (return (or (prop-accessor d) (not (prop-writable d))))))
+
 (defun ordinary-set (o key v &optional receiver)
   ;; OrdinarySet with the receiver walk: an own data prop on RECEIVER is written;
   ;; an inherited accessor's setter is called with RECEIVER as this.
@@ -259,7 +267,12 @@
         (cond ((string= k "length") (return-from ordinary-set (array-set-length o v)))
               ((array-index-string-p k)
                (let ((own (gethash k (js-object-props o))))
-                 (when (or (null own) (and (not (prop-accessor own)) (prop-writable own)))
+                 ;; Fast path only when the write lands as an own data prop: own
+                 ;; writable-data, or absent-with-no-inherited-blocker. An own
+                 ;; accessor/non-writable, or an INHERITED accessor/non-writable,
+                 ;; falls through to the ordinary proto-walk (setter runs / reject).
+                 (when (or (and own (not (prop-accessor own)) (prop-writable own))
+                           (and (null own) (not (array-index-inherited-blocker-p o k))))
                    (let* ((idx (parse-integer k)) (len (array-length o))
                           (ld (gethash "length" (js-object-props o))))
                      (when (and ld (not (prop-writable ld)) (>= idx len))

@@ -213,21 +213,21 @@
                (cond
                  ((and (char= c #\0) (member (peek 1) '(#\x #\X)))
                   (setf radix 16) (incf i 2)
-                  (loop while (and (< i n) (digit-char-p (char src i) 16)) do (incf i)))
+                  (loop while (and (< i n) (or (digit-char-p (char src i) 16) (char= (char src i) #\_))) do (incf i)))
                  ((and (char= c #\0) (member (peek 1) '(#\o #\O)))
                   (setf radix 8) (incf i 2)
-                  (loop while (and (< i n) (digit-char-p (char src i) 8)) do (incf i)))
+                  (loop while (and (< i n) (or (digit-char-p (char src i) 8) (char= (char src i) #\_))) do (incf i)))
                  ((and (char= c #\0) (member (peek 1) '(#\b #\B)))
                   (setf radix 2) (incf i 2)
-                  (loop while (and (< i n) (digit-char-p (char src i) 2)) do (incf i)))
+                  (loop while (and (< i n) (or (digit-char-p (char src i) 2) (char= (char src i) #\_))) do (incf i)))
                  (t
-                  (loop while (and (< i n) (digit-char-p (char src i))) do (incf i))
+                  (loop while (and (< i n) (or (digit-char-p (char src i)) (char= (char src i) #\_))) do (incf i))
                   (when (and (< i n) (char= (char src i) #\.))
                     (setf has-dot t) (incf i)
-                    (loop while (and (< i n) (digit-char-p (char src i))) do (incf i)))
+                    (loop while (and (< i n) (or (digit-char-p (char src i)) (char= (char src i) #\_))) do (incf i)))
                   (when (and (< i n) (member (char src i) '(#\e #\E)))
                     (setf has-exp t) (incf i) (when (member (peek) '(#\+ #\-)) (incf i))
-                    (loop while (and (< i n) (digit-char-p (char src i))) do (incf i)))))
+                    (loop while (and (< i n) (or (digit-char-p (char src i)) (char= (char src i) #\_))) do (incf i)))))
                ;; A radix prefix with no digits (0x / 0o / 0b) is malformed.
                (when (and radix (= i (+ start 2)))
                  (js-throw (make-native-error "SyntaxError" "Missing digits after radix prefix")))
@@ -235,6 +235,16 @@
                ;; (no `.`/exponent, no legacy-octal like 0123n) — else SyntaxError.
                (let ((bigint (and (< i n) (char= (char src i) #\n)))
                      (text (subseq src start i)))
+                 ;; numeric separators: each `_` must sit between two radix digits
+                 (when (find #\_ text)
+                   (let ((rdx (or radix 10)))
+                     (dotimes (j (length text))
+                       (when (char= (char text j) #\_)
+                         (unless (and (> j 0) (< (1+ j) (length text))
+                                      (digit-char-p (char text (1- j)) rdx)
+                                      (digit-char-p (char text (1+ j)) rdx))
+                           (js-throw (make-native-error "SyntaxError" "Invalid numeric separator")))))
+                     (setf text (remove #\_ text))))
                  (if bigint
                      (progn
                        (incf i)

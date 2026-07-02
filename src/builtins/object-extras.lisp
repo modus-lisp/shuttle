@@ -11,8 +11,12 @@
   (error condition))
 
 (defun object-extras-set-prototype-of (o proto)
-  "OrdinarySetPrototypeOf(O, V): returns T on success, NIL on rejection.
-   Handles same-value short-circuit, non-extensibility, and cycle detection."
+  "SetPrototypeOf(O, V): returns T on success, NIL on rejection. For a proxy/host
+   object (has a :set-proto internal trap) route through js-set-proto so the trap
+   fires; otherwise OrdinarySetPrototypeOf (same-value short-circuit, non-
+   extensibility, cycle detection)."
+  (when (and (js-object-internal o) (getf (js-object-internal o) :set-proto))
+    (return-from object-extras-set-prototype-of (js-truthy* (js-set-proto o proto))))
   (let ((current (js-object-proto o)))
     ;; SameValue(V, current) -> success (no change).
     (when (same-value proto (if (js-object-p current) current *null*))

@@ -49,7 +49,11 @@
                       (unless (fm-flag fm "raw")
                         (run-code *default-harness* realm)
                         (dolist (inc (fm-list fm "includes")) (run-code (include-code inc) realm)))
-                      (run-code (compile-toplevel src) realm)
+                      ;; onlyStrict tests must run in strict mode — prepend the directive
+                      (let ((tsrc (if (fm-flag fm "onlyStrict")
+                                      (concatenate 'string "\"use strict\";" (string #\Newline) src)
+                                      src)))
+                        (run-code (compile-toplevel tsrc) realm))
                       :ok))
                 (sb-ext:timeout () :timeout)
                 (shuttle-error () :threw)

@@ -245,7 +245,7 @@
                                          (:async-generator (async-generator-prototype))
                                          (t (%obj-proto))))))
         (unless (member kind '(:generator :async-generator)) (put proto "constructor" fn :enumerable nil))
-        (put fn "prototype" proto :enumerable nil
+        (put fn "prototype" proto :enumerable nil :configurable nil
              :writable (not (member kind '(:generator :async-generator))))))
     fn))
 
