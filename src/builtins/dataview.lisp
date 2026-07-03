@@ -3,6 +3,7 @@
 ;;;; endianness flag. Supports resizable ArrayBuffers: a length-tracking DataView (no
 ;;;; explicit length) recomputes its byteLength as the buffer resizes; a fixed-length
 ;;;; DataView that no longer fits becomes out-of-bounds (getters/methods throw TypeError).
+;;;; See array-iteration.lisp for the convention + helpers.
 (in-package #:shuttle)
 
 (defun data-view-p (o)

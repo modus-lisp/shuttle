@@ -1,6 +1,7 @@
 ;;;; builtins/typedarray.lisp — %TypedArray% abstract superclass + the concrete
 ;;;; integer/float constructors, plus integer-indexed exotic get/set and the
 ;;;; prototype method family. Backing store is the ArrayBuffer's byte vector
+;;;; (little-endian element layout).
 ;;;; See array-iteration.lisp for the convention + available helpers.
 (in-package #:shuttle)
 

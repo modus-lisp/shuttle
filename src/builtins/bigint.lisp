@@ -1,7 +1,7 @@
 ;;;; builtins/bigint.lisp — the BigInt global (constructor + BigInt.prototype +
 ;;;; asIntN/asUintN). The bigint VALUE type is a CL integer (Numbers are always
 ;;;; double-float, so an integer is an unambiguous bigint); typeof/operators/
-;;;; coercions live in the core files. Owned by the BigInt agent.
+;;;; coercions live in the core files.
 (in-package #:shuttle)
 
 (defun number-to-bigint (n)

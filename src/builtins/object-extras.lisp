@@ -1,3 +1,4 @@
+;;;; builtins/object-extras.lisp — Object statics/proto remainder (fromEntries, hasOwn, getOwnPropertyDescriptors, __proto__ accessor, groupBy).
 ;;;; See array-iteration.lisp for the convention + available helpers.
 (in-package #:shuttle)
 

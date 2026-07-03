@@ -1,4 +1,5 @@
 ;;;; builtins/error-extra.lisp — AggregateError + Error extras (cause option,
+;;;; Error.isError, Error.prototype.stack accessor). See
 ;;;; array-iteration.lisp for the group convention.
 ;;;;
 ;;;; The Error hierarchy (Error + the 6 NativeErrors) is built by the kernel

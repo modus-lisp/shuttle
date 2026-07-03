@@ -1,3 +1,4 @@
+;;;; builtins/array-immutable.lisp — Array.prototype (immutable group).
 ;;;; See array-iteration.lisp for the convention + available helpers.
 ;;;; Fill the (install-array-immutable realm) body; do not touch other files.
 (in-package #:shuttle)

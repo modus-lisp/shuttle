@@ -1,4 +1,5 @@
 ;;;; builtins/map-set.lisp — Map + Set (constructors + prototypes).
+;;;; One method group per file. See array-iteration.lisp for the convention + helpers.
 ;;;;
 ;;;; Storage model: each instance carries a CL structure in its `internal` plist
 ;;;; under :map-data / :set-data. Entries are held in an append-only adjustable

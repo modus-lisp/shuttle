@@ -1,3 +1,4 @@
+;;;; builtins/array-search.lisp — Array.prototype (search group).
 ;;;; See array-iteration.lisp for the convention + available helpers.
 ;;;; Fill the (install-array-search realm) body; do not touch other files.
 (in-package #:shuttle)

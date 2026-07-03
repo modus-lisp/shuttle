@@ -1,5 +1,6 @@
 ;;;; builtins/atomics.lisp — the Atomics namespace (single-threaded semantics:
 ;;;; plain read-modify-write on the backing bytes; wait/notify per the
+;;;; no-other-agents rules).
 ;;;;
 ;;;; Ops work on the raw unsigned bit pattern of the element (two's complement
 ;;;; wrap via ldb), reusing the ta-type encode/decode codecs from typedarray.lisp.

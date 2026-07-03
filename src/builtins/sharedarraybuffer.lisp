@@ -1,5 +1,6 @@
 ;;;; builtins/sharedarraybuffer.lisp — SharedArrayBuffer (single-threaded impl:
 ;;;; same byte-vector representation as ArrayBuffer; cannot be detached;
+;;;; growable/grow analogous to resizable/resize).
 ;;;; Brand: internal :shared-array-buffer (disjoint from :array-buffer — the
 ;;;; ArrayBuffer.prototype getters reject SABs and vice versa). Predicates
 ;;;; shared-array-buffer-p / any-array-buffer-p / buffer-resizable-p live in

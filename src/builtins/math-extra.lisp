@@ -1,3 +1,4 @@
+;;;; builtins/math-extra.lisp — Math methods beyond the kernel set.
 ;;;; Kernel install-math already has abs/sqrt/sin/cos/tan/asin/acos/atan/exp/
 ;;;; sign/trunc/cbrt/floor/ceil/round/log/pow/atan2/hypot/max/min/random and the
 ;;;; constants. This file adds the rest. Get the Math object via

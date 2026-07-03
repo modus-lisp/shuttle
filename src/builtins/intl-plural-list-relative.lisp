@@ -4,7 +4,7 @@
 ;;;; intl-register / intl-proto-from-newtarget / +numbering-system-digits+).
 ;;;;
 ;;;; DUPLICATION NOTE: SetNumberFormatDigitOptions is shared machinery with
-;;;; Intl.NumberFormat (intl-numberformat.lisp). That agent's file is a stub at
+;;;; Intl.NumberFormat (intl-numberformat.lisp). That file may load later, was a stub at
 ;;;; build time, so a locally-minimal digit-options reader + a small number
 ;;;; formatter (grouping + fraction parts) live HERE, prefixed `plr-`. When
 ;;;; NumberFormat lands its exports these should be de-duplicated.

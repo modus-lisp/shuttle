@@ -1,5 +1,6 @@
 ;;;; builtins/annexb-string.lisp — Annex B String.prototype HTML methods
 ;;;; (anchor/big/blink/bold/fixed/fontcolor/fontsize/italics/link/small/strike/
+;;;; sub/sup). See array-iteration.lisp for the convention.
 (in-package #:shuttle)
 
 (defun %create-html (s tag attribute value)

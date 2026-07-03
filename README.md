@@ -9,7 +9,37 @@ shuttle is the JavaScript engine for [`weft`](https://github.com/modus-lisp) (a
 pure-CL web engine), built the way `scribe`'s `open-font`/`shape-run` seam was —
 **consumable up front**. The pipeline is `source → bytecode → stack VM`; the
 oracle is **test262**, the official ECMAScript conformance suite (the WPT/
-html5lib pattern). Running it is what finally lets weft run Acid3.
+html5lib pattern).
+
+## Conformance
+
+**41,404 / 47,058 runnable test262 tests (88.0%)** — measured with
+`inspect/run262.sh` against a full checkout (modules and async-flagged tests are
+skipped; 6,346 total). Per area:
+
+| area | pass rate |
+|---|---|
+| `built-ins` | 94.8% |
+| `language`  | 90.3% |
+| `annexB`    | 89.4% |
+| `harness`   | 98.0% |
+
+That includes the full **Temporal** proposal (~96% of its 4,603 tests),
+**Intl/ECMA-402** with an `en` locale (NumberFormat, DateTimeFormat, Collator,
+Segmenter, PluralRules, ListFormat, RelativeTimeFormat, DisplayNames,
+DurationFormat, Locale), **BigInt** (a CL integer *is* a BigInt — exact bignum
+arithmetic for free), **UTF-16 code-unit strings** (astral scalars are surrogate
+pairs), a clean-room **RegExp** engine with `\p{…}` Unicode property escapes
+(via SBCL's `sb-unicode` tables), Proxy/Reflect, TypedArrays +
+resizable/SharedArrayBuffer + Atomics, generators and `async`/`await` (VM-frame
+suspension), Promises + a microtask queue, classes with private members, and
+the rest of the modern language. The longitudinal record is
+`inspect/test262-history.tsv` — every row a measured, committed state, from
+12.4% to 88.0%.
+
+Known gaps: `intl402/Temporal` (needs real calendars + IANA time zones),
+multi-threaded Atomics (`$262.agent`), non-`en` locale data, ES modules, tail
+calls.
 
 ## The seam (the reason it's built this way)
 
@@ -36,46 +66,33 @@ Consumer API: `make-realm` (one per document) · `eval-script` · `define-global
 (call a JS function from a host event/timer). Event-loop split: **shuttle owns
 the microtask queue; weft owns macrotasks** (timers, DOM events).
 
-## What works (the v0 slice — `inspect/self-test.lisp`, 26/26)
-
-Numbers (IEEE-754 doubles, full coercion + the `+` string/number duality),
-strings, `var`/assignment/compound assignment, `if`/`while`/ternary/`&&`/`||`
-(short-circuit), `typeof`, `===`/`==`, **functions + closures + recursion**,
-arrow functions, **methods with `this`**, `new` + prototypes, object & array
-literals, member/computed access, a few intrinsics (`Math`, `console`,
-`Array.prototype.push`/`join`), and the **host-object seam** end to end.
-
 ## Architecture
 
 `src/`: `value` (the value model + internal-method protocol — the seam) ·
 `lex` · `parse` (Pratt) · `compile` (AST → bytecode) · `vm` (stack VM +
-environments + closures) · `realm` (the consumer API + minimal intrinsics).
+environments + closures + generator/async suspension) · `realm` (the consumer
+API + the intrinsics kernel) · `regex` (backtracking RegExp engine) ·
+`unicode-props` (Unicode property tables for `\p{…}`) · `builtins/` (the
+standard library, one file per built-in group, each self-registering via
+`register-builtin-installer`).
 
 **Bytecode, not tree-walking** — deliberately. Generators and `async`/`await`
 need to *suspend mid-evaluation*; an explicit VM stack makes save/resume natural
 where a tree-walker would need a CPS rewrite. **GC is the host's** — JS objects
 are CL objects; only `WeakMap`/`WeakRef` need weak references.
 
-## The carve (how this gets built out)
+## Running the tests
 
-- **Wide library surface** — the built-in library (`Array.prototype.*`,
-  `String.prototype.*`, `Math.*`, `Date`, `JSON`, `Map`/`Set`…), each method a
-  test262-pinned unit. This is most of the code and embarrassingly parallel.
-- **Coupled strong-tier core** — the lexer, parser, bytecode compiler + VM, and
-  the runtime semantics (descriptors, prototype chain, completion records,
-  exceptions, hoisting/TDZ, strict mode).
-- **Standalone sub-repos** — a **RegExp** engine and **`dtoa`** (shortest
-  round-trip number↔string), each gnarly, self-contained, heavily test262'd.
-
-## Ladder ahead
-
-`for`/`switch`/`try`-`catch`/`throw` → the built-in library →
-RegExp + dtoa → generators/`async`/Promises + the job queue → modules → **weft
-DOM bindings → Acid3**. Known v0 gaps: UTF-16 code-unit strings, shortest-
-round-trip number formatting, full ASI, `let`/`const` block scoping.
+```sh
+sbcl --script inspect/self-test.lisp            # quick smoke (26 cases + the seam)
+git clone --depth 1 https://github.com/tc39/test262 test262-full
+inspect/run262.sh                               # full suite, batched + crash-isolated
+SHUTTLE_TEST262=$PWD/test262-full SHUTTLE_SUB=built-ins/Temporal \
+  sbcl --control-stack-size 256 --dynamic-space-size 4096 \
+  --script inspect/test262-sub.lisp             # one subtree, prints each FAIL
+```
 
 ## Status
 
-Skeleton — the seam, the VM, and a working slice stand; the language and library
-grow from here against test262. Published to `modus-lisp/shuttle` when it's woven.
+Working engine at 88% test262. Next: weft DOM bindings → Acid3.
 MIT. Research / educational; not audited.

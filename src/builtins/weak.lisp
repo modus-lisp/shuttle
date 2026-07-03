@@ -1,3 +1,4 @@
+;;;; builtins/weak.lisp — WeakMap + WeakSet.
 ;;;; See array-iteration.lisp for the convention + available helpers.
 ;;;;
 ;;;; WeakMap/WeakSet are Map/Set minus size/iteration/forEach/clear, plus a

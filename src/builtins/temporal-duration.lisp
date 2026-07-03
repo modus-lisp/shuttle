@@ -147,7 +147,7 @@
     (:nanosecond 1)))
 
 ;;; ===========================================================================
-;;; PlainDate relativeTo — resolved dynamically (a concurrent agent builds it).
+;;; PlainDate relativeTo — resolved dynamically at call time.
 ;;; ===========================================================================
 (defun relative-to-plaindate-iso (realm v)
   "If V resolves to a Temporal.PlainDate (or PlainDateTime), return its iso-date;

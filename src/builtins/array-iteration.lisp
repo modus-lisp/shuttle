@@ -1,4 +1,5 @@
 ;;;; builtins/array-iteration.lisp — Array.prototype iteration/reduction methods.
+;;;; One method group per file. Kernel already installs push/pop/join/indexOf/slice/
 ;;;; forEach/map/toString/values/@@iterator (see realm.lisp install-array);
 ;;;; this file adds the rest of the callback-driven family.
 ;;;;

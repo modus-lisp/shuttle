@@ -1,6 +1,7 @@
 ;;;; builtins/disposable.lisp — DisposableStack + SuppressedError
 ;;;; (+ Symbol.dispose / Symbol.asyncDispose well-known symbols).
 ;;;; The explicit-resource-management object API. The `using` statement is a
+;;;; separate parser feature (out of scope here).
 (in-package #:shuttle)
 
 ;;; The two well-known symbols live in specials so methods below can reference

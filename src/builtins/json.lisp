@@ -1,3 +1,4 @@
+;;;; builtins/json.lisp — the JSON global (parse + stringify).
 ;;;; See array-iteration.lisp for the convention + available helpers.
 (in-package #:shuttle)
 

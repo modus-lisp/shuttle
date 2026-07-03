@@ -1,3 +1,4 @@
+;;;; builtins/date.lisp — Date (constructor, now, parse, UTC, get/set accessors, toISOString/toString/toJSON).
 ;;;; See array-iteration.lisp for the convention + available helpers.
 ;;;;
 ;;;; Timezone: we assume local == UTC (offset 0). getTimezoneOffset -> 0, and all

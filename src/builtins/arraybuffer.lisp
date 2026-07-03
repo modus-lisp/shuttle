@@ -1,5 +1,6 @@
 ;;;; builtins/arraybuffer.lisp — ArrayBuffer (byte store, slice, byteLength, isView).
 ;;;; Backing store: a CL (simple-array (unsigned-byte 8) (*)) in js-object-primitive.
+;;;; A detached buffer stores NIL (byte-length 0).
 ;;;; See array-iteration.lisp for the convention + available helpers.
 (in-package #:shuttle)
 

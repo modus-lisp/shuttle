@@ -1,3 +1,4 @@
+;;;; builtins/array-transform.lisp — Array.prototype (transform group).
 ;;;; See array-iteration.lisp for the convention + available helpers.
 ;;;; Fill the (install-array-transform realm) body; do not touch other files.
 (in-package #:shuttle)

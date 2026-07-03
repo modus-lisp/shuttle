@@ -1,3 +1,4 @@
+;;;; builtins/global-funcs.lisp — global URI + legacy funcs (encodeURI/decodeURI/encodeURIComponent/decodeURIComponent/escape/unescape).
 ;;;; See array-iteration.lisp for the convention + helpers.
 (in-package #:shuttle)
 

@@ -1,3 +1,4 @@
+;;;; builtins/proxy.lisp — Proxy + Reflect-backed traps (get/set/has/deleteProperty/ownKeys/getOwnPropertyDescriptor/defineProperty/getPrototypeOf/setPrototypeOf/isExtensible/preventExtensions/apply/construct) + Proxy.revocable.
 ;;;; See array-iteration.lisp for the convention + helpers.
 ;;;;
 ;;;; A Proxy is an ordinary js-object whose INTERNAL plist entries are closures

@@ -1,3 +1,4 @@
+;;;; builtins/array-mutators.lisp — Array.prototype (mutators group).
 ;;;; See array-iteration.lisp for the convention + available helpers.
 ;;;; Fill the (install-array-mutators realm) body; do not touch other files.
 (in-package #:shuttle)

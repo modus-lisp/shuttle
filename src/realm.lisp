@@ -1,6 +1,6 @@
 ;;;; realm.lisp — the consumer API (the seam weft builds DOM bindings on):
 ;;;; make-realm, eval-script, define-global, make-host-object, native-function,
-;;;; invoke. Plus a minimal set of intrinsics (the full built-in library is the
+;;;; invoke. Plus the intrinsics kernel (the full built-in library lives in
 ;;;; src/builtins/, one test262-pinned file per group).
 (in-package #:shuttle)
 
@@ -101,8 +101,8 @@
 ;;; Each src/builtins/*.lisp file owns one method group and ends with
 ;;;   (register-builtin-installer 'install-<group>)
 ;;; where install-<group> is (realm) -> installs its methods (pulling protos via
-;;; realm accessors). install-intrinsics runs them all AFTER the kernel. Workers
-;;; edit only their own file + add it to the .asd — install-intrinsics is never
+;;; realm accessors). install-intrinsics runs them all AFTER the kernel. Each file
+;;; edits only itself (plus one .asd line) — install-intrinsics is never
 ;;; touched, so files stay independent.
 (defvar *builtin-installers* '())
 (defun register-builtin-installer (sym) (pushnew sym *builtin-installers*))
