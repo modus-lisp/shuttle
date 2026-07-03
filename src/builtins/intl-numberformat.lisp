@@ -430,7 +430,7 @@
 ;;; ===========================================================================
 ;;; Rounding machinery (all on rationals)
 ;;; ===========================================================================
-(defun round-to-increment (x mode)
+(defun nf-round-to-increment (x mode)
   "Round rational X to the nearest integer per MODE (roundingMode string)."
   (multiple-value-bind (q r) (truncate x)
     (if (zerop r)
@@ -488,8 +488,8 @@
            (let* ((scale (expt 10 maxf))
                   (scaled (* m scale))
                   (rounded (if (= inc 1)
-                               (round-to-increment scaled mode)
-                               (* inc (round-to-increment (/ scaled inc) mode)))))
+                               (nf-round-to-increment scaled mode)
+                               (* inc (nf-round-to-increment (/ scaled inc) mode)))))
              (/ rounded scale)))
          (round-significant (m maxs)
            (if (zerop m)
@@ -499,7 +499,7 @@
                     (shift (- maxs 1 e))
                     (scale (expt 10 (abs shift)))
                     (scaled (if (>= shift 0) (* m scale) (/ m scale)))
-                    (rounded (round-to-increment scaled mode))
+                    (rounded (nf-round-to-increment scaled mode))
                     (val (if (>= shift 0) (/ rounded scale) (* rounded scale))))
                ;; rounding may bump digit count (e.g. 9.99 -> 10.0); recompute e
                (values val e)))))

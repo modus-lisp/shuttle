@@ -11,7 +11,7 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Helpers
 ;;; ---------------------------------------------------------------------------
-(defun proto-from-newtarget (new-target default-ctor intrinsic-proto)
+(defun dstack-proto-from-newtarget (new-target default-ctor intrinsic-proto)
   "GetPrototypeFromConstructor: read NEW-TARGET.prototype; if not an object,
    fall back to INTRINSIC-PROTO. DEFAULT-CTOR is the active function object used
    when NEW-TARGET is undefined (a direct [[Call]]-free construction)."
@@ -56,7 +56,7 @@
     (when (js-object-p error-ctor) (setf (js-object-proto ctor) error-ctor))
     (setf (js-object-construct ctor)
           (lambda (args new-target)
-            (let ((o (make-object :proto (proto-from-newtarget new-target ctor proto) :class "Error")))
+            (let ((o (make-object :proto (dstack-proto-from-newtarget new-target ctor proto) :class "Error")))
               (suppressed-error-init realm proto o t args))))
     (define-global realm "SuppressedError" ctor)
     ctor))
@@ -113,7 +113,7 @@
                               "Constructor DisposableStack requires 'new'"))) 0)))
     (setf (js-object-construct ctor)
           (lambda (args new-target) (declare (ignore args))
-            (make-disposable-stack realm (proto-from-newtarget new-target ctor proto))))
+            (make-disposable-stack realm (dstack-proto-from-newtarget new-target ctor proto))))
     (def-value ctor "prototype" proto :writable nil :configurable nil)
     (def-value proto "constructor" ctor)
 
@@ -203,7 +203,7 @@
                               "Constructor AsyncDisposableStack requires 'new'"))) 0)))
     (setf (js-object-construct ctor)
           (lambda (args new-target) (declare (ignore args))
-            (let ((o (make-object :proto (proto-from-newtarget new-target ctor proto) :class "Object")))
+            (let ((o (make-object :proto (dstack-proto-from-newtarget new-target ctor proto) :class "Object")))
               (setf (getf (js-object-internal o) :async-disposable-state) (cons :pending '()))
               o)))
     (def-value ctor "prototype" proto :writable nil :configurable nil)
