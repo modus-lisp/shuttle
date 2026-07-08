@@ -92,6 +92,18 @@ SHUTTLE_TEST262=$PWD/test262-full SHUTTLE_SUB=built-ins/Temporal \
   --script inspect/test262-sub.lisp             # one subtree, prints each FAIL
 ```
 
+## Security posture
+
+Untrusted JavaScript is a tool for hardware attacks (Rowhammer, Spectre, cache
+side channels) more than a source of engine bugs. shuttle is built to be a poor
+tool for them — **no JIT**, single-agent `SharedArrayBuffer` (no timing thread),
+no `WeakRef`/`FinalizationRegistry` oracle, checked bounds and no address
+disclosure — and to slot into host-level containment. See
+[`docs/actor-isolation.md`](docs/actor-isolation.md) for the contract with
+[`modus`](https://github.com/modus-lisp) (a Lisp OS with actor isolation +
+per-actor GC): one realm per actor, `postMessage` as copy-on-send message
+passing, and a per-realm capability profile.
+
 ## Status
 
 Working engine at 88% test262. Next: weft DOM bindings → Acid3.
