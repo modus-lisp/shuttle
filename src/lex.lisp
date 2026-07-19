@@ -143,6 +143,10 @@
                          ;; or function/class expression -> division.
                          (brace-close-is-block-p toks))
                         ((string= val "]") nil)   ; array value closer -> division
+                        ;; postfix ++/-- produce a value, so `/` after them is
+                        ;; division (`i[l++/2]`); a regex is never the operand of a
+                        ;; prefix ++/--, so this is unambiguous.
+                        ((or (string= val "++") (string= val "--")) nil)
                         (t t)))                  ; other punctuators expect an expression
           (t t)))))
 
