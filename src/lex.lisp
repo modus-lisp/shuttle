@@ -61,6 +61,27 @@
   ;; identifier tokens after which a `/` is DIVISION, not a regex (they produce a value)
   '("this" "true" "false" "null" "super"))
 
+(defun paren-closes-control-head-p (toks)
+  "TOKS' last token is `)`.  Scan back to the matching `(` and return T when that
+   parenthesized group is the head of an `if` / `while` / `for` / `with`
+   statement — after such a head a statement follows, so a `/` begins a REGEX
+   literal, not division (e.g. `if(a)/b/.exec(c)`).  A `)` closing a call or a
+   grouping expression produces a value, so `/` there is division."
+  (let ((depth 0) (i (1- (fill-pointer toks))))
+    (loop
+      (when (< i 0) (return nil))
+      (let ((tk (aref toks i)))
+        (when (eq (car tk) :punct)
+          (cond ((string= (cdr tk) ")") (incf depth))
+                ((string= (cdr tk) "(")
+                 (decf depth)
+                 (when (zerop depth)
+                   (let ((prev (and (> i 0) (aref toks (1- i)))))
+                     (return (and prev (eq (car prev) :ident)
+                                  (member (cdr prev) '("if" "while" "for" "with")
+                                          :test #'string=)))))))))
+      (decf i))))
+
 (defun regex-allowed-p (toks)
   "Given the tokens emitted so far, may a `/` begin a regex literal here?
    Regex is allowed where a value/expression is expected: at start-of-input, and
@@ -79,7 +100,12 @@
                                  :test #'string=) t)
                         ;; a plain identifier -> value -> division
                         (t nil)))
-          (:punct (cond ((member val '(")" "]" "}") :test #'string=) nil)   ; value-producing closers
+          (:punct (cond ((string= val ")")
+                         ;; `)` is a value closer (division) EXCEPT when it closes an
+                         ;; if/while/for/with head, where a statement — hence a regex —
+                         ;; follows.
+                         (paren-closes-control-head-p toks))
+                        ((member val '("]" "}") :test #'string=) nil)   ; value-producing closers
                         (t t)))                  ; other punctuators expect an expression
           (t t)))))
 
