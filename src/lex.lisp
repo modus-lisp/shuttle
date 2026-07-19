@@ -82,6 +82,38 @@
                                           :test #'string=)))))))))
       (decf i))))
 
+(defun brace-close-is-block-p (toks)
+  "TOKS' last token is `}`.  Scan back to the matching `{` and decide whether it
+   opened a BLOCK / function body (statement context — so a following `/` begins a
+   REGEX, e.g. a minified `function f(){...}/re/.test(x)`) rather than an OBJECT
+   literal or a function/class EXPRESSION brace (which produce a value — so `/` is
+   division, e.g. `({a:1}/x)`).  The kind is read off the token preceding the
+   matching `{`: after `)`/`=>` it is a function/control/arrow body; after
+   `;`/`{`/`}` or `do`/`else`/`try`/`finally` it is a statement block; after
+   value-context tokens (`(` `[` `,` `:` `=` operators, `return`, …) it is an
+   object literal."
+  (let ((depth 0) (i (1- (fill-pointer toks))))
+    (loop
+      (when (< i 0) (return nil))
+      (let ((tk (aref toks i)))
+        (when (eq (car tk) :punct)
+          (cond ((string= (cdr tk) "}") (incf depth))
+                ((string= (cdr tk) "{")
+                 (decf depth)
+                 (when (zerop depth)
+                   (when (zerop i) (return t))          ; `{` at start-of-input -> block
+                   (let* ((prev (aref toks (1- i))) (ty (car prev)) (v (cdr prev)))
+                     (return
+                       (cond
+                         ((eq ty :punct)
+                          (or (string= v ")")           ; function/if/while/for/catch/method body
+                              (string= v "=>")          ; arrow body
+                              (member v '(";" "{" "}") :test #'string=))) ; statement block
+                         ((eq ty :ident)
+                          (member v '("do" "else" "try" "finally") :test #'string=))
+                         (t nil)))))))))
+      (decf i))))
+
 (defun regex-allowed-p (toks)
   "Given the tokens emitted so far, may a `/` begin a regex literal here?
    Regex is allowed where a value/expression is expected: at start-of-input, and
@@ -105,7 +137,12 @@
                          ;; if/while/for/with head, where a statement — hence a regex —
                          ;; follows.
                          (paren-closes-control-head-p toks))
-                        ((member val '("]" "}") :test #'string=) nil)   ; value-producing closers
+                        ((string= val "}")
+                         ;; `}` closing a block / function-declaration body is a
+                         ;; statement boundary -> regex; closing an object literal
+                         ;; or function/class expression -> division.
+                         (brace-close-is-block-p toks))
+                        ((string= val "]") nil)   ; array value closer -> division
                         (t t)))                  ; other punctuators expect an expression
           (t t)))))
 
