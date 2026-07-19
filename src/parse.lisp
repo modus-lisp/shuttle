@@ -166,7 +166,11 @@
 (defun parse-try ()
   (adv) (let ((blk (parse-block)) (param nil) (catch nil) (fin nil))
           (when (kw? "catch") (adv)
-            (when (punct? "(") (adv) (setf param (cur-val)) (adv) (eat ")"))
+            ;; Catch binding is a BindingIdentifier OR a BindingPattern
+            ;; (ES2015): `catch([a,b])` / `catch({x})` destructure the thrown
+            ;; value.  PARSE-BINDING-TARGET yields a name string or an :apat/:opat
+            ;; pattern node, which the compiler's :try binds via BIND-TARGET.
+            (when (punct? "(") (adv) (setf param (parse-binding-target)) (eat ")"))
             (setf catch (parse-block)))
           (when (kw? "finally") (adv) (setf fin (parse-block)))
           (list :try blk param catch fin)))
