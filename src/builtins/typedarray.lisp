@@ -257,7 +257,7 @@
         (and (ta-valid-index-p o idx) t)
         ;; OrdinaryHasProperty: own prop or (robustly) walk the prototype chain.
         (let ((k (prop-key key)))
-          (and (or (nth-value 1 (gethash k (js-object-props o)))
+          (and (or (props-present-p o k)
                    (let ((p (js-object-proto o)))
                      (and (js-object-p p) (js-truthy* (js-has p k)))))
                t)))))
@@ -274,7 +274,7 @@
         (when (ta-valid-index-p o idx)
           (make-prop :value (ta-read o (truncate idx))
                      :writable t :enumerable t :configurable t))
-        (gethash (prop-key key) (js-object-props o)))))
+        (props-get o (prop-key key)))))
 
 (defun ta-internal-define-own (o key desc)
   (let ((idx (canonical-numeric-index key)))

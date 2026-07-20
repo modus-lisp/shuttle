@@ -46,7 +46,7 @@
   value get set (writable t) (enumerable t) (configurable t) (accessor nil))
 
 (defstruct (js-object (:constructor %make-object))
-  (props (make-hash-table :test 'equal))
+  (props nil)               ; own (string/symbol)-keyed descriptors as a key->PROP map. Small-object storage (see PROPS-GET & co.): NIL (empty) -> alist (few keys) -> EQUAL hash-table (once past +props-small-limit+). Enumeration order is NOT here; KEY-ORDER carries it, so representation switches are order-safe.
   (key-order '())           ; own keys in insertion order (reversed); ordinary-own-keys re-sorts. May carry tombstones (keys since forgotten); KEY-SET is the source of truth for membership and %own-keys-in-order filters through it.
   (key-set nil)             ; lazily-created EQUAL membership set mirroring the LIVE keys — keeps %key-touch / %key-forget O(1) instead of scanning/deleting key-order (which is O(n) → O(n^2) for big arrays: bulk index writes and .length truncation)
   (key-tombstones 0)        ; count of forgotten-but-still-in-key-order entries; trigger a compaction of KEY-ORDER once they dominate
@@ -108,6 +108,11 @@
                  (if setter (js-call setter receiver (list v))
                      (js-throw (make-native-error "TypeError" "Private member was defined without a setter")))))))
 
+;; Small-object threshold: at most this many own keys stay in the compact
+;; (alist props / scanned key-order) representation before promoting to a
+;; hash-table. Shared by PROPS storage and KEY-ORDER membership.
+(defconstant +props-small-limit+ 8)
+
 (declaim (inline %key-touch %key-forget %own-keys-in-order))
 (defun %key-set-of (o)
   "The membership hash for O's live own keys, built lazily from KEY-ORDER."
@@ -126,27 +131,40 @@
           (js-object-key-tombstones o) 0)))
 (defun %key-touch (o k)
   "Record K as an own key of O (idempotent, preserves first-insertion order).
-   Membership is tested against KEY-SET (an EQUAL hash mirroring the live keys) so
-   a large object/array stays O(1) per insert rather than O(n) scanning KEY-ORDER."
-  (let ((set (%key-set-of o)))
-    (unless (gethash k set)
-      ;; A re-added key may still linger as a tombstone in KEY-ORDER. Compact
-      ;; BEFORE marking K live (compaction keys off SET membership; if K were
-      ;; already in SET the stale tombstone couldn't be told apart and would
-      ;; survive, duplicating K and corrupting enumeration order).
-      (when (plusp (js-object-key-tombstones o)) (%key-compact o))
-      (setf (gethash k set) t)
-      (push k (js-object-key-order o)))))
-(defun %key-forget (o k)
-  "Remove K from the live key set in O(1); leave a tombstone in KEY-ORDER that
-   %own-keys-in-order filters out, compacting once tombstones dominate. This keeps
-   bulk deletion (e.g. Array length truncation) O(n) overall instead of O(n^2)."
+   Small objects carry NO KEY-SET and test membership with a short scan of
+   KEY-ORDER (which then holds exactly the live keys, no tombstones); once the
+   key count crosses +props-small-limit+ a KEY-SET (an EQUAL hash mirroring the
+   live keys) is built so a large object/array stays O(1) per insert."
   (let ((set (js-object-key-set o)))
-    (when (and set (gethash k set))
-      (remhash k set)
-      (when (> (incf (js-object-key-tombstones o))
-               (hash-table-count set))
-        (%key-compact o)))))
+    (if set
+        ;; hashed regime: O(1) membership + tombstone bookkeeping
+        (unless (gethash k set)
+          ;; A re-added key may still linger as a tombstone in KEY-ORDER. Compact
+          ;; BEFORE marking K live (compaction keys off SET membership; if K were
+          ;; already in SET the stale tombstone couldn't be told apart and would
+          ;; survive, duplicating K and corrupting enumeration order).
+          (when (plusp (js-object-key-tombstones o)) (%key-compact o))
+          (setf (gethash k set) t)
+          (push k (js-object-key-order o)))
+        ;; small regime: KEY-ORDER is exactly the live keys (no tombstones)
+        (unless (member k (the list (js-object-key-order o)) :test #'equal)
+          (push k (js-object-key-order o))
+          (when (> (length (the list (js-object-key-order o))) +props-small-limit+)
+            (%key-set-of o))))))    ; promote to the hashed regime
+(defun %key-forget (o k)
+  "Remove K from O's live own keys. Hashed regime: O(1) — leave a tombstone in
+   KEY-ORDER that %own-keys-in-order filters out, compacting once tombstones
+   dominate (keeps bulk deletion O(n) overall, not O(n^2)). Small regime:
+   KEY-ORDER holds only live keys, so delete K from it directly."
+  (let ((set (js-object-key-set o)))
+    (if set
+        (when (gethash k set)
+          (remhash k set)
+          (when (> (incf (js-object-key-tombstones o))
+                   (hash-table-count set))
+            (%key-compact o)))
+        (setf (js-object-key-order o)
+              (delete k (the list (js-object-key-order o)) :test #'equal)))))
 (defun %own-keys-in-order (o)          ; insertion order, tombstones filtered out
   (if (plusp (js-object-key-tombstones o))
       (let ((set (js-object-key-set o)))
@@ -156,6 +174,71 @@
 
 (defun make-object (&key (proto *null*) (class "Object") call construct internal)
   (%make-object :proto proto :class class :call call :construct construct :internal internal))
+
+;;; ---- own-property storage (small-object optimization) --------------------
+;;; The PROPS slot maps an own property key (a CL string, or a js-symbol
+;;; compared by EQ) to its PROP descriptor. Allocating a full EQUAL hash-table
+;;; per object is wasteful — most objects hold only a handful of properties — so
+;;; storage grows lazily through three shapes:
+;;;   NIL          — no own properties yet (the fresh-object common case)
+;;;   alist        — ((key . prop) ...), while the count stays <= +props-small-limit+
+;;;   hash-table   — EQUAL-tested, once an insert would exceed the small limit
+;;; Enumeration ORDER is tracked separately in KEY-ORDER / KEY-SET (and
+;;; ordinary-own-keys re-sorts index keys), so PROPS never has to preserve order:
+;;; representation switches are order-safe and MAP-PROPS may run in any order.
+;;; All access goes through this five-function API (get / present-p / set /
+;;; remove / map) so the representation is swappable in one place.
+;;; (+props-small-limit+ is defined above, shared with the KEY-ORDER helpers.)
+
+(declaim (inline props-get props-present-p map-props))
+(defun props-get (o k)
+  "Own PROP for already-coerced key K on O, as (values prop present-p)."
+  (let ((s (js-object-props o)))
+    (cond ((null s) (values nil nil))
+          ((hash-table-p s) (gethash k s))
+          (t (let ((cell (assoc k (the list s) :test #'equal)))
+               (if cell (values (cdr cell) t) (values nil nil)))))))
+
+(defun props-present-p (o k)
+  "T iff O has an own property named K (K already coerced)."
+  (let ((s (js-object-props o)))
+    (cond ((null s) nil)
+          ((hash-table-p s) (nth-value 1 (gethash k s)))
+          (t (and (assoc k (the list s) :test #'equal) t)))))
+
+(defun props-set (o k p)
+  "Store descriptor P under key K on O (insert or replace), migrating the alist
+   to a hash-table once it would grow past +props-small-limit+ entries. Does NOT
+   update KEY-ORDER — callers pair this with %key-touch."
+  (let ((s (js-object-props o)))
+    (cond
+      ((hash-table-p s) (setf (gethash k s) p))
+      ((null s) (setf (js-object-props o) (list (cons k p))))
+      (t (let ((cell (assoc k (the list s) :test #'equal)))
+           (cond
+             (cell (setf (cdr cell) p))
+             ((>= (length (the list s)) +props-small-limit+)
+              (let ((h (make-hash-table :test 'equal :size (* 2 +props-small-limit+))))
+                (dolist (c s) (setf (gethash (car c) h) (cdr c)))
+                (setf (gethash k h) p (js-object-props o) h)))
+             (t (setf (js-object-props o) (cons (cons k p) s)))))))
+    p))
+
+(defun props-remove (o k)
+  "Remove key K's own descriptor from O (no-op if absent). Does NOT update
+   KEY-ORDER — callers pair this with %key-forget."
+  (let ((s (js-object-props o)))
+    (cond ((null s))
+          ((hash-table-p s) (remhash k s))
+          (t (setf (js-object-props o) (delete k (the list s) :test #'equal :key #'car))))))
+
+(defun map-props (o fn)
+  "Call FN with (key prop) for each own property of O, in UNSPECIFIED order
+   (order lives in KEY-ORDER, not here)."
+  (let ((s (js-object-props o)))
+    (cond ((null s))
+          ((hash-table-p s) (maphash fn s))
+          (t (dolist (c s) (funcall fn (car c) (cdr c)))))))
 
 (declaim (inline prop-key))
 (defun prop-key (k)
@@ -241,7 +324,7 @@
   (unless receiver (setf receiver o))
   (cond
     ((js-object-p o)
-     (let ((d (gethash (prop-key key) (js-object-props o))))
+     (let ((d (props-get o (prop-key key))))
        (cond (d (if (prop-accessor d)
                     (let ((g (prop-get d)))
                       (if (and g (not (js-undefined-p g))) (js-call g receiver '()) *undefined*))
@@ -318,17 +401,16 @@
   (let ((n (to-number v)))
     (if (or (js-nan-p n) (= n *inf*) (= n *-inf*)) 0 (mod (truncate n) #x100000000))))
 (defun array-length (o)
-  (let ((ld (gethash "length" (js-object-props o)))) (if ld (truncate (prop-value ld)) 0)))
+  (let ((ld (props-get o "length"))) (if ld (truncate (prop-value ld)) 0)))
 
 (defun %array-indices->=  (o newlen)
   "Present own array-index integers of O that are >= NEWLEN, in DESCENDING order.
    Iterates the property table (not the 0..2^32 range), so shrinking a sparse
    array is cheap regardless of how large its length is."
   (let ((idxs '()))
-    (maphash (lambda (k v) (declare (ignore v))
-               (when (and (stringp k) (array-index-string-p k))
-                 (let ((i (parse-integer k))) (when (>= i newlen) (push i idxs)))))
-             (js-object-props o))
+    (map-props o (lambda (k v) (declare (ignore v))
+                   (when (and (stringp k) (array-index-string-p k))
+                     (let ((i (parse-integer k))) (when (>= i newlen) (push i idxs))))))
     (sort idxs #'>)))
 
 (defun array-set-length (o v)
@@ -337,15 +419,15 @@
    non-configurable), then store the new length."
   (let* ((num (to-number v)) (newlen (to-uint32 v)))
     (unless (= newlen num) (js-throw (make-native-error "RangeError" "Invalid array length")))
-    (let ((ld (gethash "length" (js-object-props o))))
+    (let ((ld (props-get o "length")))
       (when (and ld (not (prop-writable ld))) (return-from array-set-length *false*))
       (let ((oldlen (if ld (truncate (prop-value ld)) 0)))
         (when (< newlen oldlen)
           (dolist (i (%array-indices->= o newlen))
             (let ((k (princ-to-string i)) (d nil))
-              (setf d (gethash k (js-object-props o)))
+              (setf d (props-get o k))
               (if (prop-configurable d)
-                  (progn (remhash k (js-object-props o)) (%key-forget o k))
+                  (progn (props-remove o k) (%key-forget o k))
                   (progn (when ld (setf (prop-value ld) (float (1+ i) 1d0)))
                          (return-from array-set-length *false*))))))
         (if ld (setf (prop-value ld) (float newlen 1d0))
@@ -364,7 +446,7 @@
              (when (and int (or (getf int :set) (getf int :get-own-property)
                                 (getf int :get-proto)))
                (return t)))
-           (let ((d (gethash k (js-object-props p))))
+           (let ((d (props-get p k)))
              (when d (return (or (prop-accessor d) (not (prop-writable d))))))))
 
 (defun ordinary-set (o key v &optional receiver)
@@ -387,7 +469,7 @@
       (when (stringp k)
         (cond ((string= k "length") (return-from ordinary-set (array-set-length o v)))
               ((array-index-string-p k)
-               (let ((own (gethash k (js-object-props o))))
+               (let ((own (props-get o k)))
                  ;; Fast path only when the write lands as an own data prop: own
                  ;; writable-data, or absent-with-no-inherited-blocker. An own
                  ;; accessor/non-writable, or an INHERITED accessor/non-writable,
@@ -395,14 +477,14 @@
                  (when (or (and own (not (prop-accessor own)) (prop-writable own))
                            (and (null own) (not (array-index-inherited-blocker-p o k))))
                    (let* ((idx (parse-integer k)) (len (array-length o))
-                          (ld (gethash "length" (js-object-props o))))
+                          (ld (props-get o "length")))
                      (when (and ld (not (prop-writable ld)) (>= idx len))
                        (return-from ordinary-set *false*))
                      (let ((res (%create-data-on-receiver o k v)))
                        (when (and (eq res *true*) ld (>= idx len))
                          (setf (prop-value ld) (float (1+ idx) 1d0)))
                        (return-from ordinary-set res))))))))))
-  (let* ((k (prop-key key)) (d (gethash k (js-object-props o))))
+  (let* ((k (prop-key key)) (d (props-get o k)))
     (cond
       ((and d (prop-accessor d))
        (let ((s (prop-set d)))
@@ -419,24 +501,24 @@
 
 (defun %create-data-on-receiver (receiver k v)
   (if (js-object-p receiver)
-      (let ((ex (gethash k (js-object-props receiver))))
+      (let ((ex (props-get receiver k)))
         (cond ((and ex (prop-accessor ex)) *false*)
               ((and ex (not (prop-writable ex))) *false*)
               (ex (setf (prop-value ex) v) *true*)
               ((js-object-extensible receiver)
-               (setf (gethash k (js-object-props receiver)) (make-prop :value v))
+               (props-set receiver k (make-prop :value v))
                (%key-touch receiver k) *true*)
               (t *false*)))
       *false*))
 
 (defun ordinary-has (o key)
   (let ((k (prop-key key)))
-    (or (nth-value 1 (gethash k (js-object-props o)))
+    (or (props-present-p o k)
         (and (js-object-p (js-object-proto o)) (js-truthy* (js-has (js-object-proto o) k))))))
 (defun ordinary-delete (o key)
-  (let* ((k (prop-key key)) (d (gethash k (js-object-props o))))
+  (let* ((k (prop-key key)) (d (props-get o k)))
     (cond ((null d) *true*)
-          ((prop-configurable d) (remhash k (js-object-props o)) (%key-forget o k) *true*)
+          ((prop-configurable d) (props-remove o k) (%key-forget o k) *true*)
           (t *false*))))
 (defun ordinary-own-keys (o)
   ;; Spec order: integer indices ascending, then string keys in insertion order,
@@ -460,7 +542,7 @@
 (defun put (o key value &key (enumerable t) (writable t) (configurable t))
   "Define an own data property (internal helper for building intrinsics)."
   (let ((k (prop-key key)))
-    (setf (gethash k (js-object-props o))
+    (props-set o k
           (make-prop :value value :enumerable enumerable :writable writable :configurable configurable))
     (%key-touch o k))
   o)
@@ -468,7 +550,7 @@
 (defun put-accessor (o key &key get set (enumerable t) (configurable t))
   "Define an own accessor property (internal helper for building intrinsics)."
   (let ((k (prop-key key)))
-    (setf (gethash k (js-object-props o))
+    (props-set o k
           (make-prop :accessor t :get get :set set :enumerable enumerable :configurable configurable))
     (%key-touch o k))
   o)
@@ -479,7 +561,7 @@
   (when (js-object-p o)
     (let ((tr (and (js-object-internal o) (getf (js-object-internal o) :get-own-property))))
       (if tr (funcall tr o (prop-key key))
-          (gethash (prop-key key) (js-object-props o))))))
+          (props-get o (prop-key key))))))
 
 (defun array-define-length (o desc)
   "ArraySetLength(A, Desc): the Array exotic [[DefineOwnProperty]] for \"length\".
@@ -491,7 +573,7 @@
          (newlen (to-uint32 val))
          (numlen (to-number val)))
     (unless (= newlen numlen) (js-throw (make-native-error "RangeError" "Invalid array length")))
-    (let* ((ld (gethash "length" (js-object-props o)))
+    (let* ((ld (props-get o "length"))
            (oldlen (if ld (truncate (prop-value ld)) 0))
            ;; newLenDesc: same as desc but value coerced to newlen
            (newdesc (let ((d (copy-list desc))) (setf (getf d :value) (float newlen 1d0)) d)))
@@ -507,11 +589,11 @@
         ;; Delete present indices >= newlen, highest first, honoring
         ;; non-configurable. Iterate existing keys only (sparse-safe).
         (dolist (i (%array-indices->= o newlen))
-          (let* ((kk (princ-to-string i)) (d (gethash kk (js-object-props o))))
+          (let* ((kk (princ-to-string i)) (d (props-get o kk)))
             (if (prop-configurable d)
-                (progn (remhash kk (js-object-props o)) (%key-forget o kk))
+                (progn (props-remove o kk) (%key-forget o kk))
                 (progn
-                  (let ((ld2 (gethash "length" (js-object-props o))))
+                  (let ((ld2 (props-get o "length")))
                     (when ld2 (setf (prop-value ld2) (float (1+ i) 1d0))))
                   (unless new-writable
                     (ordinary-define-own-property o "length" (list :writable nil)))
@@ -527,14 +609,14 @@
       ((and (stringp k) (string= k "length")) (array-define-length o desc))
       ((and (stringp k) (array-index-string-p k))
        (let* ((index (parse-integer k))
-              (ld (gethash "length" (js-object-props o)))
+              (ld (props-get o "length"))
               (oldlen (if ld (truncate (prop-value ld)) 0)))
          (when (and (>= index oldlen) ld (not (prop-writable ld)))
            (return-from array-define-own-property nil))
          (unless (ordinary-define-own-property o k desc)
            (return-from array-define-own-property nil))
          (when (>= index oldlen)
-           (let ((ld2 (gethash "length" (js-object-props o))))
+           (let ((ld2 (props-get o "length")))
              (if ld2 (setf (prop-value ld2) (float (1+ index) 1d0))
                  (put o "length" (float (1+ index) 1d0) :enumerable nil))))
          t))
@@ -552,7 +634,7 @@
 
 (defun ordinary-define-own-property (o key desc)
   "OrdinaryDefineOwnProperty (no exotic dispatch). Returns T/NIL."
-  (let* ((k (prop-key key)) (cur (gethash k (js-object-props o)))
+  (let* ((k (prop-key key)) (cur (props-get o k))
          (accessor (if (present-p desc :accessor) (getf desc :accessor)
                        (or (present-p desc :get) (present-p desc :set)))))
     (cond
@@ -569,7 +651,7 @@
                                :writable (and (present-p desc :writable) (getf desc :writable))
                                :enumerable (and (present-p desc :enumerable) (getf desc :enumerable))
                                :configurable (and (present-p desc :configurable) (getf desc :configurable))))))
-         (setf (gethash k (js-object-props o)) p) (%key-touch o k) t))
+         (props-set o k p) (%key-touch o k) t))
       ;; existing property — validate against configurable
       ;; (ValidateAndApplyPropertyDescriptor). DESC's descriptor "kind":
       ;;   data     = has :value or :writable

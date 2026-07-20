@@ -458,7 +458,7 @@
       (let ((clone (copy-prop-struct td)))
         ;; simulate by attempting define on a throwaway holder
         (let ((holder (make-object)))
-          (setf (gethash "k" (js-object-props holder)) clone)
+          (props-set holder "k" clone)
           (%key-touch holder "k")
           (js-define-own-property holder "k" desc)))))
 
@@ -555,7 +555,7 @@
       (define-global realm "Proxy" ctor)
       ;; global built-in constructors are non-enumerable (define-global stores an
       ;; enumerable data prop; fix the attribute to match the spec / verifyProperty).
-      (let ((d (gethash "Proxy" (js-object-props (realm-global realm)))))
+      (let ((d (props-get (realm-global realm) "Proxy")))
         (when d (setf (prop-enumerable d) nil))))))
 
 (register-builtin-installer 'install-proxy)
