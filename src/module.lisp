@@ -50,6 +50,35 @@
       (prog1 (cur-val) (adv))
       (js-throw (make-native-error "SyntaxError" "Expected an identifier"))))
 
+(defun parse-with-clause ()
+  "The optional `with { type: \"json\" }` after a module specifier (import attributes).
+
+`with` is contextual here -- it is also the `with` STATEMENT keyword -- so it only counts when a
+`{` follows it.  Attribute VALUES must be string literals; keys may be identifiers or strings.
+The attributes are recorded and not acted on: this host supports no attribute type at all, so a
+non-empty clause is refused at load time rather than quietly ignored, which is what the spec means
+by an unsupported attribute."
+  (when (and (kw? "with")
+             (let ((nx (aref *toks* (1+ *pos*))))
+               (and (eq (car nx) :punct) (string= (cdr nx) "{"))))
+    (adv) (eat "{")
+    (let ((out '()))
+      (loop until (punct? "}")
+            do (let ((key (case (cur-type)
+                            (:ident (prog1 (cur-val) (adv)))
+                            (:str (prog1 (cur-val) (adv)))
+                            (t (js-throw (make-native-error
+                                          "SyntaxError" "Expected an import attribute key"))))))
+                 (eat ":")
+                 (unless (eq (cur-type) :str)
+                   (js-throw (make-native-error
+                              "SyntaxError" "An import attribute value must be a string literal")))
+                 (push (cons key (cur-val)) out)
+                 (adv)
+                 (unless (punct? "}") (eat ","))))
+      (eat "}")
+      (nreverse out))))
+
 (defun parse-from-clause ()
   (unless (kw? "from")
     (js-throw (make-native-error "SyntaxError" "Expected 'from' in a module declaration")))
@@ -92,7 +121,9 @@
   ;; `import "side-effect";` -- no bindings at all, and the one form with no `from`.
   (when (eq (cur-type) :str)
     (return-from parse-import-decl
-      (let ((spec (cur-val))) (adv) (opt ";") (list :import spec '()))))
+      (let ((spec (cur-val)))
+        (adv)
+        (let ((attrs (parse-with-clause))) (opt ";") (list :import spec '() attrs)))))
   (let ((entries '()))
     (cond
       ((punct? "*") (push (parse-namespace-import) entries))
@@ -106,9 +137,10 @@
                (t (js-throw (make-native-error
                              "SyntaxError"
                              "Expected '*' or '{' after the default import")))))))
-    (let ((spec (parse-from-clause)))
+    (let* ((spec (parse-from-clause))
+           (attrs (parse-with-clause)))
       (opt ";")
-      (list :import spec (nreverse entries)))))
+      (list :import spec (nreverse entries) attrs))))
 
 ;;; ---- export ------------------------------------------------------------------------------
 
@@ -131,14 +163,18 @@
     ((punct? "*")
      (adv)
      (let* ((as (when (kw? "as") (adv) (module-export-name)))
-            (spec (parse-from-clause)))
+            (spec (parse-from-clause))
+            (attrs (parse-with-clause)))
+       (declare (ignore attrs))
        (opt ";")
        (list :export-star spec as)))
 
     ;; export { ... };   /   export { ... } from "m";
     ((punct? "{")
      (let* ((pairs (parse-export-list))
-            (spec (when (kw? "from") (parse-from-clause))))
+            (spec (when (kw? "from") (parse-from-clause)))
+            (attrs (and spec (parse-with-clause))))
+       (declare (ignore attrs))
        (opt ";")
        (list :export-named pairs spec)))
 
@@ -256,6 +292,9 @@ module evaluates synchronously or becomes an async body driven by a promise."
    (items :initarg :items :reader module-items)
    (requests :initarg :requests :reader module-requests
              :documentation "Every specifier this module requests, in source order, deduplicated.")
+   (request-attrs :initarg :request-attrs :initform nil :reader module-request-attrs
+                  :documentation "Specifier -> import attributes, e.g. ((\"./x.json\" . ((\"type\" . \"json\")))).
+Attributes are part of a module's IDENTITY, so the loader keys on them too.")
    (imports :initarg :imports :reader module-imports)
    (exports :initarg :exports :reader module-exports)))
 
@@ -292,13 +331,16 @@ pattern's KEYFORMs, which name properties being read and not bindings being made
 
 (defun analyse-module (items)
   "ITEMS -> (values requests imports exports), the spec's static tables."
-  (let ((requests '()) (imports '()) (exports '()))
-    (flet ((request (spec) (pushnew spec requests :test #'string=)))
+  (let ((requests '()) (imports '()) (exports '()) (attrs-of '()))
+    (flet ((request (spec &optional attrs)
+             (pushnew spec requests :test #'string=)
+             (when (and attrs (not (assoc spec attrs-of :test #'string=)))
+               (push (cons spec attrs) attrs-of))))
       (dolist (it items)
         (case (car it)
           (:import
-           (destructuring-bind (spec entries) (rest it)
-             (request spec)
+           (destructuring-bind (spec entries &optional attrs) (rest it)
+             (request spec attrs)
              (dolist (e entries)
                (push (make-instance
                       'import-entry :request spec
@@ -341,11 +383,12 @@ pattern's KEYFORMs, which name properties being read and not bindings being made
           (:export-decl
            (dolist (n (%declared-names (second it)))
              (push (make-instance 'export-entry :export-name n :local-name n) exports))))))
-    (values (nreverse requests) (nreverse imports) (nreverse exports))))
+    (values (nreverse requests) (nreverse imports) (nreverse exports) (nreverse attrs-of))))
 
 (defun parse-module (src)
   "SRC -> a MODULE-RECORD.  Static only: nothing here evaluates, links or instantiates."
   (multiple-value-bind (items spans starts) (parse-module-items src)
-    (multiple-value-bind (requests imports exports) (analyse-module items)
+    (multiple-value-bind (requests imports exports attrs-of) (analyse-module items)
       (make-instance 'module-record :source src :items items :spans spans :starts starts
-                                    :requests requests :imports imports :exports exports))))
+                                    :requests requests :imports imports :exports exports
+                                    :request-attrs attrs-of))))

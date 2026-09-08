@@ -91,6 +91,10 @@
    ;; gone by the time an async function's continuation runs -- so a deferred `import()` inside
    ;; `await` would find no host at all.  Whoever loaded this module is the right answer forever.
    (host :initarg :host :initform nil :reader mod-host)
+   ;; A JSON MODULE is not source text: it has exactly one export, "default", holding the parsed
+   ;; value, and no body to run.  Everything downstream works unchanged because its RECORD says
+   ;; so -- one export entry, no requests, no imports.
+   (json-value :initarg :json-value :initform nil :reader mod-json-value)
    ;; ---- top-level await.  A module with TLA does not finish when its body returns: its body
    ;; IS a promise, and everything importing it has to wait.  These are the spec's slots for
    ;; that, and the reason evaluation stops being a simple depth-first walk.
@@ -108,27 +112,62 @@
 
 ;;; ---- loading -------------------------------------------------------------------------------
 
-(defun resolve-imported-module (referrer specifier)
-  "HostResolveImportedModule: the same (referrer, specifier) must always give the same module."
+(defun %json-module-record ()
+  "The record a JSON module presents: one export named \"default\", nothing else."
+  (make-instance 'module-record
+                 :source "" :items '() :spans '() :starts (vector 0)
+                 :requests '() :imports '()
+                 :exports (list (make-instance 'export-entry
+                                               :export-name "default" :local-name "*default*"))))
+
+(defun %attr (attrs name)
+  (cdr (assoc name attrs :test #'string=)))
+
+(defun resolve-imported-module (referrer specifier &optional attrs)
+  "HostResolveImportedModule: the same (referrer, specifier, attributes) must always give the same
+module.  ATTRIBUTES ARE PART OF IDENTITY -- the same file imported as JSON and as source is two
+different modules -- so the registry key carries the type."
   (let* ((host (or (and referrer (mod-host referrer)) *module-host*
                    (%mod-error "TypeError" "no module host is installed")))
+         (type (%attr attrs "type"))
          (key (funcall (host-resolve host) specifier (and referrer (mod-key referrer)))))
     (unless key
       (%mod-error "TypeError" "Cannot resolve module ~s~@[ imported by ~a~]"
                   specifier (and referrer (mod-key referrer))))
-    (or (gethash key (host-registry host))
-        (let ((src (funcall (host-loader host) key)))
-          (unless src (%mod-error "TypeError" "Cannot load module ~a" key))
-          (let ((m (make-instance 'source-text-module
-                                  :key key :realm *current-realm* :host host
-                                  :record (parse-module src))))
-            (setf (mod-has-tla m) (module-has-tla-p (module-items (mod-record m))))
-            (setf (gethash key (host-registry host)) m)
-            m)))))
+    (when (and type (not (string= type "json")))
+      (%mod-error "TypeError" "Unsupported import attribute type ~s for ~a" type key))
+    (let ((rkey (if type (concatenate 'string key (string #\Nul) "type=" type) key)))
+      (or (gethash rkey (host-registry host))
+          (let ((src (funcall (host-loader host) key)))
+            (unless src (%mod-error "TypeError" "Cannot load module ~a" key))
+            (let ((m (if (equal type "json")
+                         (make-instance 'source-text-module
+                                        :key rkey :realm *current-realm* :host host
+                                        :record (%json-module-record)
+                                        :json-value (parse-json-text src))
+                         (let ((mm (make-instance 'source-text-module
+                                                  :key key :realm *current-realm* :host host
+                                                  :record (parse-module src))))
+                           (setf (mod-has-tla mm)
+                                 (module-has-tla-p (module-items (mod-record mm))))
+                           mm))))
+              (setf (gethash rkey (host-registry host)) m)
+              m))))))
+
+(defun parse-json-text (text)
+  "JSON source -> a JS value, using the engine's own parser.  A JSON module whose text does not
+parse is a SyntaxError at load, which is where the spec puts it."
+  (let ((p (%make-jparse :str text :pos 0 :len (length text))))
+    (prog1 (json-parse-value p)
+      (jp-skip-ws p)
+      (unless (jp-eof-p p)
+        (js-throw (make-native-error "SyntaxError" "Unexpected trailing content in JSON module"))))))
 
 (defun %mod-dep (m specifier)
   (or (cdr (assoc specifier (mod-deps m) :test #'string=))
-      (let ((dep (resolve-imported-module m specifier)))
+      (let ((dep (resolve-imported-module
+                  m specifier
+                  (cdr (assoc specifier (module-request-attrs (mod-record m)) :test #'string=)))))
         (push (cons specifier dep) (mod-deps m))
         dep)))
 
@@ -384,6 +423,9 @@ is where `export {nope} from './x.js'` becomes a SyntaxError rather than an unde
     (let ((env (new-env (realm-global-env (or (mod-realm m) *current-realm*)))))
       (setf (env-module env) t)                  ; var scope stops here, not at globalThis
       (setf (mod-env m) env)
+      (when (mod-json-value m)
+        ;; The whole of a JSON module: one binding, already evaluated.
+        (setf (gethash "*default*" (env-vars env)) (mod-json-value m)))
       ;; ModuleDeclarationInstantiation steps 9-11: the module's OWN bindings exist before any
       ;; body runs -- vars as undefined, lexicals in TDZ.  A cycle makes this observable: the
       ;; other module in the loop reads these names while this one has not evaluated a line.

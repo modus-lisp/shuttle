@@ -401,7 +401,8 @@ each live local reads through; pass two copies the body, splicing at spans and a
         (dolist (item items)
           (case (car item)
             (:import
-             (destructuring-bind (spec entries) (rest item)
+             (destructuring-bind (spec entries &optional attrs) (rest item)
+               (declare (ignore attrs))
                (let ((ns (next-ns)))
                  (setf (gethash item ns-for-item) ns)
                  (format pre "var ~a = __r(~a);~%" ns (%jstr (%dep-id m spec)))

@@ -517,6 +517,37 @@
               (t *false*)))
       *false*))
 
+(defun set-integrity-level (o level)
+  "SetIntegrityLevel(O, LEVEL) -> T on success, NIL on failure.  LEVEL is :SEALED or :FROZEN.
+
+Routed through the object's own [[OwnPropertyKeys]] / [[GetOwnProperty]] / [[DefineOwnProperty]]
+rather than its raw property table, which is what makes it work on a Proxy or a host object at
+all -- and what lets one REFUSE.  A module namespace refuses `writable: false`, so freezing one is
+a TypeError rather than a silent no-op."
+  (if (not (js-prevent-extensions o))
+      nil
+      (block done
+        (dolist (k (js-own-keys o) t)
+          (let ((d (js-get-own-property o k)))
+            (when d
+              (let ((desc (if (or (eq level :sealed) (prop-accessor d))
+                              (list :configurable nil)
+                              (list :configurable nil :writable nil))))
+                (unless (js-define-own-property o k desc)
+                  (return-from done nil)))))))))
+
+(defun test-integrity-level (o level)
+  "TestIntegrityLevel(O, LEVEL) -> T/NIL, through the internal methods for the same reason."
+  (if (js-extensible-p o)
+      nil
+      (block done
+        (dolist (k (js-own-keys o) t)
+          (let ((d (js-get-own-property o k)))
+            (when d
+              (when (prop-configurable d) (return-from done nil))
+              (when (and (eq level :frozen) (not (prop-accessor d)) (prop-writable d))
+                (return-from done nil))))))))
+
 (defun ordinary-has (o key)
   (let ((k (prop-key key)))
     (or (props-present-p o k)
