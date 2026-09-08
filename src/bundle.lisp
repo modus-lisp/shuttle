@@ -114,14 +114,20 @@ not a module at all.")
                                 (when (and tgt (position #\* tgt))
                                   (concatenate 'string (subseq tgt 0 (position #\* tgt)) tail))))))))))
 
+(defparameter *package-dir-names* '("node_modules" "vendor")
+  "Directory names that hold packages, tried in order at each level.  `vendor` is here so a
+project can COMMIT its dependencies and build with no package manager at all -- which is the
+whole point of the exercise; `node_modules` stays first so an ordinary checkout still works.")
+
 (defun package-dirs (from-dir)
-  "Every node_modules/ visible from FROM-DIR, nearest first — which is what makes @noble/curves'
-own nested copy of @noble/hashes win for files inside it, exactly as node would."
+  "Every package directory visible from FROM-DIR, nearest first — which is what makes
+@noble/curves' own nested copy of @noble/hashes win for files inside it, exactly as node would."
   (let ((segs (remove "" (%split-slash (string-right-trim "/" (namestring from-dir)))
                       :test #'string=))
         (out '()))
     (loop for n from (length segs) downto 0
-          do (push (format nil "/~{~a/~}node_modules/" (subseq segs 0 n)) out))
+          do (dolist (name (reverse *package-dir-names*))
+               (push (format nil "/~{~a/~}~a/" (subseq segs 0 n) name) out)))
     (nreverse out)))
 
 (defun resolve-bare (spec from-dir)
