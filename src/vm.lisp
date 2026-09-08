@@ -168,6 +168,20 @@ recurse forever.")
           ((eq v *tdz*) (js-throw (make-native-error "ReferenceError"
                           (format nil "Cannot access '~a' before initialization" name))))
           (t v))))
+(defun env-delete-binding (env name)
+  "`delete NAME` -> T if the name is gone (or was never there), NIL if it could not be deleted.
+
+A declarative binding -- var, let, const, function, parameter -- is NOT configurable, so deleting
+one answers false.  A property of the global object answers according to its own descriptor, and
+an unresolvable name answers true."
+  (loop for e = env then (env-parent e) while e
+        do (when (nth-value 1 (gethash name (env-vars e)))
+             (return-from env-delete-binding nil))
+           (when (and (env-global-obj e) (global-var-defined-p (env-global-obj e) name))
+             (return-from env-delete-binding
+               (js-truthy* (js-delete (env-global-obj e) name)))))
+  t)
+
 (defun env-typeof (env name)
   (multiple-value-bind (v p) (env-get env name)
     (when (and (not p) (string= name "Promise") (boundp '*current-realm*) *current-realm*)
@@ -1734,11 +1748,33 @@ until the job queue empties, which is where a job ends.")
         (t (js-throw (format nil "operator ~a not supported" op)))))
 
 (defun js-instanceof (a b)
-  (unless (js-callable-p b) (js-throw "Right-hand side of 'instanceof' is not callable"))
-  (let ((proto (js-get b "prototype")))
-    (and (js-object-p a)
-         (loop for p = (js-get-proto a) then (js-get-proto p)
-               while (js-object-p p) thereis (eq p proto)))))
+  "InstanceofOperator(V, target).
+
+@@hasInstance FIRST: a target may define its own answer, and `class A { static
+[Symbol.hasInstance](v) { ... } }` is the whole reason the well-known symbol exists.  Ignoring it
+made every such class answer false.
+
+And the error is a TypeError OBJECT, not a raw string -- JS-THROW takes a VALUE, so throwing a
+string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
+  (unless (js-object-p b)
+    (js-throw (make-native-error "TypeError"
+                                 "Right-hand side of 'instanceof' is not an object")))
+  (let* ((sym (well-known-symbol "hasInstance"))
+         (h (and sym (js-get b sym))))
+    (when (and h (not (js-null-or-undef h)))
+      (unless (js-callable-p h)
+        (js-throw (make-native-error "TypeError" "@@hasInstance is not callable")))
+      (return-from js-instanceof (js-truthy (js-call h b (list a)))))
+    (unless (js-callable-p b)
+      (js-throw (make-native-error "TypeError"
+                                   "Right-hand side of 'instanceof' is not callable")))
+    (let ((proto (js-get b "prototype")))
+      (unless (js-object-p proto)
+        (js-throw (make-native-error "TypeError"
+                                     "Function has non-object prototype in 'instanceof'")))
+      (and (js-object-p a)
+           (loop for p = (js-get-proto a) then (js-get-proto p)
+                 while (js-object-p p) thereis (eq p proto))))))
 
 (defun js-unop (op v)
   (cond ((string= op "!") (js-bool (not (js-truthy v))))
@@ -1958,6 +1994,7 @@ until the job queue empties, which is where a job ends.")
                                        (if (js-symbol-p k) (to-symbol-string k) (to-string k))
                                        (js-typeof o))))))
                          (push! v)))
+            (:del-var (push! (js-bool (env-delete-binding env (first a)))))
             (:del-prop (let ((k (pop!)) (o (pop!)))
                          (let ((ok (if (js-object-p o) (js-delete o k) *true*)))
                            (when (and strictp (not (js-truthy* ok)))

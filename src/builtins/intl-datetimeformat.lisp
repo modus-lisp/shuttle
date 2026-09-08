@@ -613,7 +613,7 @@
   "0=Sunday .. 6=Saturday, from a proleptic gregorian Y/M/D (exact integers)."
   ;; Use the epoch-day approach via date.lisp make-day (float ok for range).
   (let ((d (make-day (float year 1d0) (float (1- month) 1d0) (float day 1d0))))
-    (truncate (js-mod (+ d 4d0) 7d0))))
+    (truncate (date-modulo (+ d 4d0) 7d0))))
 
 (defun dtf-temporal-fields (brand v tz)
   "Extract a fields plist (with :allowed) for a Temporal object. TZ used only for

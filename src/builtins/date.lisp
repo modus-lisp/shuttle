@@ -19,13 +19,17 @@
 
 (defun %floor (x) (with-js-floats (ffloor x)))
 
-(defun js-mod (a b)
-  "Mathematical modulo returning a value with the sign of B (ECMAScript modulo)."
+(defun date-modulo (a b)
+  "The spec's MODULO for date arithmetic: sign of B, floor-based.
+
+NOT the `%` operator, which takes the sign of the DIVIDEND.  This was called JS-MOD and, because
+builtins load after vm.lisp, it silently REDEFINED the operator's own JS-MOD for the whole engine
+-- so `-1 % 2` answered 1 instead of -1, and every `%` on a negative dividend was wrong."
   (with-js-floats (- a (* (ffloor (/ a b)) b))))
 
 ;;; Day number and time-within-day
 (defun day (tv) (if (date-finite-p tv) (%floor (/ tv +ms-per-day+)) *nan*))
-(defun time-within-day (tv) (if (date-finite-p tv) (js-mod tv +ms-per-day+) *nan*))
+(defun time-within-day (tv) (if (date-finite-p tv) (date-modulo tv +ms-per-day+) *nan*))
 
 ;;; Year handling
 (defun days-in-year (y)
@@ -89,12 +93,12 @@
       (10 (- d (+ 303 leap)))
       (11 (- d (+ 333 leap))))))
 
-(defun week-day (tv) (if (date-finite-p tv) (js-mod (+ (day tv) 4d0) 7d0) *nan*))
+(defun week-day (tv) (if (date-finite-p tv) (date-modulo (+ (day tv) 4d0) 7d0) *nan*))
 
-(defun hours-from-time (tv) (if (date-finite-p tv) (js-mod (%floor (/ tv +ms-per-hour+)) 24d0) *nan*))
-(defun min-from-time (tv) (if (date-finite-p tv) (js-mod (%floor (/ tv +ms-per-minute+)) 60d0) *nan*))
-(defun sec-from-time (tv) (if (date-finite-p tv) (js-mod (%floor (/ tv +ms-per-second+)) 60d0) *nan*))
-(defun ms-from-time (tv) (if (date-finite-p tv) (js-mod tv 1000d0) *nan*))
+(defun hours-from-time (tv) (if (date-finite-p tv) (date-modulo (%floor (/ tv +ms-per-hour+)) 24d0) *nan*))
+(defun min-from-time (tv) (if (date-finite-p tv) (date-modulo (%floor (/ tv +ms-per-minute+)) 60d0) *nan*))
+(defun sec-from-time (tv) (if (date-finite-p tv) (date-modulo (%floor (/ tv +ms-per-second+)) 60d0) *nan*))
+(defun ms-from-time (tv) (if (date-finite-p tv) (date-modulo tv 1000d0) *nan*))
 
 (defun make-time (hour min sec ms)
   (if (and (date-finite-p hour) (date-finite-p min) (date-finite-p sec) (date-finite-p ms))
@@ -110,7 +114,7 @@
       (with-js-floats
         (let* ((y (ftruncate year)) (m (ftruncate month)) (dt (ftruncate date))
                (ym (+ y (ffloor (/ m 12d0))))
-               (mn (js-mod m 12d0)))
+               (mn (date-modulo m 12d0)))
           (if (not (date-finite-p ym))
               *nan*
               (let* ((first-day (day-from-year ym))

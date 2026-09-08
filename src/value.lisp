@@ -31,7 +31,13 @@
 (defparameter *-inf* sb-ext:double-float-negative-infinity)
 (defparameter *nan*  (with-js-floats (- *inf* *inf*)))
 (declaim (inline js-nan-p js-bigint-p))
-(defun js-nan-p (x) (and (floatp x) (/= x x)))
+(defun js-nan-p (x)
+  ;; SB-EXT:FLOAT-NAN-P, not (/= x x).  The self-comparison is the textbook NaN test and it
+  ;; SIGNALS an invalid-operation trap when the traps are enabled -- which they are everywhere
+  ;; outside WITH-JS-FLOATS.  Since this is the predicate the whole engine detects NaN with, any
+  ;; embedder calling an exported operation on a NaN got a Lisp condition instead of "NaN".
+  ;; A bit test cannot trap.
+  (and (floatp x) (sb-ext:float-nan-p x)))
 ;;; A JS BigInt value is represented as a CL INTEGER (Numbers are always
 ;;; double-float, so an integer is unambiguously a BigInt).
 (defun js-bigint-p (x) (integerp x))

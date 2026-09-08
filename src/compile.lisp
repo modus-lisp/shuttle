@@ -311,6 +311,15 @@
     (t (js-throw (make-native-error "SyntaxError" "bad binding target")))))
 
 ;;; ---- destructuring ASSIGNMENT (LHS is expression-form: :ident/:member/:array/:object) ----
+(defun check-strict-assign-target (tgt)
+  "In STRICT code `eval` and `arguments` may not be assigned to, incremented, or compound-assigned
+-- an early SyntaxError, not a runtime one.  Sloppy code may do all of it."
+  (when (and *strict* (consp tgt) (eq (car tgt) :ident)
+             (member (second tgt) '("eval" "arguments") :test #'string=))
+    (js-throw (make-native-error
+               "SyntaxError"
+               (format nil "Unexpected ~a in strict mode" (second tgt))))))
+
 (defun assign-to-target (tgt)
   "Value on top of stack -> assign to expression-form TGT, consuming the value.
 
@@ -907,11 +916,19 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
                (when (and *strict* (eq (car tgt) :ident))
                  (js-throw (make-native-error "SyntaxError"
                    "Delete of an unqualified identifier in strict mode.")))
-               (if (eq (car tgt) :member)
-                   (progn (compile-expr (second tgt))
-                          (if (fourth tgt) (compile-expr (third tgt)) (em :const (second (third tgt))))
-                          (em :del-prop))
-                   (em :const *true*))))   ; delete of a non-reference is true (sloppy)
+               (cond
+                 ((eq (car tgt) :member)
+                  (compile-expr (second tgt))
+                  (if (fourth tgt) (compile-expr (third tgt)) (em :const (second (third tgt))))
+                  (em :del-prop))
+                 ;; `delete x` on a BINDING is false (bindings are not configurable); on an
+                 ;; undeclared name it is true, and it must not throw the way an ordinary read
+                 ;; would -- so it needs its own op rather than compiling the identifier.
+                 ((eq (car tgt) :ident) (em :del-var (second tgt)))
+                 ;; delete of any other expression is TRUE -- but the expression is still
+                 ;; EVALUATED.  `delete foo()` calls foo.  Skipping that made the operand's side
+                 ;; effects vanish, which is the whole point of these tests.
+                 (t (compile-expr tgt) (em :pop) (em :const *true*)))))
     (:logical (let ((end (lbl)) (op (second node)))
                 (compile-expr (third node))
                 (em (cond ((string= op "&&") :and-jmp)
@@ -1414,6 +1431,7 @@ what the read path already does with :SUPER-GET.  Value is expected on the stack
 (defun compile-logical-assign (lop target value)
   "x <op>= v  where <op> in {&& || ??}: read x; short-circuit; else assign v.
    Result on stack = final value of the reference."
+  (check-strict-assign-target target)
   (let ((end (lbl))
         (jmpop (cond ((string= lop "&&") :and-jmp) ((string= lop "||") :or-jmp) (t :nullish-jmp))))
     (case (car target)
@@ -1470,6 +1488,7 @@ what the read path already does with :SUPER-GET.  Value is expected on the stack
                 (format nil "Invalid ~a target: optional chain is not a valid assignment target" ctx)))))
 
 (defun compile-assign (op target value)
+  (check-strict-assign-target target)
   (assert-not-optional-target target "assignment")
   (when (logical-assign-op op)
     (return-from compile-assign (compile-logical-assign (logical-assign-op op) target value)))
@@ -1510,6 +1529,7 @@ what the read path already does with :SUPER-GET.  Value is expected on the stack
          (em :get-var obj) (em :swap) (em :private-set pn))))))
 
 (defun compile-update (op prefix target)
+  (check-strict-assign-target target)
   (assert-not-optional-target target "update")
   (let ((binop (if (string= op "++") "+" "-")))
     (ecase (car target)
