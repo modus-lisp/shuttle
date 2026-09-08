@@ -1358,13 +1358,21 @@ until the job queue empties, which is where a job ends.")
   (let ((o (to-object obj))
         (*symbol-async-iterator* (or *symbol-async-iterator* (well-known-symbol "asyncIterator"))))
     (let ((aif (and *symbol-async-iterator* (js-get o *symbol-async-iterator*))))
-      (if (js-callable-p aif)
-          (let ((it (js-call aif o '())))
-            (unless (js-object-p it) (js-throw (make-native-error "TypeError" "async iterator is not an object")))
-            it)
-          ;; fall back to the sync iterator (its next() returns {value,done}; the
-          ;; for-await loop awaits value/result which is fine for sync iterables)
-          (get-iterator obj)))))
+      (cond
+        ((js-callable-p aif)
+         (let ((it (js-call aif o '())))
+           (unless (js-object-p it)
+             (js-throw (make-native-error "TypeError" "async iterator is not an object")))
+           it))
+        ;; GetMethod: PRESENT but not callable is a TypeError.  Only undefined or null means
+        ;; "no async iterator" and falls back to the sync one -- falling back for a `false` or a
+        ;; number reached for @@iterator on an object that had deliberately made that throw.
+        ((not (js-null-or-undef aif))
+         (js-throw (make-native-error "TypeError" "@@asyncIterator is not a function")))
+        (t
+         ;; the sync iterator, whose next() returns {value,done}; the for-await loop awaits the
+         ;; result and the value, which is what wrapping a sync iterable means
+         (get-iterator obj))))))
 
 ;;; ---- async functions ----
 ;;; An async function body runs on the SAME thread-coroutine machinery as a

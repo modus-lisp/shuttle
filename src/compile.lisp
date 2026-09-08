@@ -838,7 +838,8 @@ cases -- a switch's CaseBlock is ONE scope, which is what those tests are about.
     (:for-in (em :comp-clear) (compile-scoped-loop node #'compile-for-in) (em :comp-default-undef))
     (:for-of (em :comp-clear) (compile-scoped-loop node #'compile-for-of) (em :comp-default-undef))
     (:for-await-of (em :comp-clear) (compile-scoped-loop node #'compile-for-await-of) (em :comp-default-undef))
-    (:label (compile-labeled node))
+    (:label (check-strict-binding-name (second node))   ; `yield` is reserved in strict code
+            (compile-labeled node))
     (:break (let ((lbl (second node)))
               (if lbl
                   (let ((entry (assoc lbl *labels* :test #'string=)))
@@ -1211,12 +1212,40 @@ closures created in the loop capture.")
     (let ((hit (assoc name scope :test #'string=)))
       (when hit (return (cdr hit))))))
 
+(defun check-duplicate-private-names (members)
+  "A class body may not declare the same private name twice -- an early SyntaxError.
+
+The one exception is a getter/setter PAIR of the same name, which together describe one accessor.
+Two fields, two methods, a field and a method, or two getters all collide."
+  (let ((seen '()))                     ; (name . kind), kind :get / :set / :other
+    (dolist (m members)
+      (let* ((key (case (car m)
+                    ((:field) (second m))
+                    ((:method) (third m))
+                    (t nil)))
+             (nm (and (consp key) (eq (car key) :private) (second key)))
+             (kind (if (eq (car m) :method)
+                       (case (second m) (:get :get) (:set :set) (t :other))
+                       :other)))
+        (when nm
+          (let ((prev (assoc nm seen :test #'string=)))
+            (when (and prev
+                       ;; a get paired with a set is the only legal repeat
+                       (not (and (member kind '(:get :set))
+                                 (member (cdr prev) '(:get :set))
+                                 (not (eq kind (cdr prev))))))
+              (js-throw (make-native-error
+                         "SyntaxError"
+                         (format nil "Identifier '~a' has already been declared" nm))))
+            (push (cons nm kind) seen)))))))
+
 (defun compile-class (node)
   "Compile (:class NAME SUPER MEMBERS CTOR) leaving the constructor on the stack.
    Strategy: build a ctor function + prototype object at runtime via ops; attach
    methods (non-enumerable) and static members; run field initializers in the
    constructor prologue."
   (destructuring-bind (name super members ctor) (cdr node)
+    (check-duplicate-private-names members)
     (let* ((derived (and super t))
            (privnames (private-member-keys members ctor))
            (privscope (mapcar (lambda (nm) (cons nm (make-private-name nm))) privnames))

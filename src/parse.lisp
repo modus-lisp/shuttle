@@ -111,7 +111,15 @@ of an `if` in sloppy code -- ALLOW-FUNCTION says whether this position is that o
     ((kw? "throw") (adv) (let ((e (parse-expr 1))) (opt ";") (list :throw e)))
     ((punct? ";") (adv) (list :empty))
     ((labeled-stmt-follows-p)
-     (let ((name (cur-val))) (adv) (adv)          ; consume IDENT and ':'
+     (let ((name (cur-val)))
+       ;; `yield` is a keyword inside a generator and `await` inside an async function, so
+       ;; neither can be a LabelIdentifier there.
+       (when (or (and *in-generator* (string= name "yield"))
+                 (and *in-async* (string= name "await")))
+         (js-throw (make-native-error
+                    "SyntaxError"
+                    (format nil "'~a' cannot be used as a label here" name))))
+       (adv) (adv)          ; consume IDENT and ':'
        ;; a labelled FUNCTION declaration is Annex B legal in sloppy code
        (list :label name (parse-substatement t))))
     (t (let ((e (parse-expr 1))) (opt ";") (list :expr e)))))
