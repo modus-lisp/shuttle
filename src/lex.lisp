@@ -189,12 +189,24 @@
    position (not as an IdentifierName). Set per tokenize, read by the parser.")
 
 (defun tokenize (src)
+  ;; STARTS is the source offset each token begins at, parallel to TOKS.  Nothing in the engine
+  ;; wants it -- the parser is happy with a token stream -- but the BUNDLER does: it rewrites a
+  ;; module by splicing at declaration boundaries and passing every other byte through untouched,
+  ;; which is a far better property for somebody else's cryptography than round-tripping it
+  ;; through a printer of ours.  One vector-push per token buys that.
   (let ((i 0) (n (length src)) (toks (make-array 0 :adjustable t :fill-pointer 0))
+        (starts (make-array 0 :adjustable t :fill-pointer 0 :element-type 'fixnum))
+        (tok-start 0)
         (*escaped-idents* (make-hash-table)))
     (labels ((peek (&optional (k 0)) (if (< (+ i k) n) (char src (+ i k)) #\Nul))
-             (emit (type val) (vector-push-extend (cons type val) toks)))
+             (emit (type val) (vector-push-extend (cons type val) toks)
+                              (vector-push-extend tok-start starts)))
       (loop while (< i n) do
         (let ((c (char src i)))
+          ;; Set at the top of every iteration, which is exactly where a token may begin: the
+          ;; whitespace and comment arms below emit nothing, so this is only ever read by a real
+          ;; token's EMIT, and it is then the offset of that token's first character.
+          (setf tok-start i)
           (cond
             ((member c '(#\Space #\Tab #\Newline #\Return #\Page)) (incf i))
             ;; comments
@@ -445,4 +457,5 @@
                  (if p (progn (emit :punct p) (incf i (length p)))
                      (js-throw (make-native-error "SyntaxError" (format nil "Unexpected character ~s" c))))))))))
     (vector-push-extend (cons :eof nil) toks)
-    (values toks *escaped-idents*)))
+    (vector-push-extend n starts)
+    (values toks *escaped-idents* starts)))

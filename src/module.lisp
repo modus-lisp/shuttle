@@ -173,11 +173,25 @@ are expressions and belong to PARSE-STMT."
         (t (parse-stmt))))
 
 (defun parse-module-items (src)
-  "SRC parsed with Module as the goal symbol -> a list of module items."
-  (multiple-value-bind (toks escaped) (tokenize src)
-    (let ((*toks* toks) (*escaped-idents* escaped) (*pos* 0) (items '()))
-      (loop until (eq (cur-type) :eof) do (push (parse-module-item) items))
-      (nreverse items))))
+  "SRC parsed with Module as the goal symbol.
+
+Returns (values ITEMS SPANS STARTS).  SPANS is parallel to ITEMS, each (CHAR-START CHAR-END
+TOK-FROM TOK-TO); STARTS is the token-offset vector.  CHAR-END is the start of the NEXT token, so a
+span carries its item's trailing whitespace -- which is what makes deleting one leave no ragged
+hole.  The token indices are what let the emitter slice `export ` off the front of a declaration
+without touching a byte of the declaration itself: the payload begins at (aref starts (1+ from))."
+  (multiple-value-bind (toks escaped starts) (tokenize src)
+    (let ((*toks* toks) (*escaped-idents* escaped) (*pos* 0) (items '()) (spans '()))
+      (loop until (eq (cur-type) :eof)
+            do (let ((from *pos*))
+                 (push (parse-module-item) items)
+                 (push (list (aref starts from) (aref starts *pos*) from *pos*) spans)))
+      (values (nreverse items) (nreverse spans) starts))))
+
+(defun span-start (sp) (first sp))
+(defun span-end (sp) (second sp))
+(defun span-from (sp) (third sp))
+(defun span-to (sp) (fourth sp))
 
 ;;; ---- the record --------------------------------------------------------------------------
 ;;;
@@ -203,7 +217,13 @@ are expressions and belong to PARSE-STMT."
                :documentation "The local binding exported, for a local export.")))
 
 (defclass module-record ()
-  ((items :initarg :items :reader module-items)
+  ((source :initarg :source :reader module-source
+           :documentation "The original text.  The bundler emits from THIS, spliced at spans.")
+   (spans :initarg :spans :reader module-spans
+          :documentation "(CHAR-START CHAR-END TOK-FROM TOK-TO) per item, parallel to ITEMS.")
+   (starts :initarg :starts :reader module-starts
+           :documentation "Token -> source offset, so the emitter can cut inside an item.")
+   (items :initarg :items :reader module-items)
    (requests :initarg :requests :reader module-requests
              :documentation "Every specifier this module requests, in source order, deduplicated.")
    (imports :initarg :imports :reader module-imports)
@@ -282,7 +302,7 @@ pattern's KEYFORMs, which name properties being read and not bindings being made
 
 (defun parse-module (src)
   "SRC -> a MODULE-RECORD.  Static only: nothing here evaluates, links or instantiates."
-  (let ((items (parse-module-items src)))
+  (multiple-value-bind (items spans starts) (parse-module-items src)
     (multiple-value-bind (requests imports exports) (analyse-module items)
-      (make-instance 'module-record :items items :requests requests
-                                    :imports imports :exports exports))))
+      (make-instance 'module-record :source src :items items :spans spans :starts starts
+                                    :requests requests :imports imports :exports exports))))

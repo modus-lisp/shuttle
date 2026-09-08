@@ -20,5 +20,7 @@
    ;; ES modules, static half: what a bundler asks of a source file
    #:parse-module #:parse-module-items
    #:module-record #:module-items #:module-requests #:module-imports #:module-exports
+   #:module-source #:module-spans #:module-starts
+   #:span-start #:span-end #:span-from #:span-to
    #:import-entry #:export-entry
    #:entry-request #:entry-import-name #:entry-local-name #:entry-export-name))

@@ -58,3 +58,12 @@ host-binding seam a consumer like weft hangs DOM objects + reflow on). Oracle: t
                                            (:file "intl-datetimeformat")
                                            (:file "intl-plural-list-relative")
                                            (:file "intl-collator-segmenter-displaynames")))))))
+
+;;; The bundler is a separate system: the engine has no business depending on a file resolver,
+;;; and a consumer embedding shuttle for scripting should not get one.
+(asdf:defsystem :shuttle/bundle
+  :description "One script out of an ES module graph: resolve, order, splice. Replaces esbuild in
+the deploy path, using shuttle's own parser for the modules and its own JSON for package.json."
+  :version "0.0.1" :author "ynniv" :license "MIT"
+  :depends-on (:shuttle)
+  :components ((:module "src" :components ((:file "bundle")))))
