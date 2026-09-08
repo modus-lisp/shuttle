@@ -85,10 +85,16 @@ skipped, and `try { return 'a' } finally { return 'b' }` answered 'a'.")
         ((eq (car p) :rest) (second p))
         (t p)))                             ; a pattern (:apat/:opat)
 
+(defvar *target-names-keep-dups* nil
+  "When true, TARGET-NAMES keeps repeats.  The duplicate-lexical check needs to SEE a repeat;
+everything else wants the set.")
+
 (defun target-names (tgt &optional acc)
   "All names bound by a binding target (name string or destructuring pattern)."
   (cond
-    ((stringp tgt) (pushnew tgt acc :test #'string=))
+    ((stringp tgt) (if *target-names-keep-dups*
+                       (cons tgt acc)
+                       (pushnew tgt acc :test #'string=)))
     ((null tgt) acc)                        ; array hole
     ((eq (car tgt) :apat)
      (dolist (e (second tgt) acc)
@@ -549,6 +555,52 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
                                   (member (second s) '("let" "const") :test #'string=)))
                  stmts))
 
+(defun lexical-names-with-dups (stmts)
+  "Every name a let/const/class/generator/async-function declaration binds DIRECTLY in STMTS,
+duplicates kept -- which is the point, since a repeat is an early error."
+  (let ((acc '()) (*target-names-keep-dups* t))
+    (dolist (d (lexical-decls stmts))
+      (dolist (decl (third d)) (setf acc (target-names (car decl) acc))))
+    (dolist (s stmts)
+      (when (and (consp s) (stringp (second s)))
+        (case (car s)
+          (:class (push (second s) acc))
+          ;; a generator or async function declaration is LEXICAL in a block, unlike a plain
+          ;; `function`, which Annex B var-hoists
+          ((:genfunc :asyncfunc :asyncgenfunc) (push (second s) acc)))))
+    (nreverse acc)))
+
+(defun check-duplicate-lexicals (stmts &optional (what "block"))
+  "LexicallyDeclaredNames must be unique, and must not collide with VarDeclaredNames.
+
+An early SyntaxError, and one shuttle did not raise at all: `{ let x = 1; let x = 2; }` was
+simply accepted, as was a let/var collision and two declarations of the same name across switch
+cases -- a switch's CaseBlock is ONE scope, which is what those tests are about."
+  (let ((lex (lexical-names-with-dups stmts))
+        (seen '()))
+    (dolist (n lex)
+      (when (member n seen :test #'string=)
+        (js-throw (make-native-error
+                   "SyntaxError" (format nil "Identifier '~a' has already been declared" n))))
+      (push n seen))
+    (when seen
+      ;; A plain `function` declaration in a block is lexical too, so it collides with a
+      ;; let/const/class of the same name -- but NOT with another plain function, which Annex B
+      ;; allows.  So it is checked against SEEN rather than added to it.
+      (dolist (st stmts)
+        (when (and (consp st) (eq (car st) :func) (stringp (second st))
+                   (member (second st) seen :test #'string=))
+          (js-throw (make-native-error
+                     "SyntaxError"
+                     (format nil "Identifier '~a' has already been declared" (second st))))))
+      (let ((vars (collect-var-names (list :block stmts))))
+        (dolist (n seen)
+          (when (member n vars :test #'string=)
+            (js-throw (make-native-error
+                       "SyntaxError"
+                       (format nil "Identifier '~a' has already been declared in this ~a"
+                               n what)))))))))
+
 (defun block-lexical-names (stmts)
   "All names bound by let/const/class declarations directly in STMTS."
   (let ((acc '()))
@@ -568,6 +620,7 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
    TDZ-hoist lexicals, hoist block-level function decls (lexically), and — for names
    with an Annex B var binding — sync that var binding at the decl's evaluation point.
    Then run statements, pop env."
+  (check-duplicate-lexicals stmts)
   (let ((lex (block-lexical-names stmts))
         (fns (block-lexical-fns stmts)))
     (if (and (null lex) (null fns))
@@ -590,11 +643,14 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
   "SwitchStatement: CaseBlockEvaluation with source-order clauses & fall-through.
    The whole CaseBlock is one lexical scope (let/const/fns shared across clauses)."
   (destructuring-bind (disc clauses) (cdr node)
+    ;; The CaseBlock is ONE lexical scope, so a duplicate across clauses is an early error.
+    (check-duplicate-lexicals (loop for c in clauses append (cdr c)) "switch")
     (let* ((dv (string (gensym "SW"))) (end (lbl))
            (labels (mapcar (lambda (c) (cons c (lbl))) clauses))
            (default-entry (find :default clauses :key #'car))
            (deflabel (if default-entry (cdr (assoc default-entry labels)) end))
-           ;; all statements across every clause body form ONE lexical scope
+           ;; all statements across every clause body form ONE lexical scope -- which is why a
+           ;; name declared in `case 1:` collides with the same name in `default:`
            (all-body (loop for c in clauses append (cdr c)))
            (lex (block-lexical-names all-body))
            (fns (block-lexical-fns all-body))

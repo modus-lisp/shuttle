@@ -51,6 +51,37 @@
              (not (and (eq (car nx) :punct)
                        (or (string= (cdr nx) "(") (string= (cdr nx) "."))))))))
 
+(defun parse-substatement (&optional allow-function)
+  "The body of an `if`, a loop, a `with`, or a labelled statement.
+
+The grammar there is Statement, which is NOT Declaration: `if (x) let y = 1`,
+`while (x) class C {}`, `if (x) async function f(){}` and `for(;;) function* g(){}` are all early
+SyntaxErrors.  A plain `function` declaration is the one Annex B exception, and only as the body
+of an `if` in sloppy code -- ALLOW-FUNCTION says whether this position is that one."
+  (let ((bad (cond
+               ((or (kw? "let") (kw? "const")) (and (let ((nx (aref *toks* (1+ *pos*))))
+                                                      ;; `let` is only a declaration when a
+                                                      ;; binding follows; `let` alone is an
+                                                      ;; ordinary identifier in sloppy code
+                                                      (or (eq (car nx) :ident)
+                                                          (and (eq (car nx) :punct)
+                                                               (member (cdr nx) '("[" "{")
+                                                                       :test #'string=))))
+                                                    (cur-val)))
+               ((kw? "class") "class")
+               ((async-function-follows-p) "async function")
+               ((and (kw? "function") (not allow-function)) "function")
+               ((and (kw? "function")
+                     (let ((nx (aref *toks* (1+ *pos*))))
+                       (and (eq (car nx) :punct) (string= (cdr nx) "*"))))
+                "generator")
+               (t nil))))
+    (when bad
+      (js-throw (make-native-error
+                 "SyntaxError"
+                 (format nil "~a declaration cannot appear in a single-statement context" bad)))))
+  (parse-stmt))
+
 (defun parse-stmt ()
   (cond
     ((%module-item-here-p)
@@ -66,8 +97,8 @@
     ((kw? "return") (adv) (let ((e (if (or (punct? ";") (punct? "}") (eq (cur-type) :eof)) *undefined-ast*
                                        (parse-expr 1)))) (opt ";") (list :return e)))
     ((kw? "if") (parse-if))
-    ((kw? "while") (adv) (eat "(") (let ((c (parse-expr 1))) (eat ")") (list :while c (parse-stmt))))
-    ((kw? "do") (adv) (let ((body (parse-stmt)))
+    ((kw? "while") (adv) (eat "(") (let ((c (parse-expr 1))) (eat ")") (list :while c (parse-substatement))))
+    ((kw? "do") (adv) (let ((body (parse-substatement)))
                         (unless (kw? "while") (js-throw (make-native-error "SyntaxError" "Expected 'while' after do-body")))
                         (adv) (eat "(") (let ((c (parse-expr 1))) (eat ")") (opt ";")
                           (list :do-while c body))))
@@ -75,13 +106,14 @@
     ((kw? "switch") (parse-switch))
     ((kw? "break") (adv) (let ((l (when (label-ident-follows-p) (prog1 (cur-val) (adv))))) (opt ";") (list :break l)))
     ((kw? "continue") (adv) (let ((l (when (label-ident-follows-p) (prog1 (cur-val) (adv))))) (opt ";") (list :continue l)))
-    ((kw? "with") (adv) (eat "(") (let ((obj (parse-expr 1))) (eat ")") (list :with obj (parse-stmt))))
+    ((kw? "with") (adv) (eat "(") (let ((obj (parse-expr 1))) (eat ")") (list :with obj (parse-substatement))))
     ((kw? "try") (parse-try))
     ((kw? "throw") (adv) (let ((e (parse-expr 1))) (opt ";") (list :throw e)))
     ((punct? ";") (adv) (list :empty))
     ((labeled-stmt-follows-p)
      (let ((name (cur-val))) (adv) (adv)          ; consume IDENT and ':'
-       (list :label name (parse-stmt))))
+       ;; a labelled FUNCTION declaration is Annex B legal in sloppy code
+       (list :label name (parse-substatement t))))
     (t (let ((e (parse-expr 1))) (opt ";") (list :expr e)))))
 
 (defparameter *reserved-labels*
@@ -108,7 +140,8 @@
 (defun parse-block () (eat "{") (let ((s '())) (loop until (punct? "}") do (push (parse-stmt) s)) (eat "}")
                         (list :block (nreverse s))))
 (defun parse-if () (adv) (eat "(") (let ((c (parse-expr 1))) (eat ")")
-                    (let ((then (parse-stmt)) (else (when (kw? "else") (adv) (parse-stmt))))
+                    ;; Annex B B.3.4: a plain `function` declaration is allowed as an if/else body
+    (let ((then (parse-substatement t)) (else (when (kw? "else") (adv) (parse-substatement t))))
                       (list :if c then else))))
 (defun parse-var-decl ()                 ; no trailing semicolon (for use in `for`)
   (let ((kind (cur-val))) (adv)
@@ -140,7 +173,7 @@
                       (let ((obj (parse-expr 1))) (eat ")")
                         (return-from parse-for-tail
                           (list (cond ((string= kind "in") :for-in) (await :for-await-of) (t :for-of))
-                                (list :var decl-kind (list (cons name nil))) obj (parse-stmt))))))
+                                (list :var decl-kind (list (cons name nil))) obj (parse-substatement))))))
                    (t (let ((decls (list (cons name (when (opt "=") (parse-expr 2))))))
                         (loop while (opt ",")
                               do (let ((n2 (parse-binding-target)))
@@ -155,12 +188,12 @@
                         (let ((obj (parse-expr 1))) (eat ")")
                           (return-from parse-for-tail
                             (list (cond ((string= kind "in") :for-in) (await :for-await-of) (t :for-of))
-                                  e obj (parse-stmt))))))
+                                  e obj (parse-substatement))))))
                      (t (setf init (list :expr e)))))))
     (eat ";")
     (let ((test (unless (punct? ";") (parse-expr 1)))) (eat ";")
       (let ((update (unless (punct? ")") (parse-expr 1)))) (eat ")")
-        (list :for init test update (parse-stmt))))))
+        (list :for init test update (parse-substatement))))))
 
 (defun parse-switch ()
   (adv) (eat "(") (let ((disc (parse-expr 1))) (eat ")") (eat "{")
