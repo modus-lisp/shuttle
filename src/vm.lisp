@@ -652,12 +652,16 @@ module not a script."
           (push (cons *current-realm* gp) *generator-proto-cache*)
           gp))))
 
-(defun instantiate-fn-env (code env this args fn)
+(defun instantiate-fn-env (code env this args fn &optional given-env)
   "Build the function environment for a split generator/async CODE and run its
    instantiation stream (param binding + hoisting) SYNCHRONOUSLY in the current
    thread. Returns the prepared environment. Errors here propagate to the CALLER."
-  (let ((fenv (new-env env)))
-    (env-declare fenv "arguments" (make-arguments-object args))
+  ;; GIVEN-ENV: a module body is an async function whose environment ALREADY EXISTS -- linking
+  ;; made it, and the module's exports are read out of it -- so it must run there rather than in
+  ;; a fresh child.  A module also has no `arguments`.
+  (let ((fenv (or given-env (new-env env))))
+    (unless given-env
+      (env-declare fenv "arguments" (make-arguments-object args)))
     (when (code-inst-instrs code)
       (%run (make-code :name (code-name code) :params (code-params code)
                        :instrs (code-inst-instrs code))
@@ -1300,11 +1304,11 @@ module not a script."
    driver as an await request; resumes with the settled value or throws rejection."
   (gen-yield (make-await-request :value value)))
 
-(defun make-async-function-object (code env this args fn)
+(defun make-async-function-object (code env this args fn &optional given-env)
   "Run an async function: create the coroutine, drive it, return the result Promise.
    Param binding runs synchronously; a throw there becomes a rejected promise (the
    make-js-function :async wrapper catches it)."
-  (let* ((fenv (instantiate-fn-env code env this args fn))
+  (let* ((fenv (instantiate-fn-env code env this args fn given-env))
          (gs (make-genstate))
          (result (make-promise))
          (realm *current-realm*))
@@ -1798,6 +1802,18 @@ module not a script."
                    (promise-fulfill p (%dynamic-import-now (to-string spec)))
                  (shuttle-error (e) (promise-reject-internal p (shuttle-error-value e))))
                (push! p)))
+            (:name-default
+             ;; `export default function(){}` names the function "default".  The binding is the
+             ;; synthetic *default*, so ordinary NamedEvaluation would call it that instead --
+             ;; a name no source text can produce and nothing expects.  Only an ANONYMOUS default
+             ;; ever lands in *default*: a named one binds its own name, so this is the spec's
+             ;; own distinction rather than a guess.
+             (multiple-value-bind (val bound) (env-get env "*default*")
+               (when (and bound (js-object-p val) (js-callable-p val))
+                 (let ((n (ignore-errors (js-get val "name"))))
+                   (when (or (not (stringp n)) (string= n "") (string= n "*default*"))
+                     (put val "name" "default"
+                          :enumerable nil :writable nil :configurable t))))))
             (:import-meta
              (let ((*current-module* (or (and fn-obj (getf (js-object-internal fn-obj) :module))
                                          *current-module*)))

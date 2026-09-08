@@ -91,6 +91,15 @@
    ;; gone by the time an async function's continuation runs -- so a deferred `import()` inside
    ;; `await` would find no host at all.  Whoever loaded this module is the right answer forever.
    (host :initarg :host :initform nil :reader mod-host)
+   ;; ---- top-level await.  A module with TLA does not finish when its body returns: its body
+   ;; IS a promise, and everything importing it has to wait.  These are the spec's slots for
+   ;; that, and the reason evaluation stops being a simple depth-first walk.
+   (has-tla :initform nil :accessor mod-has-tla)
+   (async-evaluation :initform nil :accessor mod-async-evaluation)  ; NIL or an ordinal
+   (top-level-capability :initform nil :accessor mod-top-capability)
+   (async-parents :initform nil :accessor mod-async-parents)
+   (pending-deps :initform 0 :accessor mod-pending-deps)
+   (cycle-root :initform nil :accessor mod-cycle-root)
    (meta :initform nil :accessor mod-meta)
    (deps :initform nil :accessor mod-deps)))           ; specifier -> module
 
@@ -113,6 +122,7 @@
           (let ((m (make-instance 'source-text-module
                                   :key key :realm *current-realm* :host host
                                   :record (parse-module src))))
+            (setf (mod-has-tla m) (module-has-tla-p (module-items (mod-record m))))
             (setf (gethash key (host-registry host)) m)
             m)))))
 
@@ -302,7 +312,12 @@ a name no source text can collide with."
                     (stringp (second node)))
                ;; a NAMED default is a declaration: it binds its own name too
                (push node out)
-               (push (list :var "const" (list (cons "*default*" node))) out))))
+               (progn
+                 (push (list :var "const" (list (cons "*default*" node))) out)
+                 ;; NamedEvaluation happens AT the declaration, not at the end of the module --
+                 ;; which matters because a module may import ITSELF and read the name before its
+                 ;; body finishes.  test262 does exactly that.
+                 (push (list :name-default) out)))))
         (t (push item out))))))
 
 ;;; ---- linking -------------------------------------------------------------------------------
@@ -399,7 +414,16 @@ without any of this changing."
          (*current-realm* (or (and *current-module* (mod-realm *current-module*)) *current-realm*))
          (m (resolve-imported-module *current-module* specifier)))
     (link-module m)
-    (evaluate-module m)
+    (let ((p (evaluate-module m)))
+      ;; Evaluation is a promise now, and with no I/O every await settles through the microtask
+      ;; queue -- so draining it is what "wait for the graph" means here.  A promise still pending
+      ;; afterwards is a module awaiting something nothing will ever resolve, and saying so is
+      ;; better than returning a namespace whose bindings were never initialised.
+      (drain-microtasks)
+      (case (promise-state p)
+        (:rejected (js-throw (promise-value p)))
+        (:pending (%mod-error "Error" "module ~a is still awaiting: nothing will settle it"
+                              (mod-key m)))))
     (namespace-object m)))
 
 (defun %import-meta-object ()
@@ -415,56 +439,159 @@ module, which is what a filesystem host can honestly say."
                 o)))))
 
 (defun %run-module-body (m)
+  "Run M's body.  Returns a PROMISE when M has top-level await, NIL otherwise.
+
+A TLA body is compiled and driven as an async function -- the same coroutine machinery any
+`async function` uses -- except that it runs in the MODULE's own environment rather than a fresh
+child, because linking already built that environment and the exports are read out of it."
   (let* ((rec (mod-record m))
          (stmts (module-body-statements rec))
          ;; MODULE CODE IS ALWAYS STRICT, with no directive to say so.  Compiling it sloppy is
          ;; not a small difference: a failed [[Set]] or [[Delete]] silently succeeds instead of
          ;; throwing, `this` at the top is wrong, and an assignment to an undeclared name quietly
          ;; creates a global.  Every one of those reads as a module bug and is not one.
-         (code (let ((*strict* t)) (compile-fn nil '() (list :block stmts) t)))
          (realm (or (mod-realm m) *current-realm*)))
-    (let ((*current-realm* realm) (*current-module* m))
-      (run code (mod-env m) *undefined*))))
+    (if (mod-has-tla m)
+        (let ((code (let ((*strict* t) (*in-async* t))
+                      (compile-fn-split nil '() (list :block stmts)))))
+          (let ((*current-realm* realm) (*current-module* m))
+            (make-async-function-object code (env-parent (mod-env m)) *undefined* '() nil
+                                        (mod-env m))))
+        (let ((code (let ((*strict* t)) (compile-fn nil '() (list :block stmts) t))))
+          (let ((*current-realm* realm) (*current-module* m))
+            (run code (mod-env m) *undefined*))
+          nil))))
+
+(defvar *async-eval-counter* 0
+  "Increasing ordinal for [[AsyncEvaluation]], which the spec uses to run ready ancestors in the
+order they became async rather than in whatever order they were gathered.")
+
+(defun %settle-top (m ok value)
+  (let ((cap (mod-top-capability m)))
+    (when cap
+      (if ok (promise-fulfill cap *undefined*) (promise-reject-internal cap value)))))
+
+(defun %execute-module (m)
+  "ExecuteModule for a SYNCHRONOUS module: run the body, let an error propagate."
+  (%run-module-body m))
+
+(defun %execute-async-module (m)
+  "ExecuteAsyncModule: start the body and hang the module's completion off its promise."
+  (let ((p (%run-module-body m)))
+    (if (promisep p)
+        (promise-then p
+                      (lambda (v) (declare (ignore v)) (%async-module-fulfilled m))
+                      (lambda (e) (%async-module-rejected m e)))
+        ;; a module marked HasTLA whose body somehow finished synchronously
+        (%async-module-fulfilled m))))
+
+(defun %gather-available-ancestors (m acc)
+  "Every async parent of M whose last outstanding dependency was M."
+  (dolist (parent (reverse (mod-async-parents m)) acc)
+    (unless (or (member parent acc)
+                (and (mod-cycle-root parent) (mod-errored-p (mod-cycle-root parent))))
+      (decf (mod-pending-deps parent))
+      (when (zerop (mod-pending-deps parent))
+        (push parent acc)
+        (unless (mod-has-tla parent)
+          (setf acc (%gather-available-ancestors parent acc))))))
+  acc)
+
+(defun %async-module-fulfilled (m)
+  (unless (eq (mod-status m) :evaluated)
+    (setf (mod-async-evaluation m) nil
+          (mod-status m) :evaluated)
+    (%settle-top m t nil)
+    ;; Ancestors that were only waiting on M can run now -- in the order they BECAME async,
+    ;; which is what the ordinal is for.
+    (let ((ready (sort (%gather-available-ancestors m '())
+                       #'< :key (lambda (x) (or (mod-async-evaluation x) 0)))))
+      (dolist (parent ready)
+        (cond
+          ((eq (mod-status parent) :evaluated))
+          ((mod-has-tla parent) (%execute-async-module parent))
+          (t (handler-case
+                 (progn (%execute-module parent)
+                        (setf (mod-async-evaluation parent) nil
+                              (mod-status parent) :evaluated)
+                        (%settle-top parent t nil))
+               (shuttle-error (e) (%async-module-rejected parent (shuttle-error-value e))))))))))
+
+(defun %async-module-rejected (m error)
+  (unless (eq (mod-status m) :evaluated)
+    (setf (mod-errored-p m) t
+          (mod-error-value m) error
+          (mod-status m) :evaluated)
+    (dolist (parent (mod-async-parents m)) (%async-module-rejected parent error))
+    (%settle-top m nil error)))
+
+(defun %inner-module-evaluation (m stack idx)
+  (when (member (mod-status m) '(:evaluating-async :evaluated))
+    (when (mod-errored-p m) (js-throw (mod-error-value m)))
+    (return-from %inner-module-evaluation idx))
+  (when (eq (mod-status m) :evaluating) (return-from %inner-module-evaluation idx))
+  (unless (eq (mod-status m) :linked)
+    (%mod-error "TypeError" "module ~a is not linked" (mod-key m)))
+  (setf (mod-status m) :evaluating
+        (mod-dfs-index m) idx
+        (mod-dfs-ancestor m) idx
+        (mod-pending-deps m) 0)
+  (incf idx)
+  (push m (car stack))
+  (dolist (spec (module-requests (mod-record m)))
+    (let ((dep (%mod-dep m spec)))
+      (setf idx (%inner-module-evaluation dep stack idx))
+      (if (eq (mod-status dep) :evaluating)
+          (setf (mod-dfs-ancestor m) (min (mod-dfs-ancestor m) (mod-dfs-ancestor dep)))
+          (let ((root (or (mod-cycle-root dep) dep)))
+            (when (mod-errored-p root) (js-throw (mod-error-value root)))
+            (setf dep root)))
+      ;; A dependency still evaluating asynchronously is one this module has to wait for.
+      (when (mod-async-evaluation dep)
+        (incf (mod-pending-deps m))
+        (pushnew m (mod-async-parents dep)))))
+  (cond
+    ((or (plusp (mod-pending-deps m)) (mod-has-tla m))
+     (setf (mod-async-evaluation m) (incf *async-eval-counter*))
+     (when (zerop (mod-pending-deps m)) (%execute-async-module m)))
+    (t (%execute-module m)))
+  ;; Close the strongly-connected component.
+  (when (= (mod-dfs-ancestor m) (mod-dfs-index m))
+    (loop for other = (pop (car stack))
+          do (setf (mod-status other) (if (mod-async-evaluation other) :evaluating-async :evaluated)
+                   (mod-cycle-root other) m)
+          until (eq other m)))
+  idx)
 
 (defun evaluate-module (m)
-  "Evaluate M and everything it depends on, dependencies first, each exactly once.
+  "Evaluate M and its dependencies.  Returns a PROMISE for the whole graph's completion.
 
-An error is REMEMBERED: a module that threw stays thrown, and asking for it again rethrows the
-same value rather than running its side effects a second time."
-  (let ((stack '()) (index 0))
-    (labels
-        ((inner (m idx)
-           (when (mod-errored-p m) (js-throw (mod-error-value m)))
-           (when (member (mod-status m) '(:evaluated :evaluating)) (return-from inner idx))
-           (unless (eq (mod-status m) :linked)
-             (%mod-error "TypeError" "module ~a is not linked" (mod-key m)))
-           (setf (mod-status m) :evaluating
-                 (mod-dfs-index m) idx
-                 (mod-dfs-ancestor m) idx)
-           (incf idx)
-           (push m stack)
-           (dolist (spec (module-requests (mod-record m)))
-             (let ((dep (%mod-dep m spec)))
-               (setf idx (inner dep idx))
-               (when (eq (mod-status dep) :evaluating)
-                 (setf (mod-dfs-ancestor m)
-                       (min (mod-dfs-ancestor m) (mod-dfs-ancestor dep))))))
-           (handler-bind
-               ((shuttle-error
-                  (lambda (e)
-                    ;; every module in the component is poisoned by the same error
-                    (loop for other in stack
-                          do (setf (mod-errored-p other) t
-                                   (mod-error-value other) (shuttle-error-value e)
-                                   (mod-status other) :evaluated)))))
-             (%run-module-body m))
-           (when (= (mod-dfs-ancestor m) (mod-dfs-index m))
-             (loop for other = (pop stack)
-                   do (setf (mod-status other) :evaluated)
-                   until (eq other m)))
-           idx))
-      (inner m index))
-    m))
+With top-level await this stops being a depth-first walk that returns when it is done: a module
+whose body awaits is left EVALUATING-ASYNC, its dependents are counted as pending against it, and
+they are run from the promise callback when it settles.  Errors propagate to every async parent,
+and a module that already threw stays thrown rather than running its side effects again."
+  (let* ((root (if (member (mod-status m) '(:evaluating-async :evaluated))
+                   (or (mod-cycle-root m) m)
+                   m)))
+    (when (and (not (eq root m)) (mod-top-capability root))
+      (return-from evaluate-module (mod-top-capability root)))
+    (when (mod-top-capability root)
+      (return-from evaluate-module (mod-top-capability root)))
+    (let ((cap (make-promise))
+          (stack (list '())))
+      (setf (mod-top-capability root) cap)
+      (handler-case
+          (progn
+            (%inner-module-evaluation root stack 0)
+            (unless (mod-async-evaluation root)
+              (promise-fulfill cap *undefined*)))
+        (shuttle-error (e)
+          (dolist (other (car stack))
+            (setf (mod-errored-p other) t
+                  (mod-error-value other) (shuttle-error-value e)
+                  (mod-status other) :evaluated))
+          (promise-reject-internal cap (shuttle-error-value e))))
+      cap)))
 
 ;;; ---- the consumer API ----------------------------------------------------------------------
 
@@ -491,5 +618,14 @@ test262's sibling _FIXTURE files and for anyone scripting locally."
                             (%mod-error "TypeError" "no module host is installed")))
          (m (resolve-imported-module nil key)))
     (link-module m)
-    (evaluate-module m)
+    (let ((p (evaluate-module m)))
+      ;; Evaluation is a promise now, and with no I/O every await settles through the microtask
+      ;; queue -- so draining it is what "wait for the graph" means here.  A promise still pending
+      ;; afterwards is a module awaiting something nothing will ever resolve, and saying so is
+      ;; better than returning a namespace whose bindings were never initialised.
+      (drain-microtasks)
+      (case (promise-state p)
+        (:rejected (js-throw (promise-value p)))
+        (:pending (%mod-error "Error" "module ~a is still awaiting: nothing will settle it"
+                              (mod-key m)))))
     (namespace-object m)))

@@ -181,12 +181,37 @@ span carries its item's trailing whitespace -- which is what makes deleting one 
 hole.  The token indices are what let the emitter slice `export ` off the front of a declaration
 without touching a byte of the declaration itself: the payload begins at (aref starts (1+ from))."
   (multiple-value-bind (toks escaped starts) (tokenize src)
-    (let ((*toks* toks) (*escaped-idents* escaped) (*pos* 0) (items '()) (spans '()))
+    ;; The Module goal symbol is [+Await]: `await` is a keyword at the top level of a module and
+    ;; is never an identifier there, whether or not the module actually uses top-level await.
+    (let ((*toks* toks) (*escaped-idents* escaped) (*pos* 0) (*in-async* t)
+          (items '()) (spans '()))
       (loop until (eq (cur-type) :eof)
             do (let ((from *pos*))
                  (push (parse-module-item) items)
                  (push (list (aref starts from) (aref starts *pos*) from *pos*) spans)))
       (values (nreverse items) (nreverse spans) starts))))
+
+(defun module-has-tla-p (items)
+  "Does a top-level AWAIT appear in ITEMS -- not counting the inside of a nested function, which
+has its own await and its own promise?  This is the spec's [[HasTLA]], and it decides whether the
+module evaluates synchronously or becomes an async body driven by a promise."
+  ;; CAR and CDR, not the list's elements.  A var declarator is a DOTTED pair -- (target . init)
+  ;; -- so `const x = await p` is ("x" :await ...) and the :await node is never an element of
+  ;; anything.  Walking it as a cons tree is the only shape-independent way to find one.
+  (labels ((walk (node)
+             (cond
+               ((not (consp node)) nil)
+               ;; a nested function or class is a different await context, with its own promise
+               ;; A nested FUNCTION is a different await context, with its own promise.  A CLASS
+               ;; is not: its heritage and its computed member keys are evaluated right here, so
+               ;; `class C extends fn(await x) {}` really is a top-level await.  Only the member
+               ;; BODIES are elsewhere, and those are :method-func, which stops below anyway.
+               ((member (car node) '(:func :genfunc :asyncfunc :asyncgenfunc
+                                     :arrow :async-arrow :method-func))
+                nil)
+               ((member (car node) '(:await :for-await-of)) t)
+               (t (or (walk (car node)) (walk (cdr node)))))))
+    (some #'walk items)))
 
 (defun span-start (sp) (first sp))
 (defun span-end (sp) (second sp))

@@ -646,6 +646,7 @@
     (:genfunc (compile-fn-decl-closure node) (em :declare-var (second node)))
     (:asyncfunc (compile-fn-decl-closure node) (em :declare-var (second node)))
     (:asyncgenfunc (compile-fn-decl-closure node) (em :declare-var (second node)))
+    (:name-default (em :name-default))   ; see module-runtime.lisp: NamedEvaluation for *default*
     (:class (compile-expr node) (em :init-let (second node)))   ; class decl: lexical binding
     (:private-field-init
      ;; this.#name = INIT ; add a fresh private field to `this`'s brand table
