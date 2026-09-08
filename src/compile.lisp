@@ -11,6 +11,11 @@
   (constructable t))      ; NIL for arrows and concise/accessor methods (new'ing them is a TypeError)
 
 (defvar *strict* nil)     ; compile-time: are we lexically inside strict code? (inherited by nested fns)
+;; Declared HERE, above every LET that binds it: a LET of an undeclared name is a LEXICAL binding,
+;; so a defvar further down the file would leave each binding invisible to the reader in
+;; COMPILE-EXPR -- which is exactly what happened, silently.
+(defvar *in-async-gen* nil
+  "True while compiling an ASYNC generator body, where `yield*` must await each step.")
 (defvar *in-function* nil) ; compile-time: inside a function body? (`new.target` early error outside one)
 (defvar *out*)
 (defvar *break-target* nil) (defvar *continue-target* nil)
@@ -619,10 +624,17 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
    binding created by the enclosing scope (fn/global var, block let, etc.), so
    `function f(){ f = 1; }` reassigns that outer binding rather than throwing."
   (ecase (car node)
-    (:func         (em :closure         (compile-fn (second node) (third node) (fourth node))))
-    (:genfunc      (em :genclosure      (compile-fn-split (second node) (third node) (fourth node))))
-    (:asyncfunc    (em :asyncclosure    (compile-fn-split (second node) (third node) (fourth node))))
-    (:asyncgenfunc (em :asyncgenclosure (compile-fn-split (second node) (third node) (fourth node))))))
+    ;; *IN-ASYNC-GEN* is rebound for EVERY nested function, not just the async-generator one: a
+    ;; plain generator written inside an async generator has its own, synchronous, yield*.
+    (:func         (let ((*in-async-gen* nil))
+                     (em :closure (compile-fn (second node) (third node) (fourth node)))))
+    (:genfunc      (let ((*in-async-gen* nil))
+                     (em :genclosure (compile-fn-split (second node) (third node) (fourth node)))))
+    (:asyncfunc    (let ((*in-async-gen* nil))
+                     (em :asyncclosure (compile-fn-split (second node) (third node) (fourth node)))))
+    (:asyncgenfunc (let ((*in-async-gen* t))
+                     (em :asyncgenclosure
+                         (compile-fn-split (second node) (third node) (fourth node)))))))
 
 (defun anonymous-fn-value-p (node)
   "T if NODE is an expression that produces an anonymous function/class (one with
@@ -941,21 +953,26 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
     ;; concise/accessor method: ordinary this-mode (sloppy substitution) but not constructable
     (:method-func (em :closure (compile-fn (second node) (third node) (fourth node) nil :normal nil)))
     (:genfunc (if (second node)
-                  (em :named-genclosure (compile-fn-split (second node) (third node) (fourth node)) (second node))
-                  (em :genclosure (compile-fn-split (second node) (third node) (fourth node)))))
-    (:asyncfunc (if (second node)
-                    (em :named-asyncclosure (compile-fn-split (second node) (third node) (fourth node)) (second node))
-                    (em :asyncclosure (compile-fn-split (second node) (third node) (fourth node)))))
-    (:asyncgenfunc (if (second node)
-                       (em :named-asyncgenclosure (compile-fn-split (second node) (third node) (fourth node)) (second node))
-                       (em :asyncgenclosure (compile-fn-split (second node) (third node) (fourth node)))))
+                  (let ((*in-async-gen* nil))
+                    (em :named-genclosure (compile-fn-split (second node) (third node) (fourth node)) (second node)))
+                  (let ((*in-async-gen* nil))
+                    (em :genclosure (compile-fn-split (second node) (third node) (fourth node))))))
+    (:asyncfunc (let ((*in-async-gen* nil))
+                  (if (second node)
+                      (em :named-asyncclosure (compile-fn-split (second node) (third node) (fourth node)) (second node))
+                      (em :asyncclosure (compile-fn-split (second node) (third node) (fourth node))))))
+    (:asyncgenfunc (let ((*in-async-gen* t))
+                     (if (second node)
+                         (em :named-asyncgenclosure (compile-fn-split (second node) (third node) (fourth node)) (second node))
+                         (em :asyncgenclosure (compile-fn-split (second node) (third node) (fourth node))))))
     (:arrow (em :closure (compile-fn nil (second node) (third node) nil :lexical nil)))
     (:async-arrow (em :asyncclosure (compile-fn-split nil (second node) (third node) :lexical)))
     (:await (compile-expr (second node)) (em :await))
     (:class (compile-class node))
     (:yield (if (second node) (compile-expr (second node)) (em :const *undefined*))
             (em :yield))
-    (:yield* (compile-expr (second node)) (em :yield-star))
+    (:yield* (compile-expr (second node))
+             (em (if *in-async-gen* :yield-star-async :yield-star)))
     (:super-member (compile-super-member node))
     (:super-call (compile-super-call (second node)))
     (:spread (compile-expr (second node)))   ; bare spread handled by call/array sites
@@ -1080,6 +1097,7 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
                               (mapcar #'field->stmt fields)))
          ;; default constructor bodies
          (body (cond
+                 (*ctor-field-stmts* nil)
                  (ctor (splice-field-inits user-body field-stmts derived))
                  (derived (list :block (append
                                         (list (list :expr (list :super-call (list (list :spread (list :ident "args"))))))
@@ -1108,12 +1126,25 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
     (declare (ignore static))
     (list :private-method-init (second key) kind fn)))
 
+(defvar *ctor-field-stmts* nil
+  "Field initializers awaiting a super() call.  In a DERIVED constructor they run when super()
+returns -- that is when `this` comes into existence -- so COMPILE-SUPER-CALL emits them right
+after the call rather than the body splicing them anywhere.")
+
 (defun splice-field-inits (user-body field-stmts derived)
-  "Insert field initializers: for a base ctor, at the top of the body; for a
-   derived ctor, immediately AFTER the super() call (approx: at top — simplest)."
-  (declare (ignore derived))
+  "Insert field initializers.
+
+A BASE constructor gets them at the top of its body: `this` exists from the start.
+
+A DERIVED constructor does not.  Its `this` is created by super(), and the fields initialize when
+super() RETURNS -- so they are handed to COMPILE-SUPER-CALL and emitted there, wherever the call
+happens to be.  Splicing them at the top instead (which is what this did) put `this.f = ...` before
+any `this` existed; it went unnoticed only because nothing checked, and the derived-constructor
+TDZ is what finally surfaced it."
   (let ((stmts (if (eq (car user-body) :block) (second user-body) (list user-body))))
-    (list :block (append field-stmts stmts))))
+    (if derived
+        (progn (setf *ctor-field-stmts* field-stmts) (list :block stmts))
+        (list :block (append field-stmts stmts)))))
 
 (defun array-has-special-p (elems)
   (some (lambda (e) (or (null e) (and (consp e) (eq (car e) :spread)))) elems))
@@ -1316,10 +1347,17 @@ what the read path already does with :SUPER-GET.  Value is expected on the stack
 
 (defun compile-super-call (args)
   "super(...): call the parent constructor with the current `this`, running its
-   [[Call]] to initialize the instance."
+   [[Call]] to initialize the instance -- then run the field initializers, which is exactly when
+   the spec says they run."
   (if (some (lambda (a) (and (consp a) (eq (car a) :spread))) args)
       (progn (compile-arg-array args) (em :super-call-spread))
-      (progn (mapc #'compile-expr args) (em :super-call (length args)))))
+      (progn (mapc #'compile-expr args) (em :super-call (length args))))
+  ;; The call left `this` on the stack as its value; statements are stack-neutral, so the
+  ;; initializers can run right here without disturbing it.
+  (let ((fields *ctor-field-stmts*))
+    (when fields
+      (setf *ctor-field-stmts* nil)          ; only the FIRST super() initializes
+      (mapc #'compile-stmt fields))))
 
 (defun compile-call (callee args)
   ;; Direct eval: a call whose callee is the *identifier* `eval` (not a member
@@ -1378,34 +1416,48 @@ what the read path already does with :SUPER-GET.  Value is expected on the stack
    Result on stack = final value of the reference."
   (let ((end (lbl))
         (jmpop (cond ((string= lop "&&") :and-jmp) ((string= lop "||") :or-jmp) (t :nullish-jmp))))
-    (ecase (car target)
+    (case (car target)
       (:ident
        (em :get-var (second target))        ; current value on stack
        (em jmpop end)                        ; keep it & skip if short-circuits
        (compile-expr value) (em :set-var (second target))
        (em :label end))
+      ;; NOTE on the stack: the short-circuit ops POP when they fall through and KEEP the value
+      ;; when they jump (see :and-jmp / :or-jmp / :nullish-jmp in the VM).  So the not-taken path
+      ;; starts empty and must NOT pop again -- an extra :pop here underflowed the stack, which
+      ;; is why `o.a ||= 5` died on every plain object while `z ||= 3` worked.
       (:member
        (let ((short (lbl)) (obj (string (gensym "O"))) (k (string (gensym "K"))))
          (compile-expr (second target)) (em :declare-var obj)   ; save obj
          (if (fourth target) (compile-expr (third target)) (em :const (second (third target))))
          (em :declare-var k)                                    ; save key
          (em :get-var obj) (em :get-var k) (em :get-prop)       ; old on stack
-         (em jmpop short)                                       ; short-circuit: keep old
-         (em :pop)                                              ; drop old, recompute for set
+         (em jmpop short)                                       ; short-circuits: old is the result
          (em :get-var obj) (em :get-var k) (compile-expr value) (em :set-prop)
          (em :jmp end)
          (em :label short)                                      ; old already on stack = result
+         (em :label end)))
+      (:super-member
+       ;; super.x <op>= v, with the key stashed so a computed one is evaluated once
+       (let ((short (lbl)) (k (string (gensym "SK"))))
+         (if (third target) (compile-expr (second target)) (em :const (second (second target))))
+         (em :declare-var k)
+         (em :get-var k) (em :super-get)                        ; old on stack
+         (em jmpop short)
+         (compile-expr value) (em :get-var k) (em :super-set)
+         (em :jmp end)
+         (em :label short)
          (em :label end)))
       (:private-member
        (let ((short (lbl)) (pn (resolve-private-name (third target))) (obj (string (gensym "PO"))))
          (compile-expr (second target)) (em :declare-var obj)
          (em :get-var obj) (em :private-get pn)                 ; old on stack
-         (em jmpop short)                                       ; short-circuit: keep old
-         (em :pop)
+         (em jmpop short)                                       ; short-circuits: old is the result
          (compile-expr value) (em :get-var obj) (em :swap) (em :private-set pn)
          (em :jmp end)
          (em :label short)
-         (em :label end))))))
+         (em :label end)))
+      (t (js-throw (make-native-error "SyntaxError" "Invalid left-hand side in assignment"))))))
 
 (defun assert-not-optional-target (target ctx)
   "Assignment / update targets may not be optional chains (early SyntaxError):

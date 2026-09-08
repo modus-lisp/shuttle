@@ -455,7 +455,16 @@ lack of."
       ((and *in-async* (kw? "await")) (adv) (list :await (parse-unary)))
       ((kw? "typeof") (adv) (list :unary "typeof" (parse-unary)))
       ((kw? "void") (adv) (list :unary "void" (parse-unary)))
-      ((kw? "delete") (adv) (list :delete (parse-unary)))
+      ((kw? "delete")
+       (adv)
+       (let ((operand (parse-unary)))
+         ;; `delete obj.#x` is an EARLY SyntaxError: a private name is not a deletable
+         ;; reference.  Parentheses do not help -- the parser drops them, so `delete (g().#m)`
+         ;; arrives here as the same node and is rejected the same way.
+         (when (and (consp operand) (eq (car operand) :private-member))
+           (js-throw (make-native-error
+                      "SyntaxError" "Private fields can not be deleted")))
+         (list :delete operand)))
       ((kw? "new")
        (adv)
        (if (punct? ".")                              ; new.target meta-property

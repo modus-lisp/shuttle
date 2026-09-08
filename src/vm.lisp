@@ -752,6 +752,27 @@ module not a script."
   (let ((o (make-object :proto (%obj-proto))))
     (put o "value" value) (put o "done" (js-bool done)) o))
 
+(defun yield-star-async-delegate (iterable)
+  "yield* ITERABLE inside an ASYNC generator.
+
+Two differences from the sync form, and both matter: the iterator comes from @@asyncIterator (or a
+sync one wrapped), and every step's result is a PROMISE that must be AWAITED before its done/value
+can be read.  Delegating with the sync driver read `done` off a pending promise -- always
+undefined, hence falsy, hence an inner async iterable produced nothing at all and never finished."
+  (let* ((it (get-async-iterator iterable))
+         (next (js-get it "next"))
+         (sent *undefined*))
+    (unless (js-callable-p next)
+      (js-throw (make-native-error "TypeError" "iterator.next is not a function")))
+    (loop
+      (let ((r (async-await (js-call next it (list sent)))))
+        (unless (js-object-p r)
+          (js-throw (make-native-error "TypeError" "iterator result is not an object")))
+        (when (js-truthy (js-get r "done"))
+          (return-from yield-star-async-delegate (async-await (js-get r "value"))))
+        ;; the yielded value is awaited too, so `yield* [Promise.resolve(1)]` yields 1
+        (setf sent (gen-yield (async-await (js-get r "value"))))))))
+
 (defun yield-star-delegate (iterable)
   "yield* ITERABLE: drive the inner iterator, yielding each produced value and
    forwarding .next(sent) to it; return the iterator's final value."
@@ -1781,6 +1802,11 @@ until the job queue empties, which is where a job ends.")
         (stack (make-array 64 :adjustable t :fill-pointer 0)) (completion *empty-completion*)
         (home (and fn-obj (fn-home fn-obj)))          ; [[HomeObject]] for super
         (super-ctor (and fn-obj (fn-super-ctor fn-obj)))
+        ;; A DERIVED constructor's `this` does not exist until super() makes it.  Reading it
+        ;; before, or calling super() a second time, is a ReferenceError -- the TDZ rule applied
+        ;; to `this` rather than to a name.  FN-SUPER-CTOR is set only on a class constructor
+        ;; that has a heritage, so this is exactly the derived-constructor case.
+        (this-init (not (and fn-obj (fn-super-ctor fn-obj))))
         (handlers '()))                      ; ((catch-pc . saved-sp) ...) for try/catch
     (macrolet ((push! (v) `(vector-push-extend ,v stack))
                (pop! () `(vector-pop stack))
@@ -1789,6 +1815,14 @@ until the job queue empties, which is where a job ends.")
        (handler-case
         (loop
         (when (>= pc (length instrs))
+          ;; A derived constructor that never called super() has no `this` to return, and an
+          ;; implicit return is `return this` -- so falling off the end without super() is the
+          ;; same ReferenceError as reading `this` would have been.
+          (when (and super-ctor (not this-init)
+                     (not (js-object-p (if (eq completion *empty-completion*) *undefined* completion))))
+            (js-throw (make-native-error
+                       "ReferenceError"
+                       "Must call super constructor before returning from derived constructor")))
           ;; Second value: the frame's FINAL `this`.  A derived constructor's `this` is bound by
           ;; super() and can differ from the object [[Construct]] pre-made -- when the base
           ;; constructor returns an object of its own.  Nothing but the constructor path reads it.
@@ -1829,7 +1863,12 @@ until the job queue empties, which is where a job ends.")
             (:tdz-declare (env-declare-lexical env (first a) *tdz*))
             (:init-let (env-declare-lexical env (first a) (pop!)))
             (:init-const (env-declare-const env (first a) (pop!)))
-            (:get-this (push! this))
+            (:get-this
+             (unless this-init
+               (js-throw (make-native-error
+                          "ReferenceError"
+                          "Must call super constructor before accessing 'this'")))
+             (push! this))
             (:dynamic-import
              ;; import() is a PROMISE, always -- including when the load fails, which is a
              ;; rejection rather than a throw.  The load itself is synchronous here because the
@@ -2058,6 +2097,7 @@ until the job queue empties, which is where a job ends.")
                (push! fn)))
             (:yield (push! (gen-yield (pop!))))
             (:yield-star (push! (yield-star-delegate (pop!))))
+            (:yield-star-async (push! (yield-star-async-delegate (pop!))))
             (:await (push! (async-await (pop!))))
             (:get-async-iterator (push! (get-async-iterator (pop!))))
             ;; ---- classes ----
@@ -2100,12 +2140,22 @@ until the job queue empties, which is where a job ends.")
                                    (push! this)            ; thisv
                                    (push! (if (js-object-p base) (js-get base k this) *undefined*)))))
             (:super-call (let ((args (nreverse (loop repeat (first a) collect (pop!)))))
+                           (when this-init
+                             (js-throw (make-native-error
+                                        "ReferenceError"
+                                        "Super constructor may only be called once")))
                            ;; super() BINDS this, so the frame's `this` is replaced, not just read
-                           (setf this (run-super-ctor super-ctor this args fn-obj))
+                           (setf this (run-super-ctor super-ctor this args fn-obj)
+                                 this-init t)
                            (push! this)))
             (:super-call-spread (let ((argsarr (pop!)))
+                                  (when this-init
+                                    (js-throw (make-native-error
+                                               "ReferenceError"
+                                               "Super constructor may only be called once")))
                                   (setf this (run-super-ctor super-ctor this
-                                                             (array-object-to-list argsarr) fn-obj))
+                                                             (array-object-to-list argsarr) fn-obj)
+                                        this-init t)
                                   (push! this)))
             (:array (push! (make-array-object (nreverse (loop repeat (first a) collect (pop!))))))
             (:object (push! (make-plain-object
@@ -2146,7 +2196,12 @@ until the job queue empties, which is where a job ends.")
             (:or-jmp (if (js-truthy (peek!)) (setf pc (first a)) (pop!)))
             (:nullish-jmp (let ((v (peek!)))    ; keep LHS if non-nullish, else eval RHS
                             (if (or (eq v *null*) (eq v *undefined*)) (pop!) (setf pc (first a)))))
-            (:ret (return-from %run (values (pop!) this)))
+            (:ret (let ((rv (pop!)))
+                    (when (and super-ctor (not this-init) (not (js-object-p rv)))
+                      (js-throw (make-native-error
+                                 "ReferenceError"
+                                 "Must call super constructor before returning from derived constructor")))
+                    (return-from %run (values rv this))))
             (:throw-op (js-throw (pop!)))
             (t (error "shuttle vm: bad op ~a" op)))))
         (shuttle-error (e)
