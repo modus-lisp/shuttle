@@ -182,6 +182,103 @@
               (progn (remhash val tbl) *true*)
               *false*)))
       (put wsp tostag "WeakSet" :enumerable nil :writable nil :configurable t)
-      (define-global realm "WeakSet" wsctor))))
+      (define-global realm "WeakSet" wsctor))
+
+    ;; =======================================================================
+    ;; WeakRef
+    ;; =======================================================================
+    ;;
+    ;; A REAL weak pointer, plus the spec's own liveness rule: once DEREF has handed a target out
+    ;; during a job, that target must stay reachable for the REST of the job -- otherwise two
+    ;; derefs in one turn could disagree, which the spec forbids.  The keep-alive list is cleared
+    ;; when the job queue drains, which is exactly where one job ends.
+    (let* ((wrp (make-object :proto op :class "WeakRef"))
+           (wrctor (native-function realm "WeakRef"
+                     (lambda (this args) (declare (ignore this args))
+                       (js-throw (make-native-error "TypeError"
+                                                    "Constructor WeakRef requires 'new'")))
+                     1)))
+      (setf (js-object-construct wrctor)
+            (lambda (args nt)
+              (let ((target (arg 0 args)))
+                (unless (can-be-held-weakly realm target)
+                  (js-throw (make-native-error
+                             "TypeError" "WeakRef target must be an object or unregistered symbol")))
+                (make-object :proto (weak-proto-from-newtarget realm nt wrp)
+                             :class "WeakRef"
+                             :internal (list :weakref-target (sb-ext:make-weak-pointer target))))))
+      (def-value wrctor "prototype" wrp :writable nil :configurable nil)
+      (def-value wrp "constructor" wrctor)
+      (def-method realm wrp "deref" 0 (this args)
+        (declare (ignore args))
+        (let ((wp (and (js-object-p this) (getf (js-object-internal this) :weakref-target))))
+          (unless wp
+            (js-throw (make-native-error "TypeError"
+                                         "WeakRef.prototype.deref called on incompatible receiver")))
+          (multiple-value-bind (val live) (sb-ext:weak-pointer-value wp)
+            (if live (progn (push val *weak-kept-alive*) val) *undefined*))))
+      (put wrp tostag "WeakRef" :enumerable nil :writable nil :configurable t)
+      (define-global realm "WeakRef" wrctor))
+
+    ;; =======================================================================
+    ;; FinalizationRegistry
+    ;; =======================================================================
+    ;;
+    ;; The bookkeeping is real; the cleanup callback is never invoked.  That is not a shortcut --
+    ;; the spec explicitly permits an implementation to never call cleanup callbacks at all, and
+    ;; an engine that fired them on SBCL's GC schedule would be making promises the language does
+    ;; not make.  register/unregister and their errors are the observable surface, and those are
+    ;; complete.
+    (let* ((frp (make-object :proto op :class "FinalizationRegistry"))
+           (frctor (native-function realm "FinalizationRegistry"
+                     (lambda (this args) (declare (ignore this args))
+                       (js-throw (make-native-error
+                                  "TypeError" "Constructor FinalizationRegistry requires 'new'")))
+                     1)))
+      (setf (js-object-construct frctor)
+            (lambda (args nt)
+              (let ((cb (arg 0 args)))
+                (unless (js-callable-p cb)
+                  (js-throw (make-native-error "TypeError"
+                                               "FinalizationRegistry cleanup must be callable")))
+                (make-object :proto (weak-proto-from-newtarget realm nt frp)
+                             :class "FinalizationRegistry"
+                             :internal (list :finreg-cells (list nil) :finreg-cleanup cb)))))
+      (def-value frctor "prototype" frp :writable nil :configurable nil)
+      (def-value frp "constructor" frctor)
+      (macrolet ((cells (o who)
+                   `(let ((c (and (js-object-p ,o) (getf (js-object-internal ,o) :finreg-cells))))
+                      (unless c
+                        (js-throw (make-native-error
+                                   "TypeError"
+                                   (format nil "~a called on incompatible receiver" ,who))))
+                      c)))
+        (def-method realm frp "register" 2 (this args)
+          (let ((c (cells this "FinalizationRegistry.prototype.register"))
+                (target (arg 0 args)) (held (arg 1 args)) (token (arg 2 args)))
+            (unless (can-be-held-weakly realm target)
+              (js-throw (make-native-error
+                         "TypeError" "target must be an object or unregistered symbol")))
+            (when (same-value target held)
+              (js-throw (make-native-error "TypeError" "target and holdings must not be the same")))
+            (unless (or (js-undefined-p token) (can-be-held-weakly realm token))
+              (js-throw (make-native-error
+                         "TypeError" "unregister token must be an object or unregistered symbol")))
+            (push (list (sb-ext:make-weak-pointer target) held
+                        (unless (js-undefined-p token) token))
+                  (car c))
+            *undefined*))
+        (def-method realm frp "unregister" 1 (this args)
+          (let ((c (cells this "FinalizationRegistry.prototype.unregister"))
+                (token (arg 0 args)))
+            (unless (can-be-held-weakly realm token)
+              (js-throw (make-native-error
+                         "TypeError" "unregister token must be an object or unregistered symbol")))
+            (let* ((before (length (car c)))
+                   (kept (remove-if (lambda (cell) (eq (third cell) token)) (car c))))
+              (setf (car c) kept)
+              (if (< (length kept) before) *true* *false*)))))
+      (put frp tostag "FinalizationRegistry" :enumerable nil :writable nil :configurable t)
+      (define-global realm "FinalizationRegistry" frctor))))
 
 (register-builtin-installer 'install-weak)

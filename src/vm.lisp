@@ -784,6 +784,11 @@ module not a script."
 (defvar *mtq* (cons nil nil)             ; (head . tail)
   "The job queue, shared by every thread in the image.")
 
+(defvar *weak-kept-alive* nil
+  "Targets a WeakRef handed out during the current job.  The spec requires that once deref has
+returned a target, it keeps returning it for the rest of that job -- so the value is held strongly
+until the job queue empties, which is where a job ends.")
+
 (defun enqueue-microtask (thunk)
   (let ((cell (cons thunk nil)))
     (if (car *mtq*)
@@ -793,6 +798,9 @@ module not a script."
 (defun drain-microtasks ()
   "Run queued microtasks to completion (each may enqueue more). Swallows JS
    throws from reactions (unhandled rejections have no observer here)."
+  ;; A job ends when the queue empties, and that is when a WeakRef's promise of consistency
+  ;; within a job expires.
+  (setf *weak-kept-alive* nil)
   (loop while (car *mtq*) do
     (let ((thunk (car (car *mtq*))))
       (setf (car *mtq*) (cdr (car *mtq*)))

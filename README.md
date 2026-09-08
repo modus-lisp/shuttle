@@ -13,16 +13,32 @@ html5lib pattern).
 
 ## Conformance
 
-**41,404 / 47,058 runnable test262 tests (88.0%)** — measured with
-`inspect/run262.sh` against a full checkout (modules and async-flagged tests are
-skipped; 6,346 total). Per area:
+**9,411 / 10,800 (87.1%) — nothing skipped.**
 
-| area | pass rate |
-|---|---|
-| `built-ins` | 94.8% |
-| `language`  | 90.3% |
-| `annexB`    | 89.4% |
-| `harness`   | 98.0% |
+Measured with `inspect/test262-slice.lisp` over a stratified sample: nine 1,200-test
+slices spread evenly across the deterministically-sorted 53,404-file corpus. A sample
+rather than a full sweep because a full sweep does not fit the machine this is
+developed on; the slices are fixed offsets, so the number is reproducible and moves
+only when the engine does.
+
+Read that number against the one it replaces. The previous headline was **41,404 /
+47,058 (88.0%)** with **6,346 tests skipped** — ES modules and everything flagged
+`async`. Against the whole corpus that was 77.5%. Those 6,346 now run:
+
+| | then | now |
+|---|---|---|
+| ES modules (`language/module-code`) | skipped | **570 / 599** |
+| `for await` (`for-await-of`) | skipped | **1,227 / 1,234** |
+| Promises | skipped | **626 / 729** |
+| async functions | skipped | **84 / 93** |
+| async generators | skipped | **517 / 623** |
+
+A skipped test is not a passing test, and a suite that hides its hardest sixth
+flatters itself. Unskipping those two categories found real bugs in both — the
+module work is its own story, and the async work found a microtask queue that was
+`let`-bound and therefore THREAD-LOCAL, so a job enqueued from inside a coroutine
+went onto a queue nobody drained. `await` worked; awaiting an async function that
+itself awaited never resumed.
 
 That includes the full **Temporal** proposal (~96% of its 4,603 tests),
 **Intl/ECMA-402** with an `en` locale (NumberFormat, DateTimeFormat, Collator,
@@ -31,15 +47,20 @@ DurationFormat, Locale), **BigInt** (a CL integer *is* a BigInt — exact bignum
 arithmetic for free), **UTF-16 code-unit strings** (astral scalars are surrogate
 pairs), a clean-room **RegExp** engine with `\p{…}` Unicode property escapes
 (via SBCL's `sb-unicode` tables), Proxy/Reflect, TypedArrays +
-resizable/SharedArrayBuffer + Atomics, generators and `async`/`await` (VM-frame
-suspension), Promises + a microtask queue, classes with private members, and
-the rest of the modern language. The longitudinal record is
-`inspect/test262-history.tsv` — every row a measured, committed state, from
-12.4% to 88.0%.
+resizable/SharedArrayBuffer + Atomics, WeakRef and FinalizationRegistry,
+generators and `async`/`await` (VM-frame suspension), Promises + a microtask
+queue, classes with private members, **ES modules** — link, evaluate, live
+bindings, cycles, namespaces, dynamic `import()`, `import.meta`, top-level await,
+import attributes and JSON modules — and the rest of the modern language.
+
+`inspect/module262.lisp` scores any one directory on its own, which is how the
+per-area numbers above were taken. The longitudinal record is
+`inspect/test262-history.tsv`.
 
 Known gaps: `intl402/Temporal` (needs real calendars + IANA time zones),
-multi-threaded Atomics (`$262.agent`), non-`en` locale data, ES modules, tail
-calls.
+multi-threaded Atomics (`$262.agent`), non-`en` locale data, tail calls, and the
+proposals this deliberately does not implement — `import-defer`,
+`source-phase-imports`, `import-text`, `import-bytes`, `uint8array-base64`.
 
 ## The seam (the reason it's built this way)
 
