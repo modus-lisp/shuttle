@@ -29,10 +29,6 @@
 
 ;;; ---- reading, and the JSON the engine parses for itself ------------------------------------
 
-(defun slurp-file (path)
-  (with-open-file (s path :external-format :utf-8)
-    (let ((b (make-string (file-length s)))) (subseq b 0 (read-sequence b s)))))
-
 (defvar *json-realm* nil)
 
 (defun parse-json-file (path)
@@ -61,26 +57,7 @@ package.json would be admitting it could not read JavaScript."
 ESM graph, and taking a CommonJS entry point would hand the parser a `module.exports` file that is
 not a module at all.")
 
-;;; ---- paths, joined the way the specifier means them ---------------------------------------
-;;;
-;;; CL:MERGE-PATHNAMES keeps "./" and "../" as literal directory components -- it produces
-;;; "/a/b/./c" and "/a/b/../c", which PROBE-FILE then does not find.  A module specifier is a
-;;; POSIX path, so it gets POSIX joining rather than pathname arithmetic.
-
-(defun %split-slash (s)
-  (loop with start = 0
-        for p = (position #\/ s :start start)
-        collect (subseq s start p)
-        while p do (setf start (1+ p))))
-
-(defun %norm-join (dir spec)
-  "Absolute DIR + relative SPEC -> a normalised absolute namestring."
-  (let ((segs '()))
-    (dolist (seg (append (%split-slash dir) (%split-slash spec)))
-      (cond ((or (string= seg "") (string= seg ".")))
-            ((string= seg "..") (when segs (pop segs)))
-            (t (push seg segs))))
-    (format nil "/~{~a~^/~}" (nreverse segs))))
+;;; ---- resolution, on top of core's %NORM-JOIN --------------------------------------------
 
 (defun %existing-file (path)
   (let ((p (probe-file path)))
@@ -466,6 +443,7 @@ each live local reads through; pass two copies the body, splicing at spans and a
                         ;; f(){}` instead makes a named function EXPRESSION, whose name is visible
                         ;; only inside its own body -- so a later call to f() in the same module
                         ;; fails.  noVNC's crc table is built by exactly that shape.
+                        ;; Same rule ANALYSE-MODULE applies: a named default is a declaration.
                         (let ((named (let ((n (second item)))
                                        (and (consp n)
                                             (member (car n) '(:func :genfunc :asyncfunc

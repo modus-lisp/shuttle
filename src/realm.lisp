@@ -52,17 +52,28 @@
   "Call a JS function from the host (event handlers, timers)."
   (let ((*current-realm* realm)) (with-js-floats (js-call fn this args))))
 
-(defun make-host-object (realm &key get set has delete own-keys call (proto :object))
+(defun make-host-object (realm &key get set has delete own-keys get-own-property
+                                 define-own-property get-proto set-proto is-extensible
+                                 prevent-extensions call (proto :object))
   "A JS object whose internal methods are CL closures — the binding primitive.
    weft backs document/element/style with these and hangs reflow on the SET trap.
    Trap signatures: get (o key receiver), set (o key v receiver), has (o key),
-   delete (o key), own-keys (o), call (this args)."
+   delete (o key), own-keys (o), get-own-property (o key), call (this args).
+   GET-OWN-PROPERTY returns a PROP descriptor or NIL, and is what Object.keys and
+   JSON.stringify consult -- an OWN-KEYS trap without it lists keys that then look
+   non-enumerable, so the object enumerates as empty."
   (let ((*current-realm* realm) (internal '()))
     (when get (setf (getf internal :get) get))
     (when set (setf (getf internal :set) set))
     (when has (setf (getf internal :has) has))
     (when delete (setf (getf internal :delete) delete))
     (when own-keys (setf (getf internal :own-keys) own-keys))
+    (when get-own-property (setf (getf internal :get-own-property) get-own-property))
+    (when define-own-property (setf (getf internal :define-own-property) define-own-property))
+    (when get-proto (setf (getf internal :get-proto) get-proto))
+    (when set-proto (setf (getf internal :set-proto) set-proto))
+    (when is-extensible (setf (getf internal :is-extensible) is-extensible))
+    (when prevent-extensions (setf (getf internal :prevent-extensions) prevent-extensions))
     (make-object :proto (if (eq proto :object) (%obj-proto) proto) :internal internal :call call)))
 
 

@@ -48,6 +48,27 @@
 ;;; A binding value of the TDZ sentinel means "declared but not yet initialized"
 ;;; (let/const temporal dead zone). CONSTS holds names that may not be reassigned.
 (defvar *tdz* '#:tdz)                    ; unique uninitialized marker
+(defvar *current-module* nil)            ; set in module-runtime.lisp; see :dynamic-import
+
+;;; ---- indirect bindings: what makes an imported name LIVE ---------------------------------
+;;;
+;;; `import { n } from './m.js'` does not copy n.  The importer's environment holds a pointer to
+;;; the exporter's binding, and ENV-GET dereferences it on every read -- so a reassignment over
+;;; there is visible over here, which is the whole difference between a module and a copy.
+;;; DEREF-INDIRECT lives in module-runtime.lisp; this is only the shape and the test.
+;;;
+;;; DEFSTRUCT rather than DEFCLASS because this sits on the variable-access path: every ENV-GET in
+;;; the system now type-tests the value it just fetched, and that test has to be cheap.
+
+(defstruct (indirect-binding (:conc-name ib-))
+  module        ; the SOURCE-TEXT-MODULE that owns the real binding
+  name)         ; its name over there, which need not be the name over here
+
+(defparameter *indirect-depth-limit* 64
+  "A re-export chain longer than this is a cycle the resolver failed to catch; refuse rather than
+recurse forever.")
+
+
 (defvar *empty-completion* '#:empty)     ; the [[value]]:empty completion sentinel (eval completion-value tracking)
 ;; global-obj: when non-nil, this env is THE global Environment Record. Its VARS
 ;; hash-table is the *declarative* record (holds only let/const/class + built-in
@@ -57,7 +78,8 @@
 ;; var-names: the global env's [[VarNames]] — names introduced by global `var`/
 ;; function declarations (distinct from arbitrary own properties of globalThis).
 ;; Used by GlobalDeclarationInstantiation's HasVarDeclaration / HasRestrictedGlobalProperty.
-(defstruct env vars parent consts with-obj block global-obj nfe (var-names (make-hash-table :test 'equal)))
+(defstruct env vars parent consts with-obj block global-obj nfe module
+  (var-names (make-hash-table :test 'equal)))
 (defun new-env (parent) (make-env :vars (make-hash-table :test 'equal) :parent parent))
 (defun new-global-env (obj) (make-env :vars (make-hash-table :test 'equal) :parent nil :global-obj obj))
 ;; --- global-object var-binding helpers (spec CreateGlobalVarBinding etc.) ---
@@ -122,7 +144,9 @@
         do (when (and (env-with-obj e) (with-binds-p (env-with-obj e) name))
              (return-from env-get (values (js-get (env-with-obj e) name) t)))
            ;; declarative record (let/const/class + built-in declarative bindings)
-           (multiple-value-bind (v p) (gethash name (env-vars e)) (when p (return-from env-get (values v t))))
+           (multiple-value-bind (v p) (gethash name (env-vars e))
+             (when p (return-from env-get
+                       (values (if (indirect-binding-p v) (deref-indirect v 0) v) t))))
            ;; global env: fall back to the global object (var/fn + host globals)
            (when (and (env-global-obj e) (global-var-defined-p (env-global-obj e) name))
              (return-from env-get (values (js-get (env-global-obj e) name) t))))
@@ -153,6 +177,10 @@
         do (when (and (env-with-obj e) (with-binds-p (env-with-obj e) name))
              (js-set (env-with-obj e) name val) (return-from env-set val))
            (when (nth-value 1 (gethash name (env-vars e)))
+             ;; An imported binding is immutable in the importing module: the exporter owns it.
+             (when (indirect-binding-p (gethash name (env-vars e)))
+               (js-throw (make-native-error
+                          "TypeError" (format nil "Assignment to constant variable."))))
              ;; Named-function-expression self-binding: an immutable binding. Strict
              ;; assignment -> TypeError; sloppy -> silent no-op (per SetMutableBinding).
              (when (and (env-nfe e) (member name (env-nfe e) :test #'string=))
@@ -197,7 +225,15 @@
 ;;; ---- GlobalDeclarationInstantiation (ECMA-262 §16.1.7) ----
 ;;; Find the global environment record on the env chain (env-root, if it's global).
 (defun global-env-of (env)
-  (let ((r (env-root env))) (and (env-global-obj r) r)))
+  "The global environment reachable from ENV -- or NIL if a MODULE environment is in the way.
+
+A module's outer environment IS the global one, so an unguarded walk to the root finds it and
+GlobalDeclarationInstantiation then puts the module's `var`s and function declarations onto
+globalThis.  Modules do not do that: their var scope is their own, which is most of what makes a
+module not a script."
+  (loop for e = env then (env-parent e) while e
+        do (when (env-module e) (return nil))
+           (when (env-global-obj e) (return e))))
 (defun genv-has-lexical (genv name)
   "HasLexicalDeclaration: NAME in the declarative record."
   (nth-value 1 (gethash name (env-vars genv))))
@@ -446,6 +482,12 @@
         ;; arrows (:lexical) have no [[NewTarget]] of their own — new.target inside an
         ;; arrow resolves to the enclosing function's, captured here at definition.
         (lexical-nt (and (eq (code-this-mode code) :lexical) *new-target*)))
+    ;; THE ACTIVE MODULE, captured at DEFINITION.  `import()` and `import.meta` inside a function
+    ;; must resolve against the module the function was written in -- and by the time an async
+    ;; continuation runs, every dynamic binding that knew is long unwound.  So the function
+    ;; carries it, which is what the spec means by "the active script or module".
+    (when *current-module*
+      (setf (getf (js-object-internal fn) :module) *current-module*))
     (put fn "length" (float (fn-declared-length (code-params code)) 1d0) :enumerable nil :writable nil)
     (put fn "name" (or (code-name code) "") :enumerable nil :writable nil :configurable t)
     (setf (js-object-call fn)
@@ -1745,6 +1787,21 @@
             (:init-let (env-declare-lexical env (first a) (pop!)))
             (:init-const (env-declare-const env (first a) (pop!)))
             (:get-this (push! this))
+            (:dynamic-import
+             ;; import() is a PROMISE, always -- including when the load fails, which is a
+             ;; rejection rather than a throw.  The load itself is synchronous here because the
+             ;; host loader is; a host that fetches would settle this promise later instead.
+             (let ((spec (pop!)) (p (make-promise))
+                   (*current-module* (or (and fn-obj (getf (js-object-internal fn-obj) :module))
+                                         *current-module*)))
+               (handler-case
+                   (promise-fulfill p (%dynamic-import-now (to-string spec)))
+                 (shuttle-error (e) (promise-reject-internal p (shuttle-error-value e))))
+               (push! p)))
+            (:import-meta
+             (let ((*current-module* (or (and fn-obj (getf (js-object-internal fn-obj) :module))
+                                         *current-module*)))
+               (push! (%import-meta-object))))
             (:new-target (push! *new-target*))
             (:set-fn-name                                 ; NamedEvaluation: name an anonymous fn/class after its binding
              (let ((v (peek!)) (name (first a)))

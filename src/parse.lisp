@@ -494,6 +494,10 @@
     (eat "]")
     (list :array (nreverse elems))))
 
+(defun %next-punct-p (v)
+  (let ((nx (aref *toks* (1+ *pos*))))
+    (and (eq (car nx) :punct) (string= (cdr nx) v))))
+
 (defun parse-primary ()
   (let ((tt (cur-type)) (tv (cur-val)))
     (cond
@@ -512,6 +516,22 @@
          ((punct? ".") (adv) (prog1 (list :super-member (list :str (cur-val)) nil) (adv)))
          ((punct? "[") (adv) (let ((k (parse-expr 1))) (eat "]") (list :super-member k t)))
          (t (js-throw (make-native-error "SyntaxError" "Unexpected 'super'")))))
+      ;; `import(...)` and `import.meta` are EXPRESSIONS.  Without these two arms `import` falls
+      ;; through to the identifier case and the program dies at runtime with "import is not
+      ;; defined" -- a name lookup for a keyword, which is how it read before modules existed.
+      ((and (kw? "import") (%next-punct-p "("))
+       (adv) (eat "(")
+       (let ((spec (parse-expr 2)))
+         (opt ",")                                  ; the import-attributes argument, accepted
+         (unless (punct? ")") (parse-expr 2))       ; ...and evaluated for effect, not honoured
+         (eat ")")
+         (list :dynamic-import spec)))
+      ((and (kw? "import") (%next-punct-p "."))
+       (adv) (adv)
+       (unless (kw? "meta")
+         (js-throw (make-native-error "SyntaxError" "Expected 'meta' after 'import.'")))
+       (adv)
+       (list :import-meta))
       ((kw? "function") (parse-function t))
       ((async-function-follows-p) (adv) (parse-function t t))   ; async function expression
       ((and (kw? "async") (async-arrow-follows-p)) (parse-async-arrow))

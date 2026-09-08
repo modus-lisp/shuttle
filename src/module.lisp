@@ -293,8 +293,20 @@ pattern's KEYFORMs, which name properties being read and not bindings being made
              (push (make-instance 'export-entry :export-name as :request spec :import-name :all)
                    exports)))
           (:export-default
-           (push (make-instance 'export-entry :export-name "default" :local-name "*default*")
-                 exports))
+           ;; `export default function f(){}` is a DECLARATION: it binds f in module scope, and f
+           ;; is the local name the export refers to.  Only an ANONYMOUS default needs the
+           ;; synthetic *default*, a name no source text can collide with.  Getting this wrong
+           ;; makes the export resolve to a binding nobody ever creates, which surfaces as
+           ;; "Cannot access '*default*' before initialization" -- from a module that plainly
+           ;; does define its default.
+           (let* ((node (second it))
+                  (named (and (consp node)
+                              (member (car node) '(:func :genfunc :asyncfunc :asyncgenfunc :class))
+                              (stringp (second node))
+                              (second node))))
+             (push (make-instance 'export-entry :export-name "default"
+                                                :local-name (or named "*default*"))
+                   exports)))
           (:export-decl
            (dolist (n (%declared-names (second it)))
              (push (make-instance 'export-entry :export-name n :local-name n) exports))))))

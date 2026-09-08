@@ -22,5 +22,8 @@
    #:module-record #:module-items #:module-requests #:module-imports #:module-exports
    #:module-source #:module-spans #:module-starts
    #:span-start #:span-end #:span-from #:span-to
+   ;; ES modules, runtime half: link, evaluate, namespaces
+   #:eval-module #:make-file-module-host #:module-host #:source-text-module
+   #:namespace-object #:link-module #:evaluate-module #:resolve-export #:*module-host*
    #:import-entry #:export-entry
    #:entry-request #:entry-import-name #:entry-local-name #:entry-export-name))

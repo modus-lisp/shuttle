@@ -58,7 +58,7 @@
 (defun run-test (path)
   "Score one test file: :pass / :fail / :skip (module/async/CanBlockIsFalse)."
   (let* ((src (slurp path)) (fm (frontmatter src)) (neg (fm-negative fm)))
-    (when (or (fm-flag fm "module") (fm-flag fm "async") (fm-flag fm "CanBlockIsFalse")) (return-from run-test :skip))
+    (when (or (fm-flag fm "async") (fm-flag fm "CanBlockIsFalse")) (return-from run-test :skip))
     (let ((*steps* 0) (*standard-output* (make-broadcast-stream)))
       (let ((outcome
               (handler-case
@@ -68,11 +68,20 @@
                         (install-262 realm)
                         (run-code *default-harness* realm)
                         (dolist (inc (fm-list fm "includes")) (run-code (include-code inc) realm)))
-                      ;; onlyStrict tests must run in strict mode — prepend the directive
-                      (let ((tsrc (if (fm-flag fm "onlyStrict")
-                                      (concatenate 'string "\"use strict\";" (string #\Newline) src)
-                                      src)))
-                        (run-code (compile-toplevel tsrc) realm))
+                      (if (fm-flag fm "module")
+                          ;; A MODULE TEST is loaded through the module pipeline, not compiled as
+                          ;; a script: its imports have to resolve to the sibling _FIXTURE files
+                          ;; the test ships with, so the host is rooted at the test's own
+                          ;; directory.  The harness above is still SCRIPT code in the same realm,
+                          ;; and a module environment's parent is the global one, so `assert` and
+                          ;; friends are visible from inside the module exactly as they should be.
+                          (eval-module realm (namestring (truename path))
+                                       :host (make-file-module-host))
+                          ;; onlyStrict tests must run in strict mode — prepend the directive
+                          (let ((tsrc (if (fm-flag fm "onlyStrict")
+                                          (concatenate 'string "\"use strict\";" (string #\Newline) src)
+                                          src)))
+                            (run-code (compile-toplevel tsrc) realm)))
                       :ok))
                 (sb-ext:timeout () :timeout)
                 (shuttle-error () :threw)

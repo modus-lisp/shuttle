@@ -863,6 +863,8 @@
     (:null (em :const *null*))
     (:undefined (em :const *undefined*))
     (:this (em :get-this))
+    (:dynamic-import (compile-expr (second node)) (em :dynamic-import))
+    (:import-meta (em :import-meta))
     (:new-target
      (unless *in-function*
        (js-throw (make-native-error "SyntaxError" "new.target expression is not allowed here")))
