@@ -501,7 +501,13 @@
 
 (defun %create-data-on-receiver (receiver k v)
   (if (js-object-p receiver)
-      (let ((ex (props-get receiver k)))
+      ;; JS-GET-OWN-PROPERTY, not PROPS-GET.  OrdinarySetWithOwnDescriptor consults the
+      ;; RECEIVER's [[GetOwnProperty]] internal method, and reading its raw property table
+      ;; instead skips every host object and Proxy -- so a trap that should have run, or
+      ;; thrown, silently does neither.  A module namespace is the sharp case: reading an
+      ;; export whose module has not evaluated must throw, and assigning through it was
+      ;; quietly succeeding.
+      (let ((ex (js-get-own-property receiver k)))
         (cond ((and ex (prop-accessor ex)) *false*)
               ((and ex (not (prop-writable ex))) *false*)
               (ex (setf (prop-value ex) v) *true*)

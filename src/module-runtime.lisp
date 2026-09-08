@@ -151,7 +151,25 @@ RESOLVE-SET is the spec's cycle guard: a re-export loop returns NIL rather than 
     ;; 1. a binding this module declares itself
     (dolist (e (module-exports rec))
       (when (and (entry-local-name e) (equal (entry-export-name e) export-name))
-        (return-from resolve-export (values m (entry-local-name e)))))
+        ;; ...unless that binding IS a namespace import.  `import * as foo from "./x.js";
+        ;; export { foo }` exports x's namespace, and it has to resolve THROUGH to x -- otherwise
+        ;; two modules doing exactly that, of the same x, look like two different bindings and a
+        ;; star-export of both is wrongly ambiguous.  It is the same namespace object either way.
+        (let ((via (find-if (lambda (ie) (equal (entry-local-name ie) (entry-local-name e)))
+                            (module-imports rec))))
+          (return-from resolve-export
+            (cond
+              ((null via) (values m (entry-local-name e)))
+              ;; `import * as foo from x; export { foo }` exports x's NAMESPACE...
+              ((eq (entry-import-name via) :namespace)
+               (values (%mod-dep m (entry-request via)) :namespace))
+              ;; ...and `import { foo } from x; export { foo }` exports x's BINDING.  Either way
+              ;; it has to resolve through, or two modules re-exporting the same thing this way
+              ;; look like two different bindings and a star-export of both is wrongly ambiguous.
+              (t (resolve-export (%mod-dep m (entry-request via))
+                                 (if (eq (entry-import-name via) :default)
+                                     "default" (entry-import-name via))
+                                 resolve-set)))))))
     ;; 2. `export {x} from`, and `export * as ns from` which resolves to a namespace
     (dolist (e (module-exports rec))
       (when (and (entry-request e) (equal (entry-export-name e) export-name))
@@ -201,9 +219,19 @@ giving undefined.  Symbol keys fall through to ordinary behaviour, which is how 
 be a real own property saying \"Module\"."
   (or (mod-namespace m)
       (let* ((realm (or (mod-realm m) *current-realm*))
-             (names (remove-if-not (lambda (n) (resolve-export m n)) (module-exported-names m)))
+             ;; An ambiguous name is OMITTED from the namespace -- `'both' in ns` is false --
+             ;; rather than present and throwing.  RESOLVE-EXPORT says :AMBIGUOUS, which is
+             ;; truthy, so testing it for truth alone would keep exactly the wrong ones.
+             (names (remove-if-not (lambda (n)
+                                     (let ((r (resolve-export m n)))
+                                       (and r (not (eq r :ambiguous)))))
+                                   (module-exported-names m)))
              (obj nil))
-        (flet ((exported-p (key) (and (stringp key) (member key names :test #'string=))))
+        ;; PROP-KEY first: `ns[0]` arrives as a number, and a module really can export the name
+        ;; "0" (export { x as "0" }), so comparing the raw key would miss it.
+        (flet ((exported-p (key)
+                 (let ((k (and (not (js-symbol-p key)) (prop-key key))))
+                   (and (stringp k) (member k names :test #'string=)))))
           (setf obj
                 (make-host-object
                  realm :proto *null*
@@ -216,7 +244,7 @@ be a real own property saying \"Module\"."
                  :prevent-extensions (lambda (o) (declare (ignore o)) t)
                  :get (lambda (o key &optional receiver)
                         (declare (ignore receiver))
-                        (if (exported-p key) (namespace-read m key) (ordinary-get o key)))
+                        (if (exported-p key) (namespace-read m (prop-key key)) (ordinary-get o key)))
                  :set (lambda (o key v &optional receiver)
                         (declare (ignore o key v receiver))
                         *false*)                       ; a namespace is never writable
@@ -235,7 +263,7 @@ be a real own property saying \"Module\"."
                  :get-own-property
                  (lambda (o key)
                    (if (exported-p key)
-                       (make-prop :value (namespace-read m key)
+                       (make-prop :value (namespace-read m (prop-key key))
                                   :writable t :enumerable t :configurable nil)
                        (and (js-symbol-p key) (props-get o (prop-key key)))))
                  ;; A define is allowed only if it asks for exactly what is already there.
@@ -249,7 +277,7 @@ be a real own property saying \"Module\"."
                      ((and (present-p desc :enumerable) (not (getf desc :enumerable))) nil)
                      ((and (present-p desc :writable) (not (getf desc :writable))) nil)
                      ((present-p desc :value)
-                      (same-value (getf desc :value) (namespace-read m key)))
+                      (same-value (getf desc :value) (namespace-read m (prop-key key))))
                      (t t)))
                  :own-keys (lambda (o)
                              ;; string exports first, sorted, then the symbol keys -- which is
@@ -261,6 +289,11 @@ be a real own property saying \"Module\"."
           (let ((tag (well-known-symbol "toStringTag")))
             (when tag
               (put obj tag "Module" :enumerable nil :writable nil :configurable nil)))
+          ;; The STRUCT SLOT too, not only the trap.  Ordinary [[DefineOwnProperty]] -- which the
+          ;; symbol keys above are handed to -- reads the slot, so with the trap alone a
+          ;; namespace would happily accept a brand-new symbol property while reporting itself
+          ;; as not extensible.  Set after @@toStringTag, which has to go on first.
+          (setf (js-object-extensible obj) nil)
           (setf (mod-namespace m) obj)))))
 
 (defun namespace-read (m name)
@@ -301,23 +334,35 @@ be a real own property saying \"Module\"."
 ones that also declare something.  `export default <expr>` becomes a const binding of *default*,
 a name no source text can collide with."
   (let ((out '()))
+    (when (some (lambda (it)
+                  (and (eq (car it) :export-default)
+                       (eq (third it) :hoistable)
+                       (not (stringp (second (second it))))))
+                (module-items rec))
+      ;; The hoisted anonymous default exists before the first statement, so its name is set
+      ;; there too -- code above the declaration can already call it and read .name.
+      (push (list :name-default) out))
     (dolist (item (module-items rec) (nreverse out))
       (case (car item)
         ((:import :export-named :export-star))          ; linking handled these
         (:export-decl (push (second item) out))
         (:export-default
-         (let ((node (second item)))
-           (if (and (consp node)
-                    (member (car node) '(:func :genfunc :asyncfunc :asyncgenfunc :class))
-                    (stringp (second node)))
-               ;; a NAMED default is a declaration: it binds its own name too
-               (push node out)
-               (progn
-                 (push (list :var "const" (list (cons "*default*" node))) out)
-                 ;; NamedEvaluation happens AT the declaration, not at the end of the module --
-                 ;; which matters because a module may import ITSELF and read the name before its
-                 ;; body finishes.  test262 does exactly that.
-                 (push (list :name-default) out)))))
+         (let ((node (second item)) (kind (third item)))
+           (cond
+             ;; a NAMED default is a declaration: it binds its own name too
+             ((and (member kind '(:hoistable :class)) (consp node) (stringp (second node)))
+              (push node out))
+             ;; An ANONYMOUS HoistableDeclaration is hoisted and callable above its own text,
+             ;; exactly like `function f(){}`.  Giving it the synthetic name makes the ordinary
+             ;; hoisting path do that for free.  A class and an expression are NOT hoisted and
+             ;; keep the const, which leaves them in TDZ until the line runs -- which is the
+             ;; difference test262 checks between `export default function(){}` and
+             ;; `export default (function(){})`.
+             ((eq kind :hoistable)
+              (push (list* (car node) "*default*" (cddr node)) out))
+             (t
+              (push (list :var "const" (list (cons "*default*" node))) out)
+              (push (list :name-default) out)))))
         (t (push item out))))))
 
 ;;; ---- linking -------------------------------------------------------------------------------
@@ -353,7 +398,12 @@ is where `export {nope} from './x.js'` becomes a SyntaxError rather than an unde
       (dolist (ie (module-imports rec))
         (let ((dep (%mod-dep m (entry-request ie))))
           (if (eq (entry-import-name ie) :namespace)
-              (setf (gethash (entry-local-name ie) (env-vars env)) (namespace-object dep))
+              ;; Immutable, like every import: `import * as ns` then `ns = null` is a TypeError.
+              ;; It holds the namespace object directly rather than an indirect binding, so the
+              ;; immutability has to be recorded separately.
+              (progn
+                (setf (gethash (entry-local-name ie) (env-vars env)) (namespace-object dep))
+                (pushnew (entry-local-name ie) (env-consts env) :test #'string=))
               (let ((want (if (eq (entry-import-name ie) :default) "default" (entry-import-name ie))))
                 (multiple-value-bind (tm tn) (resolve-export dep want)
                   (cond

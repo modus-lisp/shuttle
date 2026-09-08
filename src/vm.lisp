@@ -526,8 +526,11 @@ module not a script."
              (lambda (args new-target)
                (let* ((pp (js-get (or new-target fn) "prototype"))
                       (obj (make-object :proto (if (js-object-p pp) pp (%obj-proto)))))
-                 (let ((r (funcall (getf (js-object-internal fn) :ctor-run) obj args)))
-                   (if (js-object-p r) r obj)))))
+                 (multiple-value-bind (r final-this)
+                     (funcall (getf (js-object-internal fn) :ctor-run) obj args)
+                   (cond ((js-object-p r) r)               ; an explicit `return {}` wins
+                         ((js-object-p final-this) final-this)   ; else the this super() bound
+                         (t obj))))))
        ;; class ctors are not plain-callable: throw on [[Call]]
        (setf (js-object-call fn)
              (lambda (this args) (declare (ignore this args))
@@ -1512,7 +1515,11 @@ module not a script."
      ;; keeps the derived prototype chain the caller already installed).
      (let ((run-fn (getf (js-object-internal super-ctor) :ctor-run)))
        (cond
-         (run-fn (funcall run-fn this args) this)
+         ;; A base constructor that RETURNS AN OBJECT makes that object the derived `this` --
+         ;; the same rule [[Construct]] already applies for `new A()`.  Discarding it here left
+         ;; `this` as the pre-made instance, so a base returning something else was silently
+         ;; ignored in a subclass and only there.
+         (run-fn (let ((r (funcall run-fn this args))) (if (js-object-p r) r this)))
          ((js-object-construct super-ctor)
           (let ((r (funcall (js-object-construct super-ctor) args (or new-target super-ctor))))
             (if (js-object-p r)
@@ -1754,7 +1761,11 @@ module not a script."
        (handler-case
         (loop
         (when (>= pc (length instrs))
-          (return-from %run (if (eq completion *empty-completion*) *undefined* completion)))
+          ;; Second value: the frame's FINAL `this`.  A derived constructor's `this` is bound by
+          ;; super() and can differ from the object [[Construct]] pre-made -- when the base
+          ;; constructor returns an object of its own.  Nothing but the constructor path reads it.
+          (return-from %run (values (if (eq completion *empty-completion*) *undefined* completion)
+                                    this)))
         (when (>= (incf *steps*) *max-steps*) (error 'shuttle-timeout))
         (let* ((in (aref instrs pc)) (op (car in)) (a (cdr in)))
           (incf pc)
@@ -1808,10 +1819,17 @@ module not a script."
              ;; a name no source text can produce and nothing expects.  Only an ANONYMOUS default
              ;; ever lands in *default*: a named one binds its own name, so this is the spec's
              ;; own distinction rather than a guess.
-             (multiple-value-bind (val bound) (env-get env "*default*")
-               (when (and bound (js-object-p val) (js-callable-p val))
+             ;; A RAW lookup: this op can run before the binding is initialised (the hoisted
+             ;; case puts it first in the body), and ENV-GET would throw on the TDZ marker.
+             (let ((val (loop for e = env then (env-parent e) while e
+                              do (multiple-value-bind (v p) (gethash "*default*" (env-vars e))
+                                   (when p (return v))))))
+               (when (and val (not (eq val *tdz*)) (js-object-p val) (js-callable-p val))
                  (let ((n (ignore-errors (js-get val "name"))))
-                   (when (or (not (stringp n)) (string= n "") (string= n "*default*"))
+                   ;; ONLY over an empty name.  `export default class { static name() {} }`
+                   ;; defines its own -- the spec names the class before its static elements
+                   ;; run, so the method wins -- and a non-string here means exactly that.
+                   (when (and (stringp n) (or (string= n "") (string= n "*default*")))
                      (put val "name" "default"
                           :enumerable nil :writable nil :configurable t))))))
             (:import-meta
@@ -2036,14 +2054,31 @@ module not a script."
             (:super-get (let ((k (pop!)))
                           (let ((base (and (js-object-p home) (js-object-proto home))))
                             (push! (if (js-object-p base) (js-get base k this) *undefined*)))))
+            (:super-set
+             ;; value is UNDER the key on the stack and is left as the expression's result --
+             ;; assignment evaluates to the assigned value, not to whether [[Set]] succeeded.
+             (let* ((k (pop!)) (v (pop!))
+                    (base (and (js-object-p home) (js-object-proto home))))
+               (when (js-object-p base)
+                 (let ((ok (js-set base k v this)))
+                   (when (and strictp (not (js-truthy* ok)))
+                     (js-throw (make-native-error
+                                "TypeError"
+                                (format nil "Cannot assign to read-only property '~a' of super"
+                                        (if (js-symbol-p k) (to-symbol-string k) (to-string k))))))))
+               (push! v)))
             (:super-get-method (let ((k (pop!)))
                                  (let ((base (and (js-object-p home) (js-object-proto home))))
                                    (push! this)            ; thisv
                                    (push! (if (js-object-p base) (js-get base k this) *undefined*)))))
             (:super-call (let ((args (nreverse (loop repeat (first a) collect (pop!)))))
-                           (run-super-ctor super-ctor this args fn-obj) (push! this)))
+                           ;; super() BINDS this, so the frame's `this` is replaced, not just read
+                           (setf this (run-super-ctor super-ctor this args fn-obj))
+                           (push! this)))
             (:super-call-spread (let ((argsarr (pop!)))
-                                  (run-super-ctor super-ctor this (array-object-to-list argsarr) fn-obj) (push! this)))
+                                  (setf this (run-super-ctor super-ctor this
+                                                             (array-object-to-list argsarr) fn-obj))
+                                  (push! this)))
             (:array (push! (make-array-object (nreverse (loop repeat (first a) collect (pop!))))))
             (:object (push! (make-plain-object
                              (nreverse (loop repeat (first a) collect (let ((v (pop!)) (k (pop!))) (cons k v)))))))
@@ -2083,7 +2118,7 @@ module not a script."
             (:or-jmp (if (js-truthy (peek!)) (setf pc (first a)) (pop!)))
             (:nullish-jmp (let ((v (peek!)))    ; keep LHS if non-nullish, else eval RHS
                             (if (or (eq v *null*) (eq v *undefined*)) (pop!) (setf pc (first a)))))
-            (:ret (return-from %run (pop!)))
+            (:ret (return-from %run (values (pop!) this)))
             (:throw-op (js-throw (pop!)))
             (t (error "shuttle vm: bad op ~a" op)))))
         (shuttle-error (e)

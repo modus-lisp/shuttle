@@ -1287,6 +1287,14 @@
   (mapc #'compile-expr args) (em :call (length args)))
 
 ;;; ---- super ----
+(defun compile-super-set (node)
+  "super.x = v / super[k] = v.  The property is written on the home object's [[Prototype]] with
+the RECEIVER still `this` -- which is what makes a setter up the chain see the right object, and
+what the read path already does with :SUPER-GET.  Value is expected on the stack; it stays there."
+  (destructuring-bind (key computed) (cdr node)
+    (if computed (compile-expr key) (em :const (second key)))
+    (em :super-set)))
+
 (defun compile-super-member (node)
   "super.x / super[k]: read property from the home object's [[Prototype]], with
    this=current this. Leaves the value on the stack."
@@ -1409,6 +1417,11 @@
     (return-from compile-assign nil))
   (let ((base (and (> (length op) 1) (subseq op 0 (1- (length op))))))  ; "+=" -> "+"
     (ecase (car target)
+      (:super-member
+       (if base
+           (progn (compile-super-member target) (compile-expr value) (em :bin base))
+           (compile-expr value))
+       (compile-super-set target))
       (:ident (if base (progn (em :get-var (second target)) (compile-expr value) (em :bin base))
                   (compile-named-init value (second target)))   ; x = function(){} -> x.name = "x"
               (em :set-var (second target)))
@@ -1449,6 +1462,25 @@
        ;; stack: obj key ; VM op reads obj[key], applies +/-1, writes back,
        ;; and pushes the new (prefix) or old (postfix) numeric value.
        (em :update-prop (if (string= op "++") 1d0 -1d0) prefix))
+      (:super-member
+       ;; No dedicated VM op: read through :SUPER-GET, step, write back through :SUPER-SET.
+       ;; The key is recomputed rather than saved, which is correct for the non-computed form
+       ;; and evaluates a computed key twice -- so a computed one is stashed in a temp first.
+       (let ((delta (if (string= op "++") 1 -1))
+             (computed (third target))       ; node is (:super-member KEY COMPUTED)
+             (ktmp (string (gensym "SK"))))
+         (declare (ignore binop))
+         (if computed
+             (progn (compile-expr (second target)) (em :declare-var ktmp)
+                    (em :get-var ktmp) (em :super-get))
+             (progn (em :const (second (second target))) (em :super-get)))
+         (em :to-numeric)
+         (flet ((write-back ()
+                  (if computed (em :get-var ktmp) (em :const (second (second target))))
+                  (em :super-set) (em :pop)))
+           (if prefix
+               (progn (em :num-step delta) (em :dup) (write-back))
+               (progn (em :dup) (em :num-step delta) (write-back))))))
       (:private-member
        (let ((pn (resolve-private-name (third target))) (obj (string (gensym "PO")))
              (delta (if (string= op "++") 1 -1)))

@@ -147,12 +147,17 @@
     ;; Parsed in the EXPRESSION forms of function and class, because `export default function(){}`
     ;; is legally anonymous and the declaration forms are not.  A named one still carries its name
     ;; in the node, which is all a bundler needs to know it also binds that name locally.
+    ;; THREE different productions wear the same node shape once parsed, and only the parser can
+    ;; tell them apart -- `export default function(){}` is a HoistableDeclaration and is callable
+    ;; above its own text, while `export default (function(){})` is an AssignmentExpression and
+    ;; is in TDZ until the line runs.  After parsing, both are (:func NIL ...).  So the kind is
+    ;; recorded here rather than guessed at later.
     ((kw? "default")
      (adv)
-     (cond ((kw? "function") (list :export-default (parse-function t)))
-           ((async-function-follows-p) (adv) (list :export-default (parse-function t t)))
-           ((kw? "class") (list :export-default (parse-class t)))
-           (t (prog1 (list :export-default (parse-expr 1)) (opt ";")))))
+     (cond ((kw? "function") (list :export-default (parse-function t) :hoistable))
+           ((async-function-follows-p) (adv) (list :export-default (parse-function t t) :hoistable))
+           ((kw? "class") (list :export-default (parse-class t) :class))
+           (t (prog1 (list :export-default (parse-expr 1) :expression) (opt ";")))))
 
     ;; export <var|let|const|function|class|async function> ...
     (t (list :export-decl (parse-stmt)))))
@@ -325,7 +330,8 @@ pattern's KEYFORMs, which name properties being read and not bindings being made
            ;; "Cannot access '*default*' before initialization" -- from a module that plainly
            ;; does define its default.
            (let* ((node (second it))
-                  (named (and (consp node)
+                  (named (and (member (third it) '(:hoistable :class))
+                              (consp node)
                               (member (car node) '(:func :genfunc :asyncfunc :asyncgenfunc :class))
                               (stringp (second node))
                               (second node))))

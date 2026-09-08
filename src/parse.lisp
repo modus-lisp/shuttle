@@ -352,6 +352,13 @@
             (t (list :func name params body))))))))
 
 ;;; ---- expressions (Pratt) ----
+(defun update-target-p (node)
+  "Is NODE a valid target for ++ / -- ?  A destructuring pattern is NOT: `[a] = x` is an
+assignment, `[a]++` is nothing.  An invalid one is an EARLY ERROR -- a SyntaxError at parse time,
+which is what the assignment operators already do and what `0++` was crashing the compiler for
+lack of."
+  (and (consp node) (member (car node) '(:ident :member :private-member :super-member)) t))
+
 (defun assignable-target-p (node op)
   "Is NODE a valid AssignmentTarget for assignment operator OP?
    Simple (=): identifiers, member accesses, and (for plain =) destructuring
@@ -360,6 +367,7 @@
     (:ident t)
     (:member t)
     (:private-member t)
+    (:super-member t)                       ; `super.x = v` is a reference, and assignable
     ((:array :object) (string= op "="))     ; destructuring only for plain assignment
     (t nil)))
 
@@ -443,12 +451,25 @@
            (let* ((callee (parse-member (parse-primary) nil)) ; member, but NOT the call
                   (newexpr (list :new callee (if (punct? "(") (parse-args) '()))))
              (parse-member newexpr))))    ; trailing .m() / [k] / () after new
-      ((or (punct? "++") (punct? "--")) (let ((op tv)) (adv) (list :update op t (parse-unary))))
+      ((or (punct? "++") (punct? "--"))
+       (let ((op tv))
+         (adv)
+         (let ((tgt (parse-unary)))
+           (unless (update-target-p tgt)
+             (js-throw (make-native-error "SyntaxError"
+                                          "Invalid left-hand side expression in prefix operation")))
+           (list :update op t tgt))))
       (t (parse-postfix)))))
 
 (defun parse-postfix ()
   (let ((e (parse-member (parse-primary))))
-    (if (or (punct? "++") (punct? "--")) (prog1 (list :update (cur-val) nil e) (adv)) e)))
+    (if (or (punct? "++") (punct? "--"))
+        (progn
+          (unless (update-target-p e)
+            (js-throw (make-native-error "SyntaxError"
+                                         "Invalid left-hand side expression in postfix operation")))
+          (prog1 (list :update (cur-val) nil e) (adv)))
+        e)))
 
 (defun parse-member (e &optional (allow-call t))   ; . [] () ?. chains + tagged templates
   (loop
