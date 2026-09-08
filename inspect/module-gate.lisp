@@ -35,7 +35,9 @@
 (try "export destructure" "export const {a, b: [c]} = o;")
 (try "export function"    "export function f(){}")
 (try "export class"       "export class C {}")
-(try "export named"       "export {a, b as c};")
+;; the names have to EXIST: `export {a}` with no declaration of a is an early SyntaxError, which
+;; this fixture was quietly relying on not being checked.
+(try "export named"       "const a = 1, b = 2; export {a, b as c};")
 (try "export re-export"   "export {a as b} from \"m\";")
 (try "export star"        "export * from \"m\";")
 (try "export star as"     "export * as ns from \"m\";")

@@ -13,7 +13,8 @@ html5lib pattern).
 
 ## Conformance
 
-**9,411 / 10,800 (87.1%) — nothing skipped.**
+**9,217 / 10,800 (85.3%) — nothing skipped, and negative tests checked against the
+error they declare.**
 
 Measured with `inspect/test262-slice.lisp` over a stratified sample: nine 1,200-test
 slices spread evenly across the deterministically-sorted 53,404-file corpus. A sample
@@ -33,8 +34,16 @@ Read that number against the one it replaces. The previous headline was **41,404
 | async functions | skipped | **84 / 93** |
 | async generators | skipped | **517 / 623** |
 
-A skipped test is not a passing test, and a suite that hides its hardest sixth
-flatters itself. Unskipping those two categories found real bugs in both — the
+A negative test used to pass on ANY throw. It does not any more: it must throw the
+error `type:` it names, in the `phase:` it names. That correction alone removed
+about 360 passes from the sample — tests that wanted a `SyntaxError` and were
+being credited for an unrelated `TypeError`. Nearly 400 of them were dynamic-import
+syntax tests "passing" because `import()` threw *no module host is installed* at
+every single one. The number went down and became true; a suite scored on
+"something went wrong" is not measuring the engine.
+
+A skipped test is not a passing test either, and a suite that hides its hardest
+sixth flatters itself. Unskipping those two categories found real bugs in both — the
 module work is its own story, and the async work found a microtask queue that was
 `let`-bound and therefore THREAD-LOCAL, so a job enqueued from inside a coroutine
 went onto a queue nobody drained. `await` worked; awaiting an async function that

@@ -385,10 +385,59 @@ pattern's KEYFORMs, which name properties being read and not bindings being made
              (push (make-instance 'export-entry :export-name n :local-name n) exports))))))
     (values (nreverse requests) (nreverse imports) (nreverse exports) (nreverse attrs-of))))
 
+(defun %module-early-errors (items exports imports)
+  "The two early errors a Module has beyond ordinary syntax (spec 16.2.1.6.1):
+
+  * its exported NAMES must be unique -- `export {a}; export {a}` is a SyntaxError, not a
+    last-one-wins;
+  * every locally-exported name must actually be DECLARED somewhere in the module, so
+    `export { nope }` fails at parse rather than resolving to nothing at link time.
+
+Both are static, and the tables to check them are already built."
+  (let ((seen '()))
+    (dolist (e exports)
+      (let ((n (entry-export-name e)))
+        (when n
+          (when (member n seen :test #'string=)
+            (js-throw (make-native-error "SyntaxError"
+                                         (format nil "Duplicate export of '~a'" n))))
+          (push n seen)))))
+  (let ((declared (mapcar #'entry-local-name imports))
+        (stmts '()))
+    (dolist (it items)
+      (case (car it)
+        ((:import :export-named :export-star))
+        (:export-decl (push (second it) stmts))
+        (:export-default
+         ;; a named default declares its own name; an anonymous one declares *default*
+         (let ((n (second it)))
+           (push (if (and (consp n) (stringp (second n))) (second n) "*default*") declared)
+           (push "*default*" declared)))
+        (t (push it stmts))))
+    (setf stmts (nreverse stmts))
+    ;; COLLECT-VAR-NAMES reaches nested blocks, which matters: `{ var x } export {x}` is legal
+    ;; because a var is module-scoped wherever it is written.
+    (setf declared (append declared
+                           (ignore-errors (collect-var-names (list :block stmts)))
+                           (ignore-errors (block-lexical-names stmts))
+                           (loop for st in stmts
+                                 when (and (consp st)
+                                           (member (car st) '(:func :genfunc :asyncfunc
+                                                              :asyncgenfunc :class))
+                                           (stringp (second st)))
+                                   collect (second st))))
+    (dolist (e exports)
+      (let ((l (entry-local-name e)))
+        (when (and l (not (member l declared :test #'string=)))
+          (js-throw (make-native-error
+                     "SyntaxError"
+                     (format nil "Export '~a' is not defined in module" l))))))))
+
 (defun parse-module (src)
   "SRC -> a MODULE-RECORD.  Static only: nothing here evaluates, links or instantiates."
   (multiple-value-bind (items spans starts) (parse-module-items src)
     (multiple-value-bind (requests imports exports attrs-of) (analyse-module items)
+      (%module-early-errors items exports imports)
       (make-instance 'module-record :source src :items items :spans spans :starts starts
                                     :requests requests :imports imports :exports exports
                                     :request-attrs attrs-of))))

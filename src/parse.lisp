@@ -40,8 +40,24 @@
       (list :block (nreverse stmts)))))
 
 ;;; ---- statements ----
+;; `export`, and `import` in its DECLARATION form, are ModuleItems: they are legal only at the
+;; top level of a module, which PARSE-MODULE-ITEM handles before ever reaching here.  Anywhere
+;; else -- inside a function, inside a block, or in a script at all -- they are an early
+;; SyntaxError.  Without this, `() => { export default null; }` quietly parsed as something.
+(defun %module-item-here-p ()
+  (or (kw? "export")
+      (and (kw? "import")
+           (let ((nx (aref *toks* (1+ *pos*))))
+             (not (and (eq (car nx) :punct)
+                       (or (string= (cdr nx) "(") (string= (cdr nx) "."))))))))
+
 (defun parse-stmt ()
   (cond
+    ((%module-item-here-p)
+     (js-throw (make-native-error
+                "SyntaxError"
+                (format nil "'~a' declarations may only appear at the top level of a module"
+                        (cur-val)))))
     ((punct? "{") (parse-block))
     ((or (kw? "var") (kw? "let") (kw? "const")) (parse-var))
     ((kw? "function") (parse-function nil))
@@ -541,10 +557,16 @@ lack of."
       ;; through to the identifier case and the program dies at runtime with "import is not
       ;; defined" -- a name lookup for a keyword, which is how it read before modules existed.
       ((and (kw? "import") (%next-punct-p "("))
+       ;; import(specifier [, options] [,]) -- BOTH commas are optional, including the trailing
+       ;; one after the options argument, which is the shape most of the generated syntax tests
+       ;; use.  The options argument is parsed and evaluated for effect; this host honours no
+       ;; import attribute type, and says so at load rather than here.
        (adv) (eat "(")
        (let ((spec (parse-expr 2)))
-         (opt ",")                                  ; the import-attributes argument, accepted
-         (unless (punct? ")") (parse-expr 2))       ; ...and evaluated for effect, not honoured
+         (when (opt ",")
+           (unless (punct? ")")
+             (parse-expr 2)
+             (opt ",")))
          (eat ")")
          (list :dynamic-import spec)))
       ((and (kw? "import") (%next-punct-p "."))

@@ -54,8 +54,22 @@
         collect (subseq s start p)
         while p do (setf start (1+ p))))
 
+(defun %probe-native (path)
+  "PROBE-FILE on a POSIX path taken LITERALLY, never as a CL pathname pattern.
+
+A module specifier is arbitrary user text: `import(somePromise)` stringifies to \"[object
+Promise]\", and PROBE-FILE reads the brackets as a wild pathname and SIGNALS rather than
+answering NIL.  A host that crashes on a specifier it merely cannot resolve is worse than one
+that rejects it."
+  (ignore-errors (probe-file (sb-ext:parse-native-namestring path))))
+
 (defun %norm-join (dir spec)
-  "Absolute DIR + relative SPEC -> a normalised absolute namestring."
+  "DIR + SPEC -> a normalised absolute namestring.
+
+An ABSOLUTE spec ignores DIR, which is what a leading slash means everywhere else and what the
+file host needs when it is handed a full path as the entry key."
+  (when (and (plusp (length spec)) (char= (char spec 0) #\/))
+    (setf dir ""))
   (let ((segs '()))
     (dolist (seg (append (%split-slash dir) (%split-slash spec)))
       (cond ((or (string= seg "") (string= seg ".")))
@@ -127,7 +141,10 @@
   "HostResolveImportedModule: the same (referrer, specifier, attributes) must always give the same
 module.  ATTRIBUTES ARE PART OF IDENTITY -- the same file imported as JSON and as source is two
 different modules -- so the registry key carries the type."
-  (let* ((host (or (and referrer (mod-host referrer)) *module-host*
+  (let* ((host (or (and referrer (mod-host referrer))
+                   *module-host*
+                   (and (boundp '*current-realm*) *current-realm*
+                        (realm-module-host *current-realm*))
                    (%mod-error "TypeError" "no module host is installed")))
          (type (%attr attrs "type"))
          (key (funcall (host-resolve host) specifier (and referrer (mod-key referrer)))))
@@ -502,7 +519,10 @@ is where `export {nope} from './x.js'` becomes a SyntaxError rather than an unde
   "import(): resolve, link, evaluate, and hand back the namespace.  Synchronous because the host
 loader is; the VM wraps the result in a promise either way, so a fetching host can settle it late
 without any of this changing."
-  (let* ((*module-host* (or (and *current-module* (mod-host *current-module*)) *module-host*))
+  (let* ((*module-host* (or (and *current-module* (mod-host *current-module*))
+                            *module-host*
+                            (and (boundp '*current-realm*) *current-realm*
+                                 (realm-module-host *current-realm*))))
          (*current-realm* (or (and *current-module* (mod-realm *current-module*)) *current-realm*))
          (m (resolve-imported-module *current-module* specifier)))
     (link-module m)
@@ -700,15 +720,26 @@ test262's sibling _FIXTURE files and for anyone scripting locally."
                      (base (%norm-join dir specifier)))
                 (loop for ext in extensions
                       for cand = (concatenate 'string base ext)
-                      when (probe-file cand) return (namestring (truename cand)))))
-   :loader (lambda (key) (and (probe-file key) (slurp-file key)))))
+                      for hit = (%probe-native cand)
+                      when (and hit (pathname-name hit)) return (namestring hit))))
+   :loader (lambda (key)
+             (let ((p (%probe-native key)))
+               (and p (pathname-name p) (slurp-file p))))))
+
+(defun set-module-host (realm host)
+  "Give REALM a module host, so `import()` works from SCRIPT code too -- which has no module to
+inherit one from.  This is the seam an embedder installs: weft will answer over HTTP where
+MAKE-FILE-MODULE-HOST answers from disk."
+  (setf (realm-module-host realm) host))
 
 (defun eval-module (realm key &key host)
   "Load, link and evaluate the module named KEY.  Returns its namespace object."
   (let* ((*current-realm* realm)
-         (*module-host* (or host *module-host*
+         (*module-host* (or host (realm-module-host realm) *module-host*
                             (%mod-error "TypeError" "no module host is installed")))
-         (m (resolve-imported-module nil key)))
+         (m (progn (unless (realm-module-host realm)
+                     (setf (realm-module-host realm) *module-host*))
+                   (resolve-imported-module nil key))))
     (link-module m)
     (let ((p (evaluate-module m)))
       ;; Evaluation is a promise now, and with no I/O every await settles through the microtask

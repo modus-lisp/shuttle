@@ -60,7 +60,9 @@ not a module at all.")
 ;;; ---- resolution, on top of core's %NORM-JOIN --------------------------------------------
 
 (defun %existing-file (path)
-  (let ((p (probe-file path)))
+  ;; Native namestring: a specifier is arbitrary text and must not be read as a CL pathname
+  ;; pattern.  See %PROBE-NATIVE in module-runtime.lisp.
+  (let ((p (%probe-native path)))
     (and p (pathname-name p) p)))
 
 (defun resolve-relative (spec dir)

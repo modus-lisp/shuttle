@@ -8,6 +8,11 @@
   string-proto number-proto boolean-proto symbol-proto
   symbol-registry                       ; string -> js-symbol (Symbol.for/keyFor)
   intrinsics                            ; plist: keyword -> js object (constructors etc.)
+  ;; The MODULE HOST belongs to the realm, not to a dynamic binding.  A dynamic binding is
+  ;; thread-local, and a dynamic import() can be evaluated on a coroutine thread -- the same trap
+  ;; the microtask queue fell into.  It is also what lets `import()` work from a SCRIPT, which has
+  ;; no module to inherit a host from.
+  module-host
   global global-env)
 (defvar *current-realm*)
 (defun %obj-proto () (realm-object-proto *current-realm*))
