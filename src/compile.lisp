@@ -317,6 +317,7 @@ everything else wants the set.")
 
 (defun bind-target (tgt)
   "Bind the value on top of the stack to TGT (name or pattern). Consumes it."
+  (dolist (n (target-names tgt)) (check-strict-binding-name n))
   (cond
     ((stringp tgt) (em :declare-var tgt))
     ((null tgt) (em :pop))                  ; hole: discard
@@ -325,6 +326,24 @@ everything else wants the set.")
     (t (js-throw (make-native-error "SyntaxError" "bad binding target")))))
 
 ;;; ---- destructuring ASSIGNMENT (LHS is expression-form: :ident/:member/:array/:object) ----
+(defparameter *strict-reserved*
+  '("implements" "interface" "let" "package" "private" "protected" "public" "static" "yield")
+  "FutureReservedWord in strict code only.  None of these may be used as an identifier there --
+neither bound nor referenced -- and shuttle enforced none of them.")
+
+(defun check-strict-binding-name (name)
+  "In strict code `eval` and `arguments` may not be BOUND -- not by var/let/const, not by a
+destructuring pattern, not as a parameter -- and the strict FutureReservedWords may not be used
+at all.  Assignment was already checked; declaration was not."
+  (when (and *strict* (stringp name))
+    (when (member name '("eval" "arguments") :test #'string=)
+      (js-throw (make-native-error
+                 "SyntaxError" (format nil "Unexpected ~a in strict mode" name))))
+    (when (member name *strict-reserved* :test #'string=)
+      (js-throw (make-native-error
+                 "SyntaxError"
+                 (format nil "Unexpected strict mode reserved word '~a'" name))))))
+
 (defun check-strict-assign-target (tgt)
   "In STRICT code `eval` and `arguments` may not be assigned to, incremented, or compound-assigned
 -- an early SyntaxError, not a runtime one.  Sloppy code may do all of it."
@@ -369,6 +388,18 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
    Consumes the value."
   (case (car pat)
     (:array
+     ;; A REST ELEMENT MUST BE LAST, and there may be only one.  `[...a, b] = x` and
+     ;; `[...a,] = x` are early SyntaxErrors -- the BINDING form already rejected them
+     ;; (parse-array-pattern), but the assignment form is an array LITERAL reinterpreted here,
+     ;; where nothing was checking.
+     (let ((elems (second pat)))
+       (loop for rest on elems
+             for e = (car rest)
+             when (and (consp e) (eq (car e) :spread))
+               do (unless (null (cdr rest))
+                    (js-throw (make-native-error
+                               "SyntaxError"
+                               "Rest element must be last element")))))
      (let* ((it (string (gensym "IT"))) (done (string (gensym "DN"))) (elems (second pat))
             (has-rest (some (lambda (e) (and (consp e) (eq (car e) :spread))) elems)))
        (em :get-iterator) (em :declare-var it)
@@ -734,7 +765,9 @@ cases -- a switch's CaseBlock is ONE scope, which is what those tests are about.
     (:expr (compile-expr (second node)) (em :save-completion))
     (:var (let ((kind (second node)))
             (loop for (tgt . init) in (third node)
-                  do (if init (compile-named-init init (and (stringp tgt) tgt)) (em :const *undefined*))
+                  ;; a simple name never reaches BIND-TARGET, so the strict-name check goes here
+                  do (when (stringp tgt) (check-strict-binding-name tgt))
+                     (if init (compile-named-init init (and (stringp tgt) tgt)) (em :const *undefined*))
                      (cond
                        ((string= kind "const") (bind-lexical tgt :const))
                        ((string= kind "let")   (bind-lexical tgt :let))
@@ -902,12 +935,19 @@ cases -- a switch's CaseBlock is ONE scope, which is what those tests are about.
 
 (defun compile-for (node)
   (destructuring-bind (init test update body) (cdr node)
-    (let ((lexical (and init (eq (car init) :var)
-                        (member (second init) '("let" "const") :test #'string=))))
+    (let* ((lexical (and init (eq (car init) :var)
+                         (member (second init) '("let" "const") :test #'string=)))
+           ;; the per-iteration bindings: every name the head declares
+           (per-iter (when lexical
+                       (let ((acc '()))
+                         (dolist (d (third init) (nreverse acc))
+                           (setf acc (target-names (car d) acc)))))))
       (when lexical (em :push-env))
       (let ((*scope-depth* (if lexical (1+ *scope-depth*) *scope-depth*)))
         (let ((top (lbl)) (cont (lbl)) (end (lbl)))
           (when init (compile-stmt (if (eq (car init) :var) init (list :expr (second init)))))
+          ;; the spec copies once before the loop, then again after each body, before the update
+          (when per-iter (em :iter-env per-iter))
           (em :label top)
           (when test (compile-expr test) (em :jmp-if-false end))
           (let ((*break-target* end) (*continue-target* cont)
@@ -916,9 +956,15 @@ cases -- a switch's CaseBlock is ONE scope, which is what those tests are about.
                 (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
             (compile-stmt body))
           (em :label cont)
+          (when per-iter (em :iter-env per-iter))
           (when update (compile-expr update) (em :pop))
           (em :jmp top) (em :label end)))
       (when lexical (em :pop-env)))))
+
+(defvar *loop-head-lexical* nil
+  "True while compiling a for-in/for-of whose head declares let/const, so the body gets a FRESH
+environment per iteration -- the loop variable is a new binding each time round, which is what
+closures created in the loop capture.")
 
 (defun compile-scoped-loop (node inner)
   "Wrap a for-in/for-of in a block env when its head declares let/const."
@@ -927,9 +973,10 @@ cases -- a switch's CaseBlock is ONE scope, which is what those tests are about.
                        (member (second head) '("let" "const") :test #'string=))))
     (if lexical
         (progn (em :push-env)
-               (let ((*scope-depth* (1+ *scope-depth*))) (funcall inner node))
+               (let ((*scope-depth* (1+ *scope-depth*)) (*loop-head-lexical* t))
+                 (funcall inner node))
                (em :pop-env))
-        (funcall inner node))))
+        (let ((*loop-head-lexical* nil)) (funcall inner node)))))
 
 (defun for-head-assign (head)
   "Bind the value currently on top of the stack to the loop target (consumes it)."
@@ -952,13 +999,18 @@ cases -- a switch's CaseBlock is ONE scope, which is what those tests are about.
       (em :label top)
       (em :get-var idx) (em :get-var len) (em :bin "<") (em :jmp-if-false end)
       (em :get-var keys) (em :get-var idx) (em :get-prop)     ; the key string
-      (for-head-assign head)
-      (let ((*break-target* end) (*continue-target* cont)
-            (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
-            (*break-finallys* *pending-finallys*) (*continue-finallys* *pending-finallys*)
-            (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
-        (compile-stmt body))
-      (em :label cont)
+      ;; a lexical head is a NEW binding per iteration; the pop is at CONT so `continue` keeps it
+      (let ((outer *scope-depth*))
+        (when *loop-head-lexical* (em :push-env))
+        (let ((*scope-depth* (if *loop-head-lexical* (1+ outer) outer)))
+          (for-head-assign head)
+          (let ((*break-target* end) (*continue-target* cont)
+                (*break-depth* outer) (*continue-depth* *scope-depth*)
+                (*break-finallys* *pending-finallys*) (*continue-finallys* *pending-finallys*)
+                (*labels* (loop-label-entries end cont outer)) (*pending-labels* '()))
+            (compile-stmt body)))
+        (em :label cont)
+        (when *loop-head-lexical* (em :pop-env)))
       (em :get-var idx) (em :const 1d0) (em :bin "+") (em :set-var idx) (em :pop)
       (em :jmp top) (em :label end))))
 
@@ -971,13 +1023,18 @@ cases -- a switch's CaseBlock is ONE scope, which is what those tests are about.
       (em :get-var it) (em :iter-next) (em :declare-var res)     ; {value,done}
       (em :get-var res) (em :get-prop-c "done") (em :jmp-if-true end)
       (em :get-var res) (em :get-prop-c "value")
-      (for-head-assign head)
-      (let ((*break-target* end) (*continue-target* cont)
-            (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
-            (*break-finallys* *pending-finallys*) (*continue-finallys* *pending-finallys*)
-            (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
-        (compile-stmt body))
-      (em :label cont) (em :jmp top) (em :label end))))
+      (let ((outer *scope-depth*))
+        (when *loop-head-lexical* (em :push-env))
+        (let ((*scope-depth* (if *loop-head-lexical* (1+ outer) outer)))
+          (for-head-assign head)
+          (let ((*break-target* end) (*continue-target* cont)
+                (*break-depth* outer) (*continue-depth* *scope-depth*)
+                (*break-finallys* *pending-finallys*) (*continue-finallys* *pending-finallys*)
+                (*labels* (loop-label-entries end cont outer)) (*pending-labels* '()))
+            (compile-stmt body)))
+        (em :label cont)
+        (when *loop-head-lexical* (em :pop-env)))
+      (em :jmp top) (em :label end))))
 
 (defun compile-for-await-of (node)
   "for await (x of asyncIterable): drive the async iterator, awaiting each step's
@@ -1015,7 +1072,12 @@ cases -- a switch's CaseBlock is ONE scope, which is what those tests are about.
      (unless *in-function*
        (js-throw (make-native-error "SyntaxError" "new.target expression is not allowed here")))
      (em :new-target))
-    (:ident (em :get-var (second node)))
+    (:ident
+     (when (and *strict* (member (second node) *strict-reserved* :test #'string=))
+       (js-throw (make-native-error
+                  "SyntaxError"
+                  (format nil "Unexpected strict mode reserved word '~a'" (second node)))))
+     (em :get-var (second node)))
     (:bin (if (and (string= (second node) "in")
                    (consp (third node)) (eq (car (third node)) :private-ref))
               (progn (compile-expr (fourth node))              ; #x in obj

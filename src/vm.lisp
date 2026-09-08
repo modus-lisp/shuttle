@@ -1896,6 +1896,18 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
                (unless (env-var-scope-has env (first a)) (env-declare env (first a) v))))
             (:annexb-var-set (env-var-set env (first a) (peek!)))   ; B.3.3 sync var binding; leaves value
             (:push-env (setf env (new-block-env env)))
+            ;; CreatePerIterationEnvironment: a SIBLING of the loop's own scope -- parent is the
+            ;; environment outside the loop, not the one we are leaving -- carrying the loop
+            ;; variables' current values across.  A child would chain one deep per iteration.
+            ;; This is what makes `for (let i = 0; ...) f.push(() => i)` capture 0, 1, 2 instead
+            ;; of three closures all seeing the final value.
+            (:iter-env
+             (let ((new (new-block-env (env-parent env))))
+               (dolist (n (first a))
+                 (multiple-value-bind (val present) (gethash n (env-vars env))
+                   (when present (setf (gethash n (env-vars new)) val))))
+               (setf (env-consts new) (copy-list (env-consts env)))
+               (setf env new)))
             (:pop-env (setf env (env-parent env)))
             (:to-object (push! (to-object (pop!))))
             (:to-prop-key (push! (prop-key (pop!))))     ; ToPropertyKey (string or symbol)

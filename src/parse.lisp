@@ -247,7 +247,17 @@ of an `if` in sloppy code -- ALLOW-FUNCTION says whether this position is that o
   (cond
     ((punct? "[") (parse-array-pattern))
     ((punct? "{") (parse-object-pattern))
-    ((eq (cur-type) :ident) (check-escaped-ident) (prog1 (cur-val) (adv)))
+    ((eq (cur-type) :ident)
+     (check-escaped-ident)
+     ;; `yield` cannot be a binding name inside a generator, nor `await` inside an async
+     ;; function -- in those contexts they are keywords, and a declaration using one is an early
+     ;; SyntaxError rather than a variable that shadows the operator.
+     (when (or (and *in-generator* (string= (cur-val) "yield"))
+               (and *in-async* (string= (cur-val) "await")))
+       (js-throw (make-native-error
+                  "SyntaxError"
+                  (format nil "'~a' cannot be used as a binding name here" (cur-val)))))
+     (prog1 (cur-val) (adv)))
     (t (js-throw (make-native-error "SyntaxError" "Invalid binding target")))))
 
 ;;; ---- destructuring patterns ----
