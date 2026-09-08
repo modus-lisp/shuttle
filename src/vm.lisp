@@ -766,22 +766,37 @@ module not a script."
 ;;; their side effects. There is no real event loop / timers here.
 (defvar *symbol-to-string-tag* nil)   ; @@toStringTag (set at realm build if available)
 (defvar *symbol-async-iterator* nil)  ; @@asyncIterator
-(defvar *microtasks* nil)            ; a queue held as (head . tail) cons cells, or nil
-(defvar *microtask-tail* nil)
+;;; THE MICROTASK QUEUE IS ONE OBJECT, GLOBAL, AND NEVER REBOUND.
+;;;
+;;; It used to be two specials that RUN let-bound at depth 0.  A dynamic binding is THREAD-LOCAL,
+;;; and async functions and generators each run on their own coroutine thread -- which sees the
+;;; variable's GLOBAL value, not the main thread's binding.  So a microtask enqueued from inside a
+;;; coroutine went onto a queue nobody was draining.
+;;;
+;;; That is exactly what happens when one async function calls another: the inner call's driver
+;;; runs on the OUTER coroutine's thread, subscribes to the awaited promise from there, and the
+;;; resumption is queued into the void.  `await` a promise worked, two awaits in one function
+;;; worked, `.then` on a suspending async function worked -- and awaiting an async function that
+;;; itself awaits never resumed, which is most real async code.
+;;;
+;;; A queue CELL, mutated in place, is visible to every thread.  No lock is needed: the coroutine
+;;; handoff is a pair of semaphores, so the two threads never run at the same time.
+(defvar *mtq* (cons nil nil)             ; (head . tail)
+  "The job queue, shared by every thread in the image.")
 
 (defun enqueue-microtask (thunk)
   (let ((cell (cons thunk nil)))
-    (if *microtasks*
-        (setf (cdr *microtask-tail*) cell *microtask-tail* cell)
-        (setf *microtasks* cell *microtask-tail* cell))))
+    (if (car *mtq*)
+        (setf (cdr (cdr *mtq*)) cell (cdr *mtq*) cell)
+        (setf (car *mtq*) cell (cdr *mtq*) cell))))
 
 (defun drain-microtasks ()
   "Run queued microtasks to completion (each may enqueue more). Swallows JS
    throws from reactions (unhandled rejections have no observer here)."
-  (loop while *microtasks* do
-    (let ((thunk (car *microtasks*)))
-      (setf *microtasks* (cdr *microtasks*))
-      (unless *microtasks* (setf *microtask-tail* nil))
+  (loop while (car *mtq*) do
+    (let ((thunk (car (car *mtq*))))
+      (setf (car *mtq*) (cdr (car *mtq*)))
+      (unless (car *mtq*) (setf (cdr *mtq*) nil))
       (handler-case (funcall thunk)
         (shuttle-error () nil)
         (serious-condition () nil)))))
@@ -1741,7 +1756,7 @@ module not a script."
   (if (zerop *run-depth*)
       ;; outermost run of a script: run the body, then drain the microtask queue so
       ;; resolved-promise reactions (async .then) fire before the caller observes state.
-      (let ((*run-depth* 1) (*microtasks* nil) (*microtask-tail* nil))
+      (let ((*run-depth* 1))
         (multiple-value-prog1 (%run code env this call-args fn-obj)
           (drain-microtasks)))
       (%run code env this call-args fn-obj)))

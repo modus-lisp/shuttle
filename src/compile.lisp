@@ -307,8 +307,12 @@
 
 ;;; ---- destructuring ASSIGNMENT (LHS is expression-form: :ident/:member/:array/:object) ----
 (defun assign-to-target (tgt)
-  "Value on top of stack -> assign to expression-form TGT, consuming the value."
-  (ecase (car tgt)
+  "Value on top of stack -> assign to expression-form TGT, consuming the value.
+
+An unrecognised node here is not an internal error, it is a SOURCE error: `[[(x, y)]] = v` parses
+fine as an array literal and only becomes wrong when it is reinterpreted as a pattern, which is
+exactly what an early error is for.  ECASE turned that into an uncatchable Lisp condition."
+  (case (car tgt)
     (:ident (em :set-var (second tgt)) (em :pop))
     (:member
      ;; stack: val ; need obj key val -> set-prop -> pop
@@ -320,7 +324,8 @@
      ;; stack: val ; -> obj val -> private-set -> pop
      (compile-expr (second tgt)) (em :swap)
      (em :private-set (resolve-private-name (third tgt))) (em :pop))
-    ((:array :object) (compile-assign-pattern tgt))))
+    ((:array :object) (compile-assign-pattern tgt))
+    (t (js-throw (make-native-error "SyntaxError" "Invalid destructuring assignment target")))))
 
 (defun assign-elem-with-default (elem)
   "ELEM may be (:assign \"=\" TGT DEFAULT). Applies default if value is undefined,
@@ -334,7 +339,7 @@
 (defun compile-assign-pattern (pat)
   "Destructure the value on top of the stack into expression-form pattern PAT.
    Consumes the value."
-  (ecase (car pat)
+  (case (car pat)
     (:array
      (let* ((it (string (gensym "IT"))) (done (string (gensym "DN"))) (elems (second pat))
             (has-rest (some (lambda (e) (and (consp e) (eq (car e) :spread))) elems)))
@@ -368,7 +373,7 @@
        (em :declare-var src)
        (when dyn-excl (em :new-array) (em :declare-var excl))
        (dolist (pr (second pat))
-         (ecase (car pr)
+         (case (car pr)
            (:spread
             (em :get-var src)
             (if dyn-excl (progn (em :get-var excl) (em :swap) (em :object-rest-dyn))
@@ -393,7 +398,14 @@
               (if (fourth pr)                        ; shorthand-with-default {x = d}
                   (progn (apply-default (fourth pr) (and (consp val) (eq (car val) :ident) (second val)))
                          (assign-to-target val))
-                  (assign-elem-with-default val))))))))))
+                  (assign-elem-with-default val))))
+           ;; A getter, setter or method in a destructuring target -- `[{ get x(){} }] = v`
+           ;; -- is an early SyntaxError, not a shape the compiler should meet.
+           (t (js-throw (make-native-error
+                         "SyntaxError" "Invalid destructuring assignment target")))))))
+    ;; Same reason as ASSIGN-TO-TARGET: an unrecognised pattern node is a SOURCE error,
+    ;; and a silent NIL here would be worse than the crash it replaces.
+    (t (js-throw (make-native-error "SyntaxError" "Invalid destructuring assignment target")))))
 
 ;;; ---- Annex B B.3.3: block-scoped function declarations ----
 ;;; In sloppy mode a function declared in a block also creates a var-scoped binding
