@@ -545,9 +545,18 @@ module not a script."
              (lambda (args new-target)
                (let* ((pp (js-get (or new-target fn) "prototype"))
                       (obj (make-object :proto (if (js-object-p pp) pp (%obj-proto)))))
-                 (multiple-value-bind (r final-this)
+                 (multiple-value-bind (r final-this cell)
                      (funcall (getf (js-object-internal fn) :ctor-run) obj args)
+                   ;; A DERIVED constructor that finished without ever calling super() has no
+                   ;; `this` to give back, and an implicit return is `return this`.  Checked HERE
+                   ;; rather than at the RET, because a `return` inside a try whose finally calls
+                   ;; super() is legal and the call has not happened at the RET.
+                   (when (and cell (not (cdr cell)) (not (js-object-p r)))
+                     (js-throw (make-native-error
+                                "ReferenceError"
+                                "Must call super constructor before returning from derived constructor")))
                    (cond ((js-object-p r) r)               ; an explicit `return {}` wins
+                         ((and cell (js-object-p (car cell))) (car cell))
                          ((js-object-p final-this) final-this)   ; else the this super() bound
                          (t obj))))))
        ;; class ctors are not plain-callable: throw on [[Call]]
@@ -1832,7 +1841,9 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
       (%run code env this call-args fn-obj)))
 
 (defun %run (code env this &optional call-args fn-obj)
-  (let ((instrs (code-instrs code)) (pc 0)
+  ;; LET*, not LET: THIS-INIT is computed from THIS-CELL.  (Every other init form here refers
+  ;; only to the parameters, so sequencing changes nothing else.)
+  (let* ((instrs (code-instrs code)) (pc 0)
         (strictp (code-strict code))
         (call-args (coerce call-args 'vector))
         (stack (make-array 64 :adjustable t :fill-pointer 0)) (completion *empty-completion*)
@@ -1842,7 +1853,14 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
         ;; before, or calling super() a second time, is a ReferenceError -- the TDZ rule applied
         ;; to `this` rather than to a name.  FN-SUPER-CTOR is set only on a class constructor
         ;; that has a heritage, so this is exactly the derived-constructor case.
-        (this-init (not (and fn-obj (fn-super-ctor fn-obj))))
+        ;; THE THIS-CELL.  `this` in a derived constructor is created by super(), and an ARROW
+        ;; written in that constructor can be the thing that calls it -- `var f = () => super()`.
+        ;; The arrow runs in its own frame, so the state cannot be frame-local: constructor and
+        ;; arrow share one mutable cell (VALUE . INITIALIZED-P).  A non-derived function has no
+        ;; cell and `this` is simply always there.
+        (this-cell (or (and fn-obj (getf (js-object-internal fn-obj) :this-cell))
+                       (and fn-obj (fn-super-ctor fn-obj) (cons this nil))))
+        (this-init (if this-cell (cdr this-cell) t))
         (handlers '()))                      ; ((catch-pc . saved-sp) ...) for try/catch
     (macrolet ((push! (v) `(vector-push-extend ,v stack))
                (pop! () `(vector-pop stack))
@@ -1851,19 +1869,15 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
        (handler-case
         (loop
         (when (>= pc (length instrs))
-          ;; A derived constructor that never called super() has no `this` to return, and an
-          ;; implicit return is `return this` -- so falling off the end without super() is the
-          ;; same ReferenceError as reading `this` would have been.
-          (when (and super-ctor (not this-init)
-                     (not (js-object-p (if (eq completion *empty-completion*) *undefined* completion))))
-            (js-throw (make-native-error
-                       "ReferenceError"
-                       "Must call super constructor before returning from derived constructor")))
+          ;; Third value: the THIS-CELL, so [[Construct]] can decide whether super() was ever
+          ;; called.  The check cannot live here: `return` inside a try whose FINALLY calls
+          ;; super() is legal, and at the RET the call has not happened yet.  Only the caller
+          ;; sees the constructor actually finish.
           ;; Second value: the frame's FINAL `this`.  A derived constructor's `this` is bound by
           ;; super() and can differ from the object [[Construct]] pre-made -- when the base
           ;; constructor returns an object of its own.  Nothing but the constructor path reads it.
           (return-from %run (values (if (eq completion *empty-completion*) *undefined* completion)
-                                    this)))
+                                    this this-cell)))
         (when (>= (incf *steps*) *max-steps*) (error 'shuttle-timeout))
         (let* ((in (aref instrs pc)) (op (car in)) (a (cdr in)))
           (incf pc)
@@ -1900,6 +1914,7 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
             (:init-let (env-declare-lexical env (first a) (pop!)))
             (:init-const (env-declare-const env (first a) (pop!)))
             (:get-this
+             (when this-cell (setf this (car this-cell) this-init (cdr this-cell)))
              (unless this-init
                (js-throw (make-native-error
                           "ReferenceError"
@@ -2113,7 +2128,18 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
                            (push! (js-construct callee (array-object-to-list argsarr)))))
             ;; LEXICAL-THIS = the enclosing frame's `this`, captured so an arrow
             ;; (:lexical this-mode) resolves `this` to its definition site.
-            (:closure (push! (make-js-function (first a) env :lexical-this this)))
+            (:closure
+             ;; An ARROW inherits [[HomeObject]] from the function it is written in, the same way
+             ;; it inherits `this` -- so `super.x` inside an arrow inside a method resolves
+             ;; against the method's home.  Without it, super in an arrow silently read nothing.
+             (let ((fn (make-js-function (first a) env :lexical-this this)))
+               (when (eq (code-this-mode (first a)) :lexical)
+                 (when home (setf (fn-home fn) home))
+                 ;; so `() => super()` inside a derived constructor reaches the same `this`
+                 (when this-cell
+                   (setf (getf (js-object-internal fn) :this-cell) this-cell))
+                 (when super-ctor (setf (fn-super-ctor fn) super-ctor)))
+               (push! fn)))
             (:genclosure (push! (make-js-function (first a) env :kind :generator :lexical-this this)))
             (:asyncclosure (push! (make-js-function (first a) env :kind :async :lexical-this this)))
             (:asyncgenclosure (push! (make-js-function (first a) env :kind :async-generator :lexical-this this)))
@@ -2156,14 +2182,24 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
             (:class-static-field (let* ((v (pop!)) (k (pop!)) (ctor (peek!)))
                                    (js-define-own-property ctor (prop-key k)
                                      (list :value v :writable t :enumerable t :configurable t))))
-            (:super-get (let ((k (pop!)))
-                          (let ((base (and (js-object-p home) (js-object-proto home))))
-                            (push! (if (js-object-p base) (js-get base k this) *undefined*)))))
+            (:super-get (let* ((k (pop!))
+                               (base (and (js-object-p home) (js-object-proto home))))
+                          ;; The super base may be NULL -- `{__proto__: null, m(){ super.v }}` --
+                          ;; and reading a property of null is a TypeError, not undefined.
+                          (unless (js-object-p base)
+                            (js-throw (make-native-error
+                                       "TypeError"
+                                       (format nil "Cannot read properties of null (reading '~a')"
+                                               (if (js-symbol-p k) (to-symbol-string k) (to-string k))))))
+                          (push! (js-get base k this))))
             (:super-set
              ;; value is UNDER the key on the stack and is left as the expression's result --
              ;; assignment evaluates to the assigned value, not to whether [[Set]] succeeded.
              (let* ((k (pop!)) (v (pop!))
                     (base (and (js-object-p home) (js-object-proto home))))
+               (unless (js-object-p base)
+                 (js-throw (make-native-error
+                            "TypeError" "Cannot set properties of null")))
                (when (js-object-p base)
                  (let ((ok (js-set base k v this)))
                    (when (and strictp (not (js-truthy* ok)))
@@ -2172,28 +2208,43 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
                                 (format nil "Cannot assign to read-only property '~a' of super"
                                         (if (js-symbol-p k) (to-symbol-string k) (to-string k))))))))
                (push! v)))
-            (:super-get-method (let ((k (pop!)))
-                                 (let ((base (and (js-object-p home) (js-object-proto home))))
-                                   (push! this)            ; thisv
-                                   (push! (if (js-object-p base) (js-get base k this) *undefined*)))))
+            (:super-get-method (let* ((k (pop!))
+                                      (base (and (js-object-p home) (js-object-proto home))))
+                                 (unless (js-object-p base)
+                                   (js-throw (make-native-error
+                                              "TypeError"
+                                              (format nil "Cannot read properties of null (reading '~a')"
+                                                      (if (js-symbol-p k) (to-symbol-string k) (to-string k))))))
+                                 (push! this)            ; thisv
+                                 (push! (js-get base k this))))
             (:super-call (let ((args (nreverse (loop repeat (first a) collect (pop!)))))
+                           (when this-cell (setf this-init (cdr this-cell)))
                            (when this-init
                              (js-throw (make-native-error
                                         "ReferenceError"
                                         "Super constructor may only be called once")))
                            ;; super() BINDS this, so the frame's `this` is replaced, not just read
-                           (setf this (run-super-ctor super-ctor this args fn-obj)
+                           (setf this (run-super-ctor (or super-ctor
+                                                          (and fn-obj (fn-super-ctor fn-obj)))
+                                                      (if this-cell (car this-cell) this)
+                                                      args fn-obj)
                                  this-init t)
+                           (when this-cell (setf (car this-cell) this (cdr this-cell) t))
                            (push! this)))
-            (:super-call-spread (let ((argsarr (pop!)))
-                                  (when this-init
-                                    (js-throw (make-native-error
-                                               "ReferenceError"
-                                               "Super constructor may only be called once")))
-                                  (setf this (run-super-ctor super-ctor this
-                                                             (array-object-to-list argsarr) fn-obj)
-                                        this-init t)
-                                  (push! this)))
+            ;; Same as :SUPER-CALL, cell and all -- and it must be, because the DEFAULT derived
+            ;; constructor is `constructor(...args){ super(...args) }`, which is the spread form.
+            (:super-call-spread
+             (let ((argsarr (pop!)))
+               (when this-cell (setf this-init (cdr this-cell)))
+               (when this-init
+                 (js-throw (make-native-error
+                            "ReferenceError" "Super constructor may only be called once")))
+               (setf this (run-super-ctor (or super-ctor (and fn-obj (fn-super-ctor fn-obj)))
+                                          (if this-cell (car this-cell) this)
+                                          (array-object-to-list argsarr) fn-obj)
+                     this-init t)
+               (when this-cell (setf (car this-cell) this (cdr this-cell) t))
+               (push! this)))
             (:array (push! (make-array-object (nreverse (loop repeat (first a) collect (pop!))))))
             (:object (push! (make-plain-object
                              (nreverse (loop repeat (first a) collect (let ((v (pop!)) (k (pop!))) (cons k v)))))))
@@ -2203,10 +2254,21 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
             (:def-prop (let ((v (pop!)) (k (pop!)))     ; obj key val -> obj
                          (js-define-own-property (peek!) (prop-key k)
                            (list :value v :writable t :enumerable t :configurable t))))
+            ;; A METHOD DEFINITION in an object literal -- shorthand method, getter or setter --
+            ;; has a [[HomeObject]]: the object.  That is what makes `super.x` work inside it, and
+            ;; without it `super` in an object method resolved against nothing at all.  A plain
+            ;; `m: function(){}` property is NOT a method definition and gets none, which is why
+            ;; only :DEF-METHOD sets it and :DEF-PROP does not.
+            (:def-method (let ((fn (pop!)) (k (pop!)))   ; obj key fn -> obj
+                           (when (js-object-p fn) (setf (fn-home fn) (peek!)))
+                           (js-define-own-property (peek!) (prop-key k)
+                             (list :value fn :writable t :enumerable t :configurable t))))
             (:def-getter (let ((fn (pop!)) (k (pop!)))  ; obj key fn -> obj
+                           (when (js-object-p fn) (setf (fn-home fn) (peek!)))
                            (js-define-own-property (peek!) (prop-key k)
                              (list :get fn :accessor t :enumerable t :configurable t))))
             (:def-setter (let ((fn (pop!)) (k (pop!)))
+                           (when (js-object-p fn) (setf (fn-home fn) (peek!)))
                            (js-define-own-property (peek!) (prop-key k)
                              (list :set fn :accessor t :enumerable t :configurable t))))
             (:set-proto (let ((pv (pop!)))              ; obj protoval -> obj
@@ -2233,12 +2295,7 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
             (:or-jmp (if (js-truthy (peek!)) (setf pc (first a)) (pop!)))
             (:nullish-jmp (let ((v (peek!)))    ; keep LHS if non-nullish, else eval RHS
                             (if (or (eq v *null*) (eq v *undefined*)) (pop!) (setf pc (first a)))))
-            (:ret (let ((rv (pop!)))
-                    (when (and super-ctor (not this-init) (not (js-object-p rv)))
-                      (js-throw (make-native-error
-                                 "ReferenceError"
-                                 "Must call super constructor before returning from derived constructor")))
-                    (return-from %run (values rv this))))
+            (:ret (return-from %run (values (pop!) this this-cell)))
             (:throw-op (js-throw (pop!)))
             (t (error "shuttle vm: bad op ~a" op)))))
         (shuttle-error (e)

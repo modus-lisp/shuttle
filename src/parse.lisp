@@ -742,17 +742,17 @@ lack of."
          (adv)
          (let ((agen (opt "*")))
            (let ((key (parse-property-key)))
-             (push (list :init key (parse-method-tail (key-name key) (if agen :async-gen :async))) props))))
+             (push (list :method-prop key (parse-method-tail (key-name key) (if agen :async-gen :async))) props))))
         ;; generator method: *key(...){...}
         ((punct? "*")
          (adv) (let ((key (parse-property-key)))
-                 (push (list :init key (parse-method-tail (key-name key) t)) props)))
+                 (push (list :method-prop key (parse-method-tail (key-name key) t)) props)))
         (t
          (let ((key (parse-property-key)))
            (cond
              ;; method: key(...){...}
              ((punct? "(")
-              (push (list :init key (parse-method-tail (key-name key))) props))
+              (push (list :method-prop key (parse-method-tail (key-name key))) props))
              ;; key: value  (literal __proto__: v sets the prototype, per B.3.1)
              ((punct? ":")
               (adv)

@@ -16,6 +16,10 @@
 ;; COMPILE-EXPR -- which is exactly what happened, silently.
 (defvar *in-async-gen* nil
   "True while compiling an ASYNC generator body, where `yield*` must await each step.")
+(defvar *pending-finallys* nil
+  "Finally blocks (innermost first) that an abrupt exit from here must run on its way out.
+`return` inside a try compiles its finallys before the RET; without this the block was simply
+skipped, and `try { return 'a' } finally { return 'b' }` answered 'a'.")
 (defvar *in-function* nil) ; compile-time: inside a function body? (`new.target` early error outside one)
 (defvar *out*)
 (defvar *break-target* nil) (defvar *continue-target* nil)
@@ -24,6 +28,10 @@
 (defvar *scope-depth* 0)                 ; current lexical block-env nesting within the fn
 (defvar *annexb-fn-names* '())           ; block-fn names getting an Annex B B.3.3 var binding
 (defvar *break-depth* 0) (defvar *continue-depth* 0)  ; scope depth at the loop/switch target
+;; The pending-finally list AS IT WAS at the loop/switch target.  Breaking or continuing out of a
+;; try must run the finallys entered since -- the same rule `return` follows, measured against a
+;; nearer boundary.
+(defvar *break-finallys* nil) (defvar *continue-finallys* nil)
 (defun em (op &rest args) (push (cons op args) *out*))
 (defun lbl () (gensym "L"))
 (defun pop-envs (count) (dotimes (_ count) (em :pop-env)))
@@ -690,7 +698,16 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
      (destructuring-bind (name kind fn) (cdr node)
        (em :get-this) (em :const (resolve-private-name name))
        (compile-expr fn) (em :private-method-add kind)))
-    (:return (compile-expr (second node)) (em :ret))
+    (:return
+     ;; The value is computed FIRST, then every pending finally runs, then the return happens --
+     ;; which is the spec's order and the reason `try { return f() } finally { g() }` calls f
+     ;; before g.  A finally that returns wins, and it does so naturally: its own :RET fires
+     ;; while compiling it here, before this one is ever reached.
+     (compile-expr (second node))
+     (let ((fins *pending-finallys*))
+       (let ((*pending-finallys* nil))       ; a finally does not re-run itself
+         (dolist (f fins) (compile-finally-block f))))
+     (em :ret))
     (:throw (compile-expr (second node)) (em :throw-op))
     (:if (let ((l1 (lbl)) (l2 (lbl)))
            (em :comp-clear)
@@ -703,6 +720,7 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
               (em :label top) (compile-expr (second node)) (em :jmp-if-false end)
               (let ((*break-target* end) (*continue-target* top)
                     (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+            (*break-finallys* *pending-finallys*) (*continue-finallys* *pending-finallys*)
                     (*labels* (loop-label-entries end top *scope-depth*)) (*pending-labels* '()))
                 (compile-stmt (third node)))
               (em :jmp top) (em :label end) (em :comp-default-undef)))
@@ -711,6 +729,7 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
                  (em :label top)
                  (let ((*break-target* end) (*continue-target* cont)
                        (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+            (*break-finallys* *pending-finallys*) (*continue-finallys* *pending-finallys*)
                        (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
                    (compile-stmt (third node)))
                  (em :label cont) (compile-expr (second node)) (em :jmp-if-true top)
@@ -724,16 +743,22 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
               (if lbl
                   (let ((entry (assoc lbl *labels* :test #'string=)))
                     (unless entry (js-throw (make-native-error "SyntaxError" (format nil "Undefined label '~a'" lbl))))
+                    (run-exit-finallys *break-finallys*)
                     (pop-envs (- *scope-depth* (fourth entry))) (em :jmp (second entry)))
-                  (if *break-target* (progn (pop-envs (- *scope-depth* *break-depth*)) (em :jmp *break-target*))
+                  (if *break-target*
+                      (progn (run-exit-finallys *break-finallys*)
+                             (pop-envs (- *scope-depth* *break-depth*)) (em :jmp *break-target*))
                       (js-throw (make-native-error "SyntaxError" "illegal break"))))))
     (:continue (let ((lbl (second node)))
                  (if lbl
                      (let ((entry (assoc lbl *labels* :test #'string=)))
                        (unless (and entry (third entry))
                          (js-throw (make-native-error "SyntaxError" (format nil "Undefined continue label '~a'" lbl))))
+                       (run-exit-finallys *continue-finallys*)
                        (pop-envs (- *scope-depth* (fourth entry))) (em :jmp (third entry)))
-                     (if *continue-target* (progn (pop-envs (- *scope-depth* *continue-depth*)) (em :jmp *continue-target*))
+                     (if *continue-target*
+                         (progn (run-exit-finallys *continue-finallys*)
+                                (pop-envs (- *scope-depth* *continue-depth*)) (em :jmp *continue-target*))
                          (js-throw (make-native-error "SyntaxError" "illegal continue"))))))
     (:switch (compile-switch node))
     (:with
@@ -746,26 +771,53 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
      (em :pop-env))
     (:try (destructuring-bind (blk param catch fin) (cdr node)
             (em :comp-clear)
-            (if catch
-                (let ((lc (lbl)) (after (lbl)))
-                  (em :push-handler lc) (compile-stmt blk) (em :pop-handler) (em :jmp after)
-                  (em :label lc)                                  ; thrown value on stack
-                  (em :comp-clear)                                ; catch clause: fresh completion
-                  (em :push-env)                                  ; catch parameter scope
-                  (let ((*scope-depth* (1+ *scope-depth*)))
-                    (cond ((null param) (em :pop))
-                          ((stringp param) (em :declare-var param))
-                          (t (bind-target param)))               ; destructuring catch param
-                    (compile-stmt catch))
-                  (em :pop-env)
-                  (em :label after))
-                (compile-stmt blk))
-            (when fin                                             ; finally: if it completes normally, keep the try/catch value
-              (let ((saved (string (gensym "FINV"))))
-                (em :comp-default-undef) (em :get-completion) (em :declare-var saved)
-                (em :comp-clear) (compile-stmt fin)
-                (em :get-var saved) (em :save-completion)))
-            (em :comp-default-undef)))))   ; v0: finally runs on the normal/caught path
+            (flet ((body ()
+                     (if catch
+                         (let ((lc (lbl)) (after (lbl)))
+                           (em :push-handler lc) (compile-stmt blk) (em :pop-handler) (em :jmp after)
+                           (em :label lc)                                  ; thrown value on stack
+                           (em :comp-clear)                                ; catch clause: fresh completion
+                           (em :push-env)                                  ; catch parameter scope
+                           (let ((*scope-depth* (1+ *scope-depth*)))
+                             (cond ((null param) (em :pop))
+                                   ((stringp param) (em :declare-var param))
+                                   (t (bind-target param)))               ; destructuring catch param
+                             (compile-stmt catch))
+                           (em :pop-env)
+                           (em :label after))
+                         (compile-stmt blk))))
+              (if (null fin)
+                  (body)
+                  ;; WITH A FINALLY, every way out has to go through it: normal completion, an
+                  ;; uncaught throw, and any `return` inside (which compiles the block itself --
+                  ;; see :RETURN).  Only the normal path ran it before, so a throw or a return
+                  ;; skipped cleanup entirely.
+                  (let ((lthrow (lbl)) (after (lbl)))
+                    (em :push-handler lthrow)
+                    (let ((*pending-finallys* (cons fin *pending-finallys*)))
+                      (body))
+                    (em :pop-handler)
+                    (compile-finally-block fin)          ; normal completion
+                    (em :jmp after)
+                    (em :label lthrow)                   ; thrown value is on the stack
+                    (compile-finally-block fin)          ; ...run the finally, then rethrow
+                    (em :throw-op)
+                    (em :label after))))
+            (em :comp-default-undef)))))
+
+(defun run-exit-finallys (baseline)
+  "Compile the finally blocks entered since BASELINE, innermost first."
+  (let ((fins (ldiff *pending-finallys* baseline)))
+    (let ((*pending-finallys* baseline))
+      (dolist (f fins) (compile-finally-block f)))))
+
+(defun compile-finally-block (fin)
+  "Run FIN, preserving whatever completion value was already in flight."
+  (let ((saved (string (gensym "FINV"))))
+    (em :comp-default-undef) (em :get-completion) (em :declare-var saved)
+    (em :comp-clear)
+    (let ((*pending-finallys* nil)) (compile-stmt fin))
+    (em :get-var saved) (em :save-completion)))
 
 (defun loop-label-entries (break-lbl continue-lbl depth)
   "Register any *pending-labels* (labels attached to this loop) as label entries
@@ -804,6 +856,7 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
           (when test (compile-expr test) (em :jmp-if-false end))
           (let ((*break-target* end) (*continue-target* cont)
                 (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+            (*break-finallys* *pending-finallys*) (*continue-finallys* *pending-finallys*)
                 (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
             (compile-stmt body))
           (em :label cont)
@@ -846,6 +899,7 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
       (for-head-assign head)
       (let ((*break-target* end) (*continue-target* cont)
             (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+            (*break-finallys* *pending-finallys*) (*continue-finallys* *pending-finallys*)
             (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
         (compile-stmt body))
       (em :label cont)
@@ -864,6 +918,7 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
       (for-head-assign head)
       (let ((*break-target* end) (*continue-target* cont)
             (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+            (*break-finallys* *pending-finallys*) (*continue-finallys* *pending-finallys*)
             (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
         (compile-stmt body))
       (em :label cont) (em :jmp top) (em :label end))))
@@ -882,6 +937,7 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
       (for-head-assign head)
       (let ((*break-target* end) (*continue-target* cont)
             (*break-depth* *scope-depth*) (*continue-depth* *scope-depth*)
+            (*break-finallys* *pending-finallys*) (*continue-finallys* *pending-finallys*)
             (*labels* (loop-label-entries end cont *scope-depth*)) (*pending-labels* '()))
         (compile-stmt body))
       (em :label cont) (em :jmp top) (em :label end))))
@@ -1108,13 +1164,17 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
    members to initialize (in the ctor prologue, after super() for derived).
    PRIV-METHODS are instance private methods/accessors installed per-instance."
   (declare (ignore name))
-  (let* ((params (if ctor (third ctor) (if derived (list (list :rest "args")) '())))
+  ;; Bound per constructor so a pending set of field initializers cannot leak into the next
+  ;; class.  (This was meant to be a binding and was briefly a COND CLAUSE, which made the body
+  ;; NIL whenever any initializers were pending -- so a default derived constructor lost its
+  ;; super() call entirely.)
+  (let* ((*ctor-field-stmts* nil)
+         (params (if ctor (third ctor) (if derived (list (list :rest "args")) '())))
          (user-body (if ctor (fourth ctor) nil))
          (field-stmts (append (mapcar #'priv-method->stmt priv-methods)
                               (mapcar #'field->stmt fields)))
          ;; default constructor bodies
          (body (cond
-                 (*ctor-field-stmts* nil)
                  (ctor (splice-field-inits user-body field-stmts derived))
                  (derived (list :block (append
                                         (list (list :expr (list :super-call (list (list :spread (list :ident "args"))))))
@@ -1206,6 +1266,14 @@ TDZ is what finally surfaced it."
             (em :const (second key))
             (compile-named-init val (and (stringp (second key)) (second key)))
             (em :def-prop)))))                ; obj key val -> obj
+      ;; A method definition, unlike `m: function(){}`, carries a [[HomeObject]] -- so `super.x`
+      ;; inside it resolves against the object's prototype.  :DEF-METHOD sets it; :DEF-PROP does
+      ;; not, which is the whole reason these are different ops.
+      (:method-prop
+       (let ((key (second pr)) (fn (third pr)))
+         (if (eq (car key) :computed) (compile-expr (second key)) (em :const (second key)))
+         (compile-expr fn)
+         (em :def-method)))
       ((:get :set)
        (let ((key (second pr)) (fn (third pr)))
          (if (eq (car key) :computed) (compile-expr (second key)) (em :const (second key)))
