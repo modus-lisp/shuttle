@@ -49,6 +49,10 @@ skipped, and `try { return 'a' } finally { return 'b' }` answered 'a'.")
   ;; top-level falls off the end so RUN returns the completion value (eval semantics)
   (compile-fn nil '() (parse-program src) (if eval-code :eval t)))
 
+(defun simple-parameter-list-p (params)
+  "True when every parameter is a plain name -- no default, no rest, no pattern."
+  (every #'stringp params))
+
 (defun check-no-duplicate-params (params)
   "Strict-mode early error: a duplicate binding name in a parameter list is a
    SyntaxError. (In sloppy mode duplicates are allowed for plain-ident params.)"
@@ -130,8 +134,13 @@ everything else wants the set.")
   (when (and (eq this-mode :normal) *strict*)
     (setf this-mode :strict))
   (let ((*out* '()) (pnames (param-names params)))
-    ;; strict early error: duplicate parameter names are a SyntaxError.
-    (when *strict* (check-no-duplicate-params params))
+    ;; DUPLICATE PARAMETER NAMES are a SyntaxError in more places than strict code: an ARROW
+    ;; never allows them, and neither does any parameter list that is not SIMPLE -- one with a
+    ;; default, a rest, or a destructuring pattern.  Only a sloppy function whose parameters are
+    ;; all plain names may repeat one.  `(x, [x]) => 1` is both an arrow and non-simple, and was
+    ;; accepted.
+    (when (or *strict* (eq this-mode :lexical) (not (simple-parameter-list-p params)))
+      (check-no-duplicate-params params))
     ;; bind parameters from incoming call args
     (compile-params params)
     ;; hoist: pre-declare all `var` names (as undefined) so forward reads don't
@@ -206,6 +215,8 @@ everything else wants the set.")
   (when (and (eq this-mode :normal) *strict*)
     (setf this-mode :strict))
   (let ((pnames (param-names params)) (inst nil))
+    ;; a generator or async function never permits duplicate parameters
+    (check-no-duplicate-params params)
     (let ((*out* '()))
       (compile-params params)
       (dolist (v (collect-var-names body))

@@ -30,6 +30,28 @@
                                                   #x136B #x136C #x136D #x136E #x136F #x1370
                                                   #x1371 #x19DA))))
 
+(defun js-line-terminator-p (c)
+  "LineTerminator: LF, CR, LS (U+2028), PS (U+2029).  A single-line comment ends at any of them,
+and an unescaped one inside a string literal is a SyntaxError -- not only at a LINE FEED, which
+is all shuttle looked for."
+  (or (char= c #\Newline) (char= c #\Return)
+      (char= c #\Line_separator) (char= c #\Paragraph_separator)))
+
+(defun js-whitespace-p (c)
+  "WhiteSpace or LineTerminator, per the spec rather than per ASCII.
+
+The set is TAB, VT, FF, SP, NBSP, ZWNBSP and every character in Unicode category Zs, plus the
+line terminators LF, CR, LS and PS.  Shuttle recognised five ASCII characters, so a source file
+containing a NO-BREAK SPACE -- which test262 uses deliberately, and which a copy-paste produces
+by accident -- failed to lex at all."
+  (or (member c '(#\Space #\Tab #\Newline #\Return #\Page
+                  #\Vt                                  ; U+000B VERTICAL TAB
+                  #\No-break_space                      ; U+00A0
+                  #\Zero_width_no-break_space           ; U+FEFF (BOM)
+                  #\Line_separator #\Paragraph_separator))  ; U+2028 U+2029
+      (and (> (char-code c) 127)
+           (eq (sb-unicode:general-category c) :zs))))
+
 (defparameter *reserved-words*
   ;; ReservedWord (keywords + literals); an escaped reserved word is an early error.
   '("break" "case" "catch" "class" "const" "continue" "debugger" "default"
@@ -208,10 +230,10 @@
           ;; token's EMIT, and it is then the offset of that token's first character.
           (setf tok-start i)
           (cond
-            ((member c '(#\Space #\Tab #\Newline #\Return #\Page)) (incf i))
+            ((js-whitespace-p c) (incf i))
             ;; comments
             ((and (char= c #\/) (char= (peek 1) #\/))
-             (loop while (and (< i n) (char/= (char src i) #\Newline)) do (incf i)))
+             (loop while (and (< i n) (not (js-line-terminator-p (char src i)))) do (incf i)))
             ((and (char= c #\/) (char= (peek 1) #\*))
              (incf i 2) (loop until (or (>= i n) (and (char= (char src i) #\*) (char= (peek 1) #\/))) do (incf i))
              (incf i 2))
@@ -301,6 +323,12 @@
                           v)))
                  (loop until (or (>= i n) (char= (char src i) q)) do
                    (let ((ch (char src i)))
+                     ;; A raw LineTerminator inside a string is an early SyntaxError: a string
+                     ;; may span lines only through a line CONTINUATION (a backslash before the
+                     ;; break), which the escape branch below handles.
+                     (when (js-line-terminator-p ch)
+                       (js-throw (make-native-error
+                                  "SyntaxError" "Unterminated string literal")))
                      (if (char= ch #\\)
                          (let ((e (char src (1+ i))))
                            (incf i)   ; i now on the escape char

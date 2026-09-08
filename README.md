@@ -13,7 +13,7 @@ html5lib pattern).
 
 ## Conformance
 
-**9,518 / 10,800 (88.1%) — nothing skipped, and negative tests checked against the
+**9,546 / 10,800 (88.4%) — nothing skipped, and negative tests checked against the
 error they declare.**
 
 Measured with `inspect/test262-slice.lisp` over a stratified sample: nine 1,200-test
