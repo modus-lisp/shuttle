@@ -101,3 +101,84 @@ integrity pins the BYTES, position pins the tree\",~%  \"root\": {~%")
                        (< (1+ i) (length nodes)))))
     (format s "  }~%}~%"))
   path)
+
+;;; ---- reading a lockfile back --------------------------------------------------------------
+;;;
+;;; A lockfile you cannot install FROM is a receipt, not a lock.  The point of writing one is that
+;;; a later install reproduces the same bytes without asking the registry what `^1.2.3` means
+;;; today -- so this reads it back, and the install path prefers it whenever it still covers what
+;;; the project declares.
+
+(defun %lock-json (path)
+  (unless *json-realm* (setf *json-realm* (make-realm)))
+  (define-global *json-realm* "__locktext" (slurp-file path))
+  (eval-script *json-realm* "JSON.parse(__locktext)"))
+
+(defun read-lockfile (path)
+  "Reconstruct the tree recorded in PATH.  Returns (VALUES ROOT-NODE ROOT-DEPS).
+
+Rebuilt from the recorded POSITIONS, shortest path first, so a parent always exists before the
+child that nests inside it."
+  (let* ((json (%lock-json path))
+         (packages (jsref json "packages"))
+         (root (make-instance 'node))
+         (deps '()))
+    (let ((rd (jsref json "root")))
+      (when rd
+        (dolist (k (remove-if-not #'stringp (ordinary-own-keys rd)))
+          (push (cons k (jsstr (jsref rd k))) deps))))
+    (unless packages (%reg-fail "~a: no `packages` section" path))
+    (let ((paths (sort (remove-if-not #'stringp (ordinary-own-keys packages))
+                       #'< :key (lambda (p) (count #\/ p)))))
+      (dolist (p paths)
+        (let* ((entry (jsref packages p))
+               ;; "node_modules/a/node_modules/@scope/b" -> the names, in order
+               (names (let ((acc '()) (parts (%split p #\/)))
+                        (loop while parts
+                              do (let ((seg (pop parts)))
+                                   (when (string= seg "node_modules")
+                                     (let ((n (pop parts)))
+                                       (when (and n (plusp (length n)) (char= (char n 0) #\@))
+                                         (setf n (concatenate 'string n "/" (pop parts))))
+                                       (push n acc)))))
+                        (nreverse acc)))
+               (parent root))
+          (dolist (n (butlast names))
+            (setf parent (or (gethash n (node-children parent))
+                             (%reg-fail "~a: ~s nests inside ~s, which the lockfile does not list"
+                                        path p n))))
+          (let ((leaf (car (last names))))
+            (setf (gethash leaf (node-children parent))
+                  (make-instance 'node :name leaf :parent parent
+                                 :resolved (make-instance 'resolved
+                                             :name leaf
+                                             :version (jsstr (jsref entry "version"))
+                                             :tarball (jsstr (jsref entry "resolved"))
+                                             :integrity (jsstr (jsref entry "integrity"))
+                                             :algorithm (if (equal (jsstr (jsref entry "algorithm"))
+                                                                   "sha1")
+                                                            :sha1 :sha512))))))))
+    (values root (nreverse deps))))
+
+(defun lock-covers-p (root declared)
+  "Does the locked tree still satisfy what the project DECLARES?
+
+A lockfile is only usable while it agrees with package.json; when someone widens or changes a
+range, the honest answer is to re-resolve rather than install a version nobody asked for any more."
+  (every (lambda (d)
+           (let ((hit (gethash (car d) (node-children root))))
+             (and hit (semver-satisfies-p (resolved-version (node-resolved hit)) (cdr d)))))
+         declared))
+
+(defun install-locked (root into &key (progress t))
+  "Fetch, verify and unpack exactly what the lockfile pinned.  Returns the file count."
+  (let ((files 0))
+    (dolist (node (tree-nodes root))
+      (incf files (install-node node into))
+      (when progress
+        (format t "~&  ~a@~a~%" (node-name node) (resolved-version (node-resolved node)))))
+    files))
+
+(defun project-dependencies (package-json)
+  "The `dependencies` an existing package.json declares, as an alist."
+  (manifest-dependencies (parse-json-file package-json)))

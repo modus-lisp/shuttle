@@ -1,0 +1,132 @@
+#!/usr/bin/env -S sbcl --script
+;;;; bin/shuttle — the command line.
+;;;;
+;;;;   shuttle install [name[@range] ...]   resolve, verify and unpack into ./node_modules
+;;;;   shuttle bundle <entry> [-o out]      one entry module -> one script
+;;;;   shuttle minify <file> [-o out]       strip comments and insignificant whitespace
+;;;;   shuttle version | help
+;;;;
+;;;; INSTALL PREFERS THE LOCKFILE.  With a shuttle-lock.json that still satisfies what
+;;;; package.json declares, it installs exactly those bytes and never asks the registry what a
+;;;; range means today.  When the lockfile no longer covers the declared ranges -- someone edited
+;;;; package.json -- it says so and re-resolves, rather than quietly installing a version nobody
+;;;; asked for any more.  --frozen turns that into an error instead, which is what CI wants.
+
+(require :asdf)
+(require :sb-bsd-sockets)
+
+;; --script skips the user's init, so nothing has put these systems on ASDF's path.  Look beside
+;; this checkout, which is how the rest of the stack's probes find their siblings.
+(let* ((here (truename *load-truename*))
+       (root (make-pathname :directory (butlast (pathname-directory here)))))
+  (push root asdf:*central-registry*)
+  (dolist (sib '("seal" "natrium" "cram"))
+    (let ((p (probe-file (merge-pathnames (format nil "../~a/" sib) root))))
+      (when p (push p asdf:*central-registry*)))))
+
+(handler-bind ((warning #'muffle-warning))
+  (let ((*standard-output* (make-broadcast-stream)))
+    (handler-case (asdf:load-system "shuttle/npm")
+      (error (e)
+        (let ((*standard-output* *error-output*))
+          (format *error-output* "~&shuttle: cannot load: ~a~%~
+  shuttle/npm needs seal, natrium and cram checked out beside this repo.~%" e)
+          (sb-ext:exit :code 1))))))
+
+(in-package #:shuttle)
+
+(defun %arg-after (flag args) (let ((p (member flag args :test #'string=))) (second p)))
+(defun %flagp (flag args) (and (member flag args :test #'string=) t))
+(defun %positional (args) (remove-if (lambda (a) (char= (char a 0) #\-))
+                                     (remove-if #'null args)))
+
+(defun %split-spec (spec)
+  "`name`, `name@range`, `@scope/name@range` -> (NAME . RANGE), defaulting to `*`."
+  (let ((at (position #\@ spec :start (if (and (plusp (length spec)) (char= (char spec 0) #\@)) 1 0))))
+    (if at (cons (subseq spec 0 at) (subseq spec (1+ at))) (cons spec "*"))))
+
+(defun cmd-install (args)
+  (let* ((frozen (%flagp "--frozen" args))
+         (into (or (%arg-after "--into" args) "node_modules"))
+         (lock (or (%arg-after "--lockfile" args) "shuttle-lock.json"))
+         (named (mapcar #'%split-spec (remove "install" (%positional args) :test #'string=)))
+         (declared (or named
+                       (and (probe-file "package.json") (project-dependencies "package.json"))))
+         ;; `--into node_modules` is where Node looks; the tree's own paths already begin with
+         ;; `node_modules/`, so the destination ROOT is its parent.
+         (dest (if (string= into "node_modules") "." into)))
+    (unless declared
+      (format *error-output* "~&shuttle install: nothing to install.~%  ~
+Name packages on the command line, or run where a package.json declares `dependencies`.~%")
+      (sb-ext:exit :code 1))
+    (let ((existing (and (probe-file lock) (not named)
+                         (multiple-value-list (read-lockfile lock)))))
+      (cond
+        ((and existing (lock-covers-p (first existing) declared))
+         (format t "~&using ~a (~d packages pinned)~%" lock (length (tree-nodes (first existing))))
+         (let ((files (install-locked (first existing) dest)))
+           (format t "~&~d packages, ~d files~%" (length (tree-nodes (first existing))) files)))
+        (t
+         (when (and existing frozen)
+           (format *error-output* "~&shuttle install --frozen: ~a no longer satisfies the ~
+declared dependencies.~%  Re-run without --frozen to update it.~%" lock)
+           (sb-ext:exit :code 1))
+         (when existing
+           (format t "~&~a no longer covers the declared ranges; re-resolving~%" lock))
+         (multiple-value-bind (tree n files) (install-tree declared :into dest :progress nil)
+           (write-lockfile tree lock :root-deps declared)
+           (format t "~&~d packages, ~d files~%~a written~%" n files lock)))))))
+
+(defun cmd-bundle (args)
+  (let* ((pos (remove "bundle" (%positional args) :test #'string=))
+         (entry (first pos))
+         (out (%arg-after "-o" args))
+         (minify (not (%flagp "--no-minify" args))))
+    (unless entry
+      (format *error-output* "~&usage: shuttle bundle <entry> [-o out] [--no-minify]~%")
+      (sb-ext:exit :code 1))
+    (let ((text (handler-case (bundle entry :minify minify)
+                  (bundle-error (e)
+                    (format *error-output* "~&shuttle bundle: ~a~%" (bundle-error-text e))
+                    (sb-ext:exit :code 1)))))
+      (if out
+          (progn (with-open-file (s out :direction :output :if-exists :supersede
+                                        :external-format :utf-8)
+                   (write-string text s))
+                 (format t "~&~a  (~d bytes)~%" out (length text)))
+          (write-string text *standard-output*)))))
+
+(defun cmd-minify (args)
+  (let* ((pos (remove "minify" (%positional args) :test #'string=))
+         (file (first pos))
+         (out (%arg-after "-o" args)))
+    (unless file
+      (format *error-output* "~&usage: shuttle minify <file> [-o out]~%") (sb-ext:exit :code 1))
+    (let ((text (handler-case (minify-source (slurp-file file))
+                  (minify-error (e)
+                    (format *error-output* "~&shuttle minify: ~a~%" (minify-error-text e))
+                    (sb-ext:exit :code 1)))))
+      (if out
+          (progn (with-open-file (s out :direction :output :if-exists :supersede
+                                        :external-format :utf-8)
+                   (write-string text s))
+                 (format t "~&~a  (~d bytes)~%" out (length text)))
+          (write-string text *standard-output*)))))
+
+(let* ((args (rest sb-ext:*posix-argv*))
+       (cmd (first args)))
+  (handler-case
+      (cond ((null cmd) (format t "~&shuttle — install, bundle and minify JavaScript, without node.~%~%~
+  shuttle install [name[@range] ...] [--frozen] [--into DIR]~%~
+  shuttle bundle <entry> [-o out] [--no-minify]~%~
+  shuttle minify <file> [-o out]~%"))
+            ((string= cmd "install") (cmd-install args))
+            ((string= cmd "bundle") (cmd-bundle args))
+            ((string= cmd "minify") (cmd-minify args))
+            ((member cmd '("help" "-h" "--help") :test #'string=)
+             (format t "~&see `shuttle` with no arguments~%"))
+            (t (format *error-output* "~&shuttle: unknown command ~s~%" cmd) (sb-ext:exit :code 1)))
+    (registry-error (e)
+      (format *error-output* "~&shuttle: ~a~%" (registry-error-text e)) (sb-ext:exit :code 1))
+    (cram:tar-error (e)
+      (format *error-output* "~&shuttle: ~a~%" (cram:tar-error-text e)) (sb-ext:exit :code 1))))
