@@ -62,6 +62,14 @@ host-binding seam a consumer like weft hangs DOM objects + reflow on). Oracle: t
 
 ;;; The bundler is a separate system: the engine has no business depending on a file resolver,
 ;;; and a consumer embedding shuttle for scripting should not get one.
+(asdf:defsystem :shuttle/semver
+  :description "npm's version algebra: parse, compare, and range satisfaction.  Separate from the
+engine -- a JS runtime has no business knowing about package versions, and a resolver should not
+have to load an interpreter to compare two numbers."
+  :depends-on ("shuttle")
+  :serial t
+  :components ((:module "src" :components ((:file "semver")))))
+
 (asdf:defsystem :shuttle/bundle
   :description "One script out of an ES module graph: resolve, order, splice. Replaces esbuild in
 the deploy path, using shuttle's own parser for the modules and its own JSON for package.json."

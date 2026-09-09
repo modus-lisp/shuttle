@@ -25,6 +25,10 @@
    ;; ES modules, runtime half: link, evaluate, namespaces
    #:eval-module #:make-file-module-host #:set-module-host #:module-host #:source-text-module
    #:namespace-object #:link-module #:evaluate-module #:resolve-export #:*module-host*
+   ;; semver (src/semver.lisp, system :shuttle/semver)
+   #:semver #:parse-semver #:semver-string #:semver-compare #:semver< #:semver=
+   #:semver-major #:semver-minor #:semver-patch #:semver-prerelease #:semver-build
+   #:parse-range #:semver-satisfies-p #:semver-max-satisfying
    #:minify-source #:minify-error #:minify-error-text
    #:import-entry #:export-entry
    #:entry-request #:entry-import-name #:entry-local-name #:entry-export-name))
