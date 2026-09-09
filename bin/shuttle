@@ -2,6 +2,7 @@
 ;;;; bin/shuttle — the command line.
 ;;;;
 ;;;;   shuttle install [name[@range] ...]   resolve, verify and unpack into ./node_modules
+;;;;                                        (--production / --omit=dev skips devDependencies)
 ;;;;   shuttle bundle <entry> [-o out]      one entry module -> one script
 ;;;;   shuttle minify <file> [-o out]       strip comments and insignificant whitespace
 ;;;;   shuttle version | help
@@ -50,8 +51,10 @@
          (into (or (%arg-after "--into" args) "node_modules"))
          (lock (or (%arg-after "--lockfile" args) "shuttle-lock.json"))
          (named (mapcar #'%split-spec (remove "install" (%positional args) :test #'string=)))
+         (dev (not (or (%flagp "--production" args) (%flagp "--omit=dev" args))))
          (declared (or named
-                       (and (probe-file "package.json") (project-dependencies "package.json"))))
+                       (and (probe-file "package.json")
+                            (project-dependencies "package.json" :dev dev))))
          ;; `--into node_modules` is where Node looks; the tree's own paths already begin with
          ;; `node_modules/`, so the destination ROOT is its parent.
          (dest (if (string= into "node_modules") "." into)))
@@ -117,7 +120,7 @@ declared dependencies.~%  Re-run without --frozen to update it.~%" lock)
        (cmd (first args)))
   (handler-case
       (cond ((null cmd) (format t "~&shuttle — install, bundle and minify JavaScript, without node.~%~%~
-  shuttle install [name[@range] ...] [--frozen] [--into DIR]~%~
+  shuttle install [name[@range] ...] [--frozen] [--production] [--into DIR]~%~
   shuttle bundle <entry> [-o out] [--no-minify]~%~
   shuttle minify <file> [-o out]~%"))
             ((string= cmd "install") (cmd-install args))

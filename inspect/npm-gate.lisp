@@ -29,11 +29,12 @@
   (format t "~&  ~:[FAIL~;ok  ~] ~a~@[   ~a~]~%" p name detail)
   (unless p (incf *f*)))
 
-(defun mk (name version &optional deps)
+(defun mk (name version &optional deps peers optional-peers)
   (make-instance 'resolved :name name :version version
                  :tarball (format nil "https://registry.npmjs.org/~a/-/~a-~a.tgz" name name version)
                  :integrity (format nil "sha512-~a" (make-string 86 :initial-element #\A))
-                 :algorithm :sha512 :dependencies deps))
+                 :algorithm :sha512 :dependencies deps
+                 :peers peers :optional-peers optional-peers))
 
 (defun attach (parent name resolved)
   (let ((n (make-instance 'node :name name :parent parent :resolved resolved)))
@@ -72,6 +73,59 @@
   (attach root "b" (mk "b" "1.0.0"))
   (attach a "b" (mk "b" "2.0.1"))
   (ok "a nested copy SHADOWS an incompatible outer one" (null (tree-violations root))))
+
+(format t "~&~%== peers ==~%")
+
+;; A REQUIRED peer that nobody provides is an error, not a warning.
+(let ((root (make-instance 'node)))
+  (attach root "plug" (mk "plug" "1.0.0" nil '(("host" . "^2.0.0"))))
+  (let ((bad (tree-violations root)))
+    (ok "an unprovided required peer is reported"
+        (and (= 1 (length bad)) (eq (fourth (first bad)) :missing-peer)) (first bad))))
+
+;; Provided at the dependent's level: satisfied.
+(let ((root (make-instance 'node)))
+  (attach root "plug" (mk "plug" "1.0.0" nil '(("host" . "^2.0.0"))))
+  (attach root "host" (mk "host" "2.1.0"))
+  (ok "a peer provided beside the package satisfies it" (null (tree-violations root))))
+
+;; THE SHARP CASE.  A peer means "the dependent and I must see the SAME copy".  A copy the package
+;; keeps privately inside its own node_modules is exactly what a peer declaration exists to
+;; prevent -- two Reacts in one page -- so it must NOT count.
+(let* ((root (make-instance 'node))
+       (plug (attach root "plug" (mk "plug" "1.0.0" nil '(("host" . "^2.0.0"))))))
+  (attach plug "host" (mk "host" "2.1.0"))
+  (let ((bad (tree-violations root)))
+    (ok "a package's OWN private copy does not satisfy its peer"
+        (and (= 1 (length bad)) (eq (fourth (first bad)) :missing-peer)) (first bad))))
+
+;; Optional peers: absent is fine, present-and-wrong is not.
+(let ((root (make-instance 'node)))
+  (attach root "plug" (mk "plug" "1.0.0" nil '(("host" . "^2.0.0")) '("host")))
+  (ok "an ABSENT optional peer is not a problem" (null (tree-violations root))))
+
+(let ((root (make-instance 'node)))
+  (attach root "plug" (mk "plug" "1.0.0" nil '(("host" . "^2.0.0")) '("host")))
+  (attach root "host" (mk "host" "1.0.0"))
+  (let ((bad (tree-violations root)))
+    (ok "a PRESENT optional peer at the wrong version IS a problem" (= 1 (length bad))
+        (first bad))))
+
+(format t "~&~%== what a project declares ==~%")
+
+(let ((path "/tmp/shuttle-npm-gate-package.json"))
+  (with-open-file (s path :direction :output :if-exists :supersede)
+    (write-string "{\"dependencies\":{\"a\":\"^1.0.0\",\"both\":\"^2.0.0\"},
+                    \"devDependencies\":{\"d\":\"^3.0.0\",\"both\":\"^9.0.0\"}}" s))
+  (let ((with-dev (project-dependencies path))
+        (without (project-dependencies path :dev nil)))
+    (ok "devDependencies are included by default" (assoc "d" with-dev :test #'string=))
+    (ok "and omitted on request" (null (assoc "d" without :test #'string=)))
+    (ok "`dependencies` wins over `devDependencies` for the same name -- the stronger claim"
+        (equal "^2.0.0" (cdr (assoc "both" with-dev :test #'string=)))
+        (cdr (assoc "both" with-dev :test #'string=)))
+    (ok "the runtime set is unaffected by the dev flag"
+        (equal (remove-if (lambda (x) (string= (car x) "d")) with-dev) without))))
 
 (format t "~&~%== the lockfile round trip ==~%")
 

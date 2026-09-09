@@ -179,6 +179,18 @@ range, the honest answer is to re-resolve rather than install a version nobody a
         (format t "~&  ~a@~a~%" (node-name node) (resolved-version (node-resolved node)))))
     files))
 
-(defun project-dependencies (package-json)
-  "The `dependencies` an existing package.json declares, as an alist."
-  (manifest-dependencies (parse-json-file package-json)))
+(defun project-dependencies (package-json &key (dev t))
+  "What a project declares: `dependencies`, plus `devDependencies` unless :DEV is NIL.
+
+DEV DEPENDENCIES BELONG TO THE ROOT ONLY.  They are the tools a project is built and tested with,
+and they are emphatically not part of what it means to USE that project -- so they are read here,
+from the package.json in front of us, and never followed for anything fetched from the registry.
+A resolver that treated a dependency's devDependencies as its own would install a test runner for
+every package in the tree.
+
+Where a name appears in both, `dependencies` wins: it is the stronger claim, and installing the
+dev range over it would ship a version the runtime dependency did not ask for."
+  (let* ((json (parse-json-file package-json))
+         (deps (manifest-dependencies json))
+         (devs (and dev (manifest-dependencies json :field "devDependencies"))))
+    (append deps (remove-if (lambda (d) (assoc (car d) deps :test #'string=)) devs))))

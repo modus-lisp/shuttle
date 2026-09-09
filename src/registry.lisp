@@ -83,7 +83,13 @@
    (algorithm :initarg :algorithm :reader resolved-algorithm
               :documentation "Which hash actually verified the bytes -- :sha512 or :sha1.")
    (dependencies :initarg :dependencies :initform '() :reader resolved-dependencies
-                 :documentation "An alist of (NAME . RANGE) from the manifest's `dependencies`."))
+                 :documentation "An alist of (NAME . RANGE) from the manifest's `dependencies`.")
+   (peers :initarg :peers :initform '() :reader resolved-peers
+          :documentation "An alist of (NAME . RANGE) from `peerDependencies`.  A peer is provided
+by whoever DEPENDS on this package, not by this package -- see resolve.lisp.")
+   (optional-peers :initarg :optional-peers :initform '() :reader resolved-optional-peers
+                   :documentation "Names from `peerDependenciesMeta` marked optional: wanted if
+present, never a reason to install or to fail."))
   (:documentation "One package pinned to one version, with the hash that pins its bytes."))
 
 (defun manifest-dependencies (manifest &key (field "dependencies"))
@@ -92,6 +98,19 @@
       (dolist (k (remove-if-not #'stringp (ordinary-own-keys deps)))
         (let ((r (jsstr (jsref deps k))))
           (when r (push (cons k r) acc)))))
+    (nreverse acc)))
+
+(defun manifest-optional-peers (manifest)
+  "Names in `peerDependenciesMeta` flagged `optional: true`.
+
+npm's convention for \"use this if the host has it\" -- an ESLint plugin that can work with or
+without a TypeScript parser, say.  Treating one as required turns an optional integration into a
+failed install."
+  (let ((meta (jsref manifest "peerDependenciesMeta")) (acc '()))
+    (when meta
+      (dolist (k (remove-if-not #'stringp (ordinary-own-keys meta)))
+        (let ((e (jsref meta k)))
+          (when (and e (js-truthy* (jsref e "optional"))) (push k acc)))))
     (nreverse acc)))
 
 (defun resolve-version (name range &key packument)
@@ -122,7 +141,9 @@ because it could not satisfy a constraint has stopped being a resolver."
                                       (%reg-fail "~a@~a: the registry published NO integrity hash ~
 and no shasum, so these bytes cannot be verified" name vs))
                        :algorithm (if (jsstr (jsref dist "integrity")) :sha512 :sha1)
-                       :dependencies (manifest-dependencies manifest))))))
+                       :dependencies (manifest-dependencies manifest)
+                       :peers (manifest-dependencies manifest :field "peerDependencies")
+                       :optional-peers (manifest-optional-peers manifest))))))
 
 (defun verify-integrity (bytes resolved)
   "Signal unless BYTES hash to what the registry published for RESOLVED."
