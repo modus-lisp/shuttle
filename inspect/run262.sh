@@ -14,9 +14,14 @@ TOTAL=$(find "$SHUTTLE_TEST262/test" -name '*.js' ! -name '*_FIXTURE*' | wc -l)
 echo "corpus: $TOTAL files, slice size $SLICE"
 start=0; crashed=0
 while [ "$start" -lt "$TOTAL" ]; do
-  before=$(grep -c '^SLICE' "$OUT" 2>/dev/null || echo 0)
+  # `grep -c` already prints 0 when nothing matches -- but it EXITS 1, so a `|| echo 0` appended a
+  # SECOND line and the count became "0\n0".  `[` then failed with "integer expression expected"
+  # and the comparison below evaluated false, so a slice that died on the first iteration was
+  # never counted as crashed and the headline silently became a floor instead of a measurement.
+  # That is the exact failure this script exists to prevent.
+  before=$(grep -c '^SLICE' "$OUT" 2>/dev/null); before=${before:-0}
   SHUTTLE_SLICE="$start:$SLICE" "${SBCL[@]}" >/dev/null 2>>"/tmp/run262.err.$$"
-  after=$(grep -c '^SLICE' "$OUT" 2>/dev/null || echo 0)
+  after=$(grep -c '^SLICE' "$OUT" 2>/dev/null); after=${after:-0}
   if [ "$after" -le "$before" ]; then
     echo "  slice $start:$SLICE CRASHED at $(cat /tmp/cur262 2>/dev/null) — recording 0, continuing"
     crashed=$((crashed+1))
