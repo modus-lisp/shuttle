@@ -40,7 +40,28 @@
   (chk "array-join"   "[1, 2, 3].join('-')" "1-2-3" :test #'string=)
   (chk "math"         "Math.max(1, 5, 3) + Math.floor(2.9)" 7d0)
   (chk "new"          "function P(x){ this.x = x; } var p = new P(7); p.x" 7d0)
-  (chk "method-this"  "var o = { v: 10, get: function(){ return this.v; } }; o.get()" 10d0))
+  (chk "method-this"  "var o = { v: 10, get: function(){ return this.v; } }; o.get()" 10d0)
+
+  ;; `/` AFTER `}` -- the one place the lexer has to decide regex-vs-division from context, and
+  ;; the place a line terminator was quietly covering for a wrong answer.  A function EXPRESSION
+  ;; body produces a value, so `/` divides; a DECLARATION ends a statement, so `/` starts a regex.
+  ;; Reading only the `)` before the `{` calls both of them declarations.  It stayed hidden because
+  ;; SCAN-REGEX gives up at a newline: in hand-written source the bad guess died at end of line.
+  ;; On ONE LINE -- which is what minified code is -- it runs on and eats the next `/` it finds.
+  (chk "div-after-function-expression"
+       "isNaN(function(){return 1} / {}) === true" *true* :test #'eq)
+  ;; Dividing a function object is NaN -- which is the point: the `/` divided instead of opening a
+  ;; regex that would have run on and swallowed the `/` inside the string literal that follows.
+  (chk "div-after-function-expression-one-line"
+       "(function(){return 6} / 2) + ': a / b'" "NaN: a / b" :test #'string=)
+  (chk "regex-after-function-declaration"
+       "function f(){return 1}/ab/.test('xaby')" *true* :test #'eq)
+  (chk "div-after-object-literal"       "({a:6} .a / 2)" 3d0)
+  (chk "regex-after-block"              "{ } /ab/.test('zab')" *true* :test #'eq)
+  (chk "div-after-named-function-expression"
+       "isNaN(function g(){return 8} / 4)" *true* :test #'eq)
+  (chk "div-after-async-function-expression"
+       "typeof (async function(){} / 2)" "number" :test #'string=))
 
 ;; ---- the seam: JS mutating a host object fires a CL "reflow" callback ----
 (let* ((realm (make-realm)) (reflows '()) (stored nil))

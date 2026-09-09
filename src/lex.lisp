@@ -104,6 +104,15 @@ by accident -- failed to lex at all."
                                           :test #'string=)))))))))
       (decf i))))
 
+(defvar *legacy-brace-rule* nil
+  "Bind to T to restore the pre-fix rule that called EVERY `)` before a `{` a statement body.
+
+It exists so the two rules can be run against each other in ONE image, over the corpus, with no
+timing in the comparison.  Comparing two whole test262 RUNS could not answer whether this change
+regressed anything: 27 of 45 slices moved, by up to 267 tests in BOTH directions, because a
+20-second per-test timeout makes the score a function of machine load.  Parsing is deterministic,
+so diffing parses isolates the change exactly and reproducibly.")
+
 (defun brace-close-is-block-p (toks)
   "TOKS' last token is `}`.  Scan back to the matching `{` and decide whether it
    opened a BLOCK / function body (statement context — so a following `/` begins a
@@ -128,13 +137,76 @@ by accident -- failed to lex at all."
                      (return
                        (cond
                          ((eq ty :punct)
-                          (or (string= v ")")           ; function/if/while/for/catch/method body
+                          (or (and (string= v ")")      ; function/if/while/for/catch/method body
+                                   (or *legacy-brace-rule*
+                                       (paren-opens-statement-body-p toks (1- i))))
                               (string= v "=>")          ; arrow body
                               (member v '(";" "{" "}") :test #'string=))) ; statement block
                          ((eq ty :ident)
                           (member v '("do" "else" "try" "finally") :test #'string=))
                          (t nil)))))))))
       (decf i))))
+
+(defun paren-opens-statement-body-p (toks close)
+  "TOKS[CLOSE] is the `)` just before a `{`.  Does that `{` open a STATEMENT body?
+
+`)` before `{` covers two different things, and they disagree about what a following `/` means:
+
+  function f() {...} /re/.test(s)     a DECLARATION.  Its `}` ends a statement, so `/` is a regex,
+                                      and this is the shape minified code actually produces.
+  isNaN(function(){return 1} / {})    an EXPRESSION.  Its `}` produces a VALUE, so `/` is DIVISION.
+
+Reading only the `)` calls both of them blocks.  That was invisible for as long as it was, because
+SCAN-REGEX abandons a candidate that reaches a line terminator: in hand-written source the wrong
+guess ran to the end of the line and quietly fell back to division.  Put the file on one line --
+minify it -- and the same wrong guess finds a `/` inside a later string literal and takes the
+program apart.  A newline was standing in for the analysis.
+
+So: find the `(` this `)` closes, and look at what is in front of it.  A function keyword there
+means the answer depends on whether that FUNCTION is a declaration or an expression, which is
+decided by what precedes IT in turn.  Anything else -- `if`, `while`, `for`, `catch`, a method
+name -- keeps the old answer."
+  (let ((depth 0) (i close))
+    (loop
+      (when (< i 0) (return-from paren-opens-statement-body-p t))
+      (let ((tk (aref toks i)))
+        (when (eq (car tk) :punct)
+          (cond ((string= (cdr tk) ")") (incf depth))
+                ((string= (cdr tk) "(")
+                 (decf depth)
+                 (when (zerop depth)
+                   (return-from paren-opens-statement-body-p (%head-before-params toks (1- i))))))))
+      (decf i))))
+
+(defun %head-before-params (toks i)
+  "TOKS[I] is the token just before a parameter list's `(`.  T if the body it introduces is a
+statement body."
+  (when (< i 0) (return-from %head-before-params t))
+  (let* ((tk (aref toks i)) (name-p (eq (car tk) :ident)))
+    ;; `function (` and `function f (` both reach the keyword; skip an optional name, and a `*`
+    ;; for a generator.
+    (let ((k (cond ((and name-p (string= (cdr tk) "function")) i)
+                   ((and name-p (> i 0) (equal (aref toks (1- i)) '(:punct . "*"))
+                         (> i 1) (equal (aref toks (- i 2)) '(:ident . "function")))
+                    (- i 2))
+                   ((and name-p (> i 0) (equal (aref toks (1- i)) '(:ident . "function")))
+                    (1- i))
+                   (t nil))))
+      (if (null k)
+          t                                     ; if/while/for/catch/method -- a statement body
+          ;; A function: declaration or expression?  Decided by what precedes the keyword, and by
+          ;; `async` in front of it if there is one.
+          (let ((j (if (and (> k 0) (equal (aref toks (1- k)) '(:ident . "async"))) (1- k) k)))
+            (if (zerop j)
+                t                               ; first token in the program -- a declaration
+                (let ((before (aref toks (1- j))))
+                  (cond ((eq (car before) :punct)
+                         (and (member (cdr before) '(";" "{" "}" ")") :test #'string=) t))
+                        ((eq (car before) :ident)
+                         (and (member (cdr before) '("do" "else" "export" "default")
+                                      :test #'string=)
+                              t))
+                        (t nil)))))))))
 
 (defun regex-allowed-p (toks)
   "Given the tokens emitted so far, may a `/` begin a regex literal here?
@@ -218,6 +290,11 @@ by accident -- failed to lex at all."
   ;; through a printer of ours.  One vector-push per token buys that.
   (let ((i 0) (n (length src)) (toks (make-array 0 :adjustable t :fill-pointer 0))
         (starts (make-array 0 :adjustable t :fill-pointer 0 :element-type 'fixnum))
+        ;; ENDS is filled one iteration LATE, and that is the trick that makes it cheap: the loop
+        ;; body consumes exactly one thing per turn, so at the top of the turn AFTER a token was
+        ;; emitted, `i` is precisely where that token ended -- before any whitespace is skipped.
+        ;; No branch has to remember to record anything.
+        (ends (make-array 0 :adjustable t :fill-pointer 0 :element-type 'fixnum))
         (tok-start 0)
         (*escaped-idents* (make-hash-table)))
     (labels ((peek (&optional (k 0)) (if (< (+ i k) n) (char src (+ i k)) #\Nul))
@@ -228,6 +305,8 @@ by accident -- failed to lex at all."
           ;; Set at the top of every iteration, which is exactly where a token may begin: the
           ;; whitespace and comment arms below emit nothing, so this is only ever read by a real
           ;; token's EMIT, and it is then the offset of that token's first character.
+          (when (< (fill-pointer ends) (fill-pointer toks))
+            (vector-push-extend i ends))
           (setf tok-start i)
           (cond
             ((js-whitespace-p c) (incf i))
@@ -484,6 +563,9 @@ by accident -- failed to lex at all."
                                  *punctuators*)))
                  (if p (progn (emit :punct p) (incf i (length p)))
                      (js-throw (make-native-error "SyntaxError" (format nil "Unexpected character ~s" c))))))))))
+    (when (< (fill-pointer ends) (fill-pointer toks))   ; the last real token ended at EOF
+      (vector-push-extend n ends))
     (vector-push-extend (cons :eof nil) toks)
     (vector-push-extend n starts)
-    (values toks *escaped-idents* starts)))
+    (vector-push-extend n ends)
+    (values toks *escaped-idents* starts ends)))

@@ -100,20 +100,17 @@ export const answers = {
 
 (format t "~&~%== the bundler ==~%")
 
-(let ((out nil))
-  (handler-case
-      (setf out (bundle (concatenate 'string *dir* "entry.mjs") :id-root (pathname *dir*)))
-    (error (e) (format t "~&  FAIL bundling: ~a~%" e) (incf *fails*)))
-
-  (when out
-    (ok "the bundle is one script, and it parses" (plusp (length out)) (format nil "~a bytes" (length out)))
-
-    (let* ((realm (make-realm))
-           (val (handler-case (eval-script realm (format nil "var __out = ~a; __out.answers" out))
-                  (error (e) (format t "~&  FAIL running the bundle: ~a~%" e) (incf *fails*) nil))))
-      (when val
-        (flet ((got (k) (let ((v (js-get val k))) (if (js-undefined-p v) :missing v)))
-               (num= (a b) (and (numberp b) (= a b))))   ; a JS number arrives as a double
+;; Run the fixture's answers out of a bundle, so the SAME twelve checks can be pointed at the
+;; minified output as at the plain one.  Minification is a source-to-source rewrite of a program
+;; this gate already knows the right answers for, which makes running it here nearly free -- and
+;; it is an EXECUTION check, which the corpus-wide AST gate deliberately is not.
+(defun check-bundle (out label)
+  (let* ((realm (make-realm))
+         (val (handler-case (eval-script realm (format nil "var __out = ~a; __out.answers" out))
+                (error (e) (format t "~&  FAIL running the ~a bundle: ~a~%" label e) (incf *fails*) nil))))
+    (when val
+      (flet ((got (k) (let ((v (js-get val k))) (if (js-undefined-p v) :missing v)))
+             (num= (a b) (and (numberp b) (= a b))))   ; a JS number arrives as a double
           (ok "a NAMED default export is a declaration, so the module can call it"
               (num= 41 (got "named_default_call")) (got "named_default_call"))
           (ok "and its name is bound locally too — the crc-table shape"
@@ -133,8 +130,30 @@ export const answers = {
           (ok "a local renamed on the way out" (equal "h" (got "local_rename")) (got "local_rename"))
           (ok "an exported class keeps its methods"
               (equal "thing" (got "class_method")) (got "class_method"))
-          (ok "a destructuring export exports both names"
-              (equal "d1d2" (got "destructured")) (got "destructured")))))))
+        (ok "a destructuring export exports both names"
+            (equal "d1d2" (got "destructured")) (got "destructured"))))))
+
+(let ((out nil))
+  (handler-case
+      (setf out (bundle (concatenate 'string *dir* "entry.mjs") :id-root (pathname *dir*)))
+    (error (e) (format t "~&  FAIL bundling: ~a~%" e) (incf *fails*)))
+  (when out
+    (ok "the bundle is one script, and it parses" (plusp (length out))
+        (format nil "~a bytes" (length out)))
+    (check-bundle out "plain")
+
+    ;; The same graph, minified.  A whitespace minifier that broke one of these would be breaking
+    ;; a program whose correct answers are written down two screens up.
+    (format t "~&~%-- and again, minified --~%")
+    (let ((small (handler-case (bundle (concatenate 'string *dir* "entry.mjs")
+                                       :id-root (pathname *dir*) :minify t)
+                   (error (e) (format t "~&  FAIL minifying: ~a~%" e) (incf *fails*) nil))))
+      (when small
+        (ok "minifying the bundle makes it smaller and it still parses"
+            (< (length small) (length out))
+            (format nil "~d -> ~d bytes (~,1f%)" (length out) (length small)
+                    (* 100.0 (/ (length small) (length out)))))
+        (check-bundle small "minified")))))
 
 ;;; ---- and the refusals, which are half the design --------------------------------------------
 

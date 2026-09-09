@@ -25,5 +25,6 @@
    ;; ES modules, runtime half: link, evaluate, namespaces
    #:eval-module #:make-file-module-host #:set-module-host #:module-host #:source-text-module
    #:namespace-object #:link-module #:evaluate-module #:resolve-export #:*module-host*
+   #:minify-source #:minify-error #:minify-error-text
    #:import-entry #:export-entry
    #:entry-request #:entry-import-name #:entry-local-name #:entry-export-name))

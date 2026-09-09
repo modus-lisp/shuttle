@@ -67,4 +67,5 @@ host-binding seam a consumer like weft hangs DOM objects + reflow on). Oracle: t
 the deploy path, using shuttle's own parser for the modules and its own JSON for package.json."
   :version "0.0.1" :author "ynniv" :license "MIT"
   :depends-on (:shuttle)
-  :components ((:module "src" :components ((:file "bundle")))))
+  :components ((:module "src" :serial t
+                :components ((:file "minify") (:file "bundle")))))

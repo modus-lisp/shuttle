@@ -489,8 +489,14 @@ each live local reads through; pass two copies the body, splicing at spans and a
     (format nil "__d(~a, function (__x, __r) {~%\"use strict\";~%~a~a~%});~%"
             (%jstr (bm-id m)) (get-output-stream-string pre) (get-output-stream-string body))))
 
-(defun bundle (entry &key (id-root nil))
-  "ENTRY -> one script, as a string."
+(defun bundle (entry &key (id-root nil) (minify nil))
+  "ENTRY -> one script, as a string.
+
+With :MINIFY, comments and insignificant whitespace are stripped from the result.  It runs on the
+FINISHED bundle rather than on each module going in, which is both simpler and safer: the emitter
+splices text at declaration spans, and offsets computed against a rewritten source would be
+offsets into the wrong string.  By the time the whole thing has been parsed once (below), it is
+just a script, and the minifier's own token check re-verifies it a second time."
   (multiple-value-bind (order cycles) (build-graph entry :id-root id-root)
     (when cycles
       (%bail "the graph has ~a cycle~:p, which this emitter will not guess at:~%~{  ~{~a~^ -> ~}~%~}"
@@ -517,4 +523,7 @@ becomes a plain function here, and `await` cannot appear in one." (bm-id m))))
         ;; that whole class from silent corruption into a refusal.
         (handler-case (parse-program out)
           (error (e) (%bail "the emitted bundle does not parse, so a rewrite above is wrong:~%  ~a" e)))
-        out))))
+        (if minify
+            (handler-case (minify-source out)
+              (minify-error (e) (%bail "minifying the bundle failed: ~a" (minify-error-text e))))
+            out)))))
