@@ -29,6 +29,14 @@
    #:semver #:parse-semver #:semver-string #:semver-compare #:semver< #:semver=
    #:semver-major #:semver-minor #:semver-patch #:semver-prerelease #:semver-build
    #:parse-range #:semver-satisfies-p #:semver-max-satisfying
+   ;; npm client (src/registry.lisp, src/resolve.lisp; system :shuttle/npm)
+   #:*registry* #:registry-error #:registry-error-text #:registry-packument
+   #:resolve-version #:resolved #:resolved-name #:resolved-version #:resolved-tarball
+   #:resolved-integrity #:resolved-algorithm #:resolved-dependencies
+   #:verify-integrity #:fetch-package
+   #:resolve-tree #:tree-nodes #:tree-violations #:node-name #:node-resolved #:node-children
+   #:node-path #:node-path-string
+   #:install-tree #:install-node #:write-lockfile
    #:minify-source #:minify-error #:minify-error-text
    #:import-entry #:export-entry
    #:entry-request #:entry-import-name #:entry-local-name #:entry-export-name))

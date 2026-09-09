@@ -70,6 +70,18 @@ have to load an interpreter to compare two numbers."
   :serial t
   :components ((:module "src" :components ((:file "semver")))))
 
+(asdf:defsystem :shuttle/npm
+  :description "An npm client: resolve a dependency graph against a registry, verify every
+tarball against the hash the registry published for it, and lay out a node_modules tree.
+
+Depends on seal for TLS with real certificate validation -- fetching code over an unauthenticated
+channel would make this strictly worse than the thing it replaces -- on natrium for SHA-512, and
+on cram for gunzip and tar."
+  :depends-on ("shuttle" "shuttle/semver" "shuttle/bundle" "seal" "seal/http" "natrium" "cram")
+  :serial t
+  :components ((:module "src" :serial t
+                :components ((:file "registry") (:file "resolve") (:file "install")))))
+
 (asdf:defsystem :shuttle/bundle
   :description "One script out of an ES module graph: resolve, order, splice. Replaces esbuild in
 the deploy path, using shuttle's own parser for the modules and its own JSON for package.json."
