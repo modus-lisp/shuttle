@@ -495,6 +495,14 @@ each live local reads through; pass two copies the body, splicing at spans and a
     (when cycles
       (%bail "the graph has ~a cycle~:p, which this emitter will not guess at:~%~{  ~{~a~^ -> ~}~%~}"
              (length cycles) cycles))
+    ;; TOP-LEVEL AWAIT has no place in this output shape.  Each module becomes a plain factory
+    ;; function, and `await` cannot appear in one -- so a module using it would produce a bundle
+    ;; that does not parse.  Supporting it means making the registry return promises and every
+    ;; dependent await its dependencies, which is a different emitter.  Refuse and say so.
+    (dolist (m order)
+      (when (module-has-tla-p (module-items (bm-record m)))
+        (%bail "~a uses TOP-LEVEL AWAIT, which this bundler does not support.~%  Every module ~
+becomes a plain function here, and `await` cannot appear in one." (bm-id m))))
     (let ((live-of (make-hash-table :test 'equal)))
       (dolist (m order)
         (let ((live (module-live-exports (bm-record m))))
