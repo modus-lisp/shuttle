@@ -37,6 +37,7 @@
    #:resolve-tree #:tree-nodes #:tree-violations #:node-name #:node-resolved #:node-children
    #:node-path #:node-path-string
    #:install-tree #:install-node #:write-lockfile
+   #:*entropy-source*
    #:minify-source #:minify-error #:minify-error-text
    #:import-entry #:export-entry
    #:entry-request #:entry-import-name #:entry-local-name #:entry-export-name))

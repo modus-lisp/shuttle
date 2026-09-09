@@ -80,5 +80,52 @@
       (if ok (incf *pass*)
           (progn (incf *fail*) (format t "~&FAIL seam: reflows=~s~%" reflows))))))
 
+
+;; ---- crypto.getRandomValues refuses rather than inventing entropy ----
+;; The first check is the one that matters: with no source installed it must THROW.  An engine
+;; that quietly falls back to a clock-seeded PRNG produces bytes indistinguishable from secure
+;; ones right up until someone reproduces the key.
+(let ((realm (make-realm)))
+  (flet ((jt (src) (js-truthy (eval-script realm src))))
+    (macrolet ((c (name form) `(if ,form (incf *pass*)
+                                   (progn (incf *fail*) (format t "~&FAIL ~a~%" ,name)))))
+      (c "crypto exists even with no source" (jt "typeof crypto === 'object'"))
+      (c "getRandomValues throws with no source"
+         (jt "(function(){try{crypto.getRandomValues(new Uint8Array(8));return false}
+                        catch(e){return /will not invent/.test(String(e))}})()"))
+      (c "a float TypedArray is refused"
+         (jt "(function(){try{crypto.getRandomValues(new Float64Array(4));return false}
+                        catch(e){return e instanceof TypeError}})()"))
+      (c "over-quota is refused"
+         (jt "(function(){try{crypto.getRandomValues(new Uint8Array(70000));return false}
+                        catch(e){return e instanceof RangeError}})()")))))
+
+;; With a source installed the mechanics must be right.  A COUNTER, not a PRNG: this is testing
+;; that the bytes land in the right places, and a deterministic source makes that checkable.
+(let* ((counter 0)
+       (*entropy-source* (lambda (n) (let ((v (make-array n :element-type (quote (unsigned-byte 8)))))
+                                       (dotimes (i n v) (setf (aref v i) (mod (incf counter) 251))))))
+       (realm (make-realm)))
+  (flet ((jt (src) (js-truthy (eval-script realm src))))
+    (macrolet ((c (name form) `(if ,form (incf *pass*)
+                                   (progn (incf *fail*) (format t "~&FAIL ~a~%" ,name)))))
+      (c "an installed source fills the array, and the call returns it"
+         (jt "(function(){var a=new Uint8Array(8);return crypto.getRandomValues(a)===a&&a[0]!==0})()"))
+      (c "an offset view is filled at ITS offset, not the buffer's start"
+         (jt "(function(){var b=new ArrayBuffer(16),h=new Uint8Array(b,0,8),t=new Uint8Array(b,8,8);
+               crypto.getRandomValues(t);
+               var hz=true;for(var i=0;i<8;i++)if(h[i]!==0)hz=false;
+               var ts=false;for(var i=0;i<8;i++)if(t[i]!==0)ts=true;return hz&&ts})()")))))
+
+;; A source that returns the wrong number of bytes is BROKEN, and padding it would be the same
+;; lie as inventing the bytes in the first place.
+(let ((*entropy-source* (lambda (n) (declare (ignore n)) #(1 2 3)))
+      (realm (make-realm)))
+  (if (js-truthy (eval-script realm
+        "(function(){try{crypto.getRandomValues(new Uint8Array(32));return false}
+                     catch(e){return /returned 3 bytes/.test(String(e))}})()"))
+      (incf *pass*)
+      (progn (incf *fail*) (format t "~&FAIL short entropy source must be refused~%"))))
+
 (format t "~&~%shuttle self-test: ~d passed, ~d failed~%" *pass* *fail*)
 (sb-ext:exit :code (if (zerop *fail*) 0 1))

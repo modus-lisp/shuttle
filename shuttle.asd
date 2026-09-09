@@ -34,7 +34,7 @@ host-binding seam a consumer like weft hangs DOM objects + reflow on). Oracle: t
                                            (:file "arraybuffer")
                                            (:file "typedarray")
                                            (:file "dataview")
-                                           (:file "proxy")
+                                           (:file "proxy") (:file "webcrypto")
                                            (:file "global-funcs")
                                            (:file "error-extra")
                                            (:file "bigint")
