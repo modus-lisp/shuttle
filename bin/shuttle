@@ -36,25 +36,70 @@
 
 (in-package #:shuttle)
 
+(defparameter *value-flags* '("--into" "--lockfile" "--target-node" "-o")
+  "Flags that take a separate value.  The VALUE is not a positional argument, and treating it as
+one made `--target-node v20.20.2` try to install a package called v20.20.2 -- a flag's value does
+not start with a dash, so filtering on dashes alone cannot see it.")
+
 (defun %arg-after (flag args) (let ((p (member flag args :test #'string=))) (second p)))
 (defun %flagp (flag args) (and (member flag args :test #'string=) t))
-(defun %positional (args) (remove-if (lambda (a) (char= (char a 0) #\-))
-                                     (remove-if #'null args)))
+
+(defun %positional (args)
+  (let ((out '()) (rest (remove nil args)))
+    (loop while rest
+          do (let ((a (pop rest)))
+               (cond ((member a *value-flags* :test #'string=) (pop rest))   ; drop its value too
+                     ((and (plusp (length a)) (char= (char a 0) #\-)))       ; a flag
+                     (t (push a out)))))
+    (nreverse out)))
 
 (defun %split-spec (spec)
   "`name`, `name@range`, `@scope/name@range` -> (NAME . RANGE), defaulting to `*`."
   (let ((at (position #\@ spec :start (if (and (plusp (length spec)) (char= (char spec 0) #\@)) 1 0))))
     (if at (cons (subseq spec 0 at) (subseq spec (1+ at))) (cons spec "*"))))
 
+(defun %project-engine-node (path)
+  "The project's declared `engines.node`, if it declares one."
+  (let* ((json (parse-json-file path)) (e (and json (jsref json "engines"))))
+    (and e (jsstr (jsref e "node")))))
+
+(defun %engine-target (args)
+  "What `engines.node` is measured against: --target-node, else the project's own declaration,
+else nothing.  Never guessed -- see *TARGET-NODE*."
+  (let ((flag (or (%arg-after "--target-node" args)
+                  (let ((eq- (find-if (lambda (a) (and (> (length a) 14)
+                                                       (string= "--target-node=" (subseq a 0 14))))
+                                      args)))
+                    (and eq- (subseq eq- 14))))))
+    (cond (flag (string-left-trim "v" flag))
+          ((probe-file "package.json")
+           (let ((declared (%project-engine-node "package.json")))
+             ;; A project declares a RANGE; the target has to be a version.  Take the lowest
+             ;; version the range admits, which is the oldest runtime the project claims to run on
+             ;; and therefore the conservative choice for what a dependency may assume.
+             (and declared
+                  (let ((r (parse-range declared)))
+                    (and r (let ((lows (remove nil (mapcar (lambda (set)
+                                                             (find :gte set :key #'comparator-op))
+                                                           r))))
+                             (and lows (semver-string (comparator-version (first lows))))))))))
+          (t nil))))
+
 (defun cmd-install (args)
   (let* ((frozen (%flagp "--frozen" args))
+         (*target-node* (%engine-target args))
          (into (or (%arg-after "--into" args) "node_modules"))
          (lock (or (%arg-after "--lockfile" args) "shuttle-lock.json"))
          (named (mapcar #'%split-spec (remove "install" (%positional args) :test #'string=)))
+         (save (and named (not (%flagp "--no-save" args)) (probe-file "package.json")))
          (dev (not (or (%flagp "--production" args) (%flagp "--omit=dev" args))))
-         (declared (or named
-                       (and (probe-file "package.json")
-                            (project-dependencies "package.json" :dev dev))))
+         (existing-decls (and (probe-file "package.json")
+                              (project-dependencies "package.json" :dev dev)))
+         ;; NAMING A PACKAGE ADDS IT; IT DOES NOT REPLACE THE PROJECT.  `shuttle install chalk`
+         ;; used to install chalk and nothing else, quietly emptying node_modules of everything
+         ;; package.json already declared -- `npm install X` has never meant that.
+         (declared (append named (remove-if (lambda (d) (assoc (car d) named :test #'string=))
+                                            existing-decls)))
          ;; `--into node_modules` is where Node looks; the tree's own paths already begin with
          ;; `node_modules/`, so the destination ROOT is its parent.
          (dest (if (string= into "node_modules") "." into)))
@@ -77,7 +122,25 @@ declared dependencies.~%  Re-run without --frozen to update it.~%" lock)
          (when existing
            (format t "~&~a no longer covers the declared ranges; re-resolving~%" lock))
          (multiple-value-bind (tree n files) (install-tree declared :into dest :progress nil)
-           (write-lockfile tree lock :root-deps declared)
+           ;; Record what was installed, or the next `shuttle install` forgets it.  npm saves by
+           ;; default and so does this; --no-save is the way out.
+           (when save
+             (let ((adds (mapcar (lambda (d)
+                                   (let ((hit (gethash (car d) (node-children tree))))
+                                     (cons (car d)
+                                           (save-range-for
+                                            (cdr d)
+                                            (and hit (resolved-version (node-resolved hit)))))))
+                                 named)))
+               (save-dependencies "package.json" adds)
+               (format t "~&package.json  +~{~a~^ ~}~%" (mapcar #'car adds))))
+           ;; The lockfile must describe the PROJECT, not just this invocation: after saving, the
+           ;; declared set is whatever package.json now says, and locking only the names from the
+           ;; command line would drop everything already there.
+           (write-lockfile tree lock
+                           :root-deps (if save
+                                          (project-dependencies "package.json" :dev dev)
+                                          declared))
            (format t "~&~d packages, ~d files~%~a written~%" n files lock)))))))
 
 (defun cmd-bundle (args)
@@ -120,7 +183,7 @@ declared dependencies.~%  Re-run without --frozen to update it.~%" lock)
        (cmd (first args)))
   (handler-case
       (cond ((null cmd) (format t "~&shuttle — install, bundle and minify JavaScript, without node.~%~%~
-  shuttle install [name[@range] ...] [--frozen] [--production] [--into DIR]~%~
+  shuttle install [name[@range] ...] [--frozen] [--production] [--target-node V]~%~
   shuttle bundle <entry> [-o out] [--no-minify]~%~
   shuttle minify <file> [-o out]~%"))
             ((string= cmd "install") (cmd-install args))

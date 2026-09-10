@@ -194,3 +194,58 @@ dev range over it would ship a version the runtime dependency did not ask for."
          (deps (manifest-dependencies json))
          (devs (and dev (manifest-dependencies json :field "devDependencies"))))
     (append deps (remove-if (lambda (d) (assoc (car d) deps :test #'string=)) devs))))
+
+
+;;; ---- writing a dependency back into package.json --------------------------------------------
+
+(defun save-dependencies (package-json additions &key (field "dependencies"))
+  "Merge ADDITIONS -- an alist of (NAME . RANGE) -- into PACKAGE-JSON and rewrite it.
+
+`shuttle install foo` has to record that the project now depends on foo, or the next install
+forgets.  The file is re-serialised through the engine's own JSON.stringify with two-space
+indentation, which is what npm writes, so a project that uses both does not get a whole-file diff
+every time it changes tools.
+
+Insertion order is preserved by parse and by stringify alike, so an existing file keeps its shape
+and a genuinely new key lands at the end -- a rewrite that reordered a package.json would make
+every install look like a large change in review."
+  (unless *json-realm* (setf *json-realm* (make-realm)))
+  (define-global *json-realm* "__pj" (slurp-file package-json))
+  (define-global *json-realm* "__field" field)
+  (define-global *json-realm* "__adds"
+    (let ((pairs (with-output-to-string (o)
+                   (format o "[")
+                   (loop for (n . r) in additions for i from 0
+                         do (format o "~:[~;,~][~s,~s]" (plusp i) n r))
+                   (format o "]"))))
+      pairs))
+  (let ((text (to-string
+               (eval-script *json-realm* "
+(function () {
+  var pj = JSON.parse(__pj);
+  var adds = JSON.parse(__adds);
+  if (!pj[__field]) pj[__field] = {};
+  for (var i = 0; i < adds.length; i++) pj[__field][adds[i][0]] = adds[i][1];
+  // Sorted, because npm sorts these and an unsorted rewrite would churn the diff.
+  var keys = Object.keys(pj[__field]).sort();
+  var sorted = {};
+  for (var j = 0; j < keys.length; j++) sorted[keys[j]] = pj[__field][keys[j]];
+  pj[__field] = sorted;
+  return JSON.stringify(pj, null, 2) + \"\\n\";
+})()"))))
+    (with-open-file (s package-json :direction :output :if-exists :supersede
+                                    :external-format :utf-8)
+      (write-string text s))
+    package-json))
+
+(defun save-range-for (spec-range resolved-version)
+  "What to record in package.json for a package the user named.
+
+A RANGE the user typed is kept verbatim -- `^5`, `>=2 <4`, `1.x` are all things they meant.  A
+bare name, or an exact VERSION, becomes `^version`: that is what npm writes, and writing the exact
+version instead would pin the project to a patch release nobody asked to be pinned to.  The
+distinction is whether the spec parses as a single version, not whether it contains punctuation."
+  (cond ((null resolved-version) (or spec-range "*"))
+        ((or (null spec-range) (string= spec-range "*")) (format nil "^~a" resolved-version))
+        ((parse-semver spec-range) (format nil "^~a" resolved-version))   ; an exact version
+        (t spec-range)))

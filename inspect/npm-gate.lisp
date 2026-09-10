@@ -89,15 +89,17 @@
   (attach root "host" (mk "host" "2.1.0"))
   (ok "a peer provided beside the package satisfies it" (null (tree-violations root))))
 
-;; THE SHARP CASE.  A peer means "the dependent and I must see the SAME copy".  A copy the package
-;; keeps privately inside its own node_modules is exactly what a peer declaration exists to
-;; prevent -- two Reacts in one page -- so it must NOT count.
+;; A NESTED copy satisfies a peer.  I first asserted the opposite here, on the reasoning that a
+;; peer means "the dependent and I see the SAME copy" and a private copy defeats that.  That is the
+;; ideal rule and npm does not follow it: installing webpack puts ajv@6 at the root for
+;; schema-utils@3 and nests ajv@8 inside ajv-formats, because there is nowhere else for the second
+;; one to go.  The strict check called npm's own tree broken.  Placement still PREFERS the shared
+;; position; the check asks the question that decides whether the tree works.
 (let* ((root (make-instance 'node))
        (plug (attach root "plug" (mk "plug" "1.0.0" nil '(("host" . "^2.0.0"))))))
   (attach plug "host" (mk "host" "2.1.0"))
-  (let ((bad (tree-violations root)))
-    (ok "a package's OWN private copy does not satisfy its peer"
-        (and (= 1 (length bad)) (eq (fourth (first bad)) :missing-peer)) (first bad))))
+  (ok "a nested copy satisfies a peer, as it must for webpack's tree to be legal"
+      (null (tree-violations root))))
 
 ;; Optional peers: absent is fine, present-and-wrong is not.
 (let ((root (make-instance 'node)))
@@ -126,6 +128,35 @@
         (cdr (assoc "both" with-dev :test #'string=)))
     (ok "the runtime set is unaffected by the dev flag"
         (equal (remove-if (lambda (x) (string= (car x) "d")) with-dev) without))))
+
+(format t "~&~%== what gets written back into package.json ==~%")
+
+(ok "a bare name becomes ^version" (equal "^1.2.3" (save-range-for nil "1.2.3")))
+(ok "so does an EXACT version, which is what npm writes -- pinning a project to a patch release
+        nobody asked for is the alternative"
+    (equal "^5.3.0" (save-range-for "5.3.0" "5.3.0")))
+(ok "a RANGE the user typed is kept verbatim" (equal "^5" (save-range-for "^5" "5.3.0")))
+(ok "including one with spaces and operators"
+    (equal ">=2 <4" (save-range-for ">=2 <4" "3.1.0")))
+(ok "and `1.x` is a range, not a version" (equal "1.x" (save-range-for "1.x" "1.9.0")))
+
+(let ((path "/tmp/shuttle-npm-gate-save.json"))
+  (with-open-file (s path :direction :output :if-exists :supersede)
+    (write-string "{\"name\":\"demo\",\"version\":\"1.0.0\",
+                    \"dependencies\":{\"zeta\":\"^1.0.0\"},\"scripts\":{\"build\":\"x\"}}" s))
+  (save-dependencies path '(("alpha" . "^2.0.0")))
+  (let ((text (slurp-file path)))
+    (ok "the new dependency is written" (search "\"alpha\": \"^2.0.0\"" text))
+    (ok "the existing one survives" (search "\"zeta\": \"^1.0.0\"" text))
+    (ok "unrelated fields survive -- a rewrite that dropped `scripts` would be a disaster"
+        (search "\"build\"" text))
+    (ok "dependencies come out SORTED, so an install does not churn the diff"
+        (< (search "alpha" text) (search "zeta" text)))
+    (ok "two-space indentation, which is what npm writes" (search (format nil "~%  \"name\"") text))
+    ;; Idempotence: installing the same thing twice must not keep changing the file.
+    (let ((before (slurp-file path)))
+      (save-dependencies path '(("alpha" . "^2.0.0")))
+      (ok "writing the same dependency again changes nothing" (string= before (slurp-file path))))))
 
 (format t "~&~%== the lockfile round trip ==~%")
 
