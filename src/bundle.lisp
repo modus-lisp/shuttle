@@ -489,7 +489,27 @@ each live local reads through; pass two copies the body, splicing at spans and a
     (format nil "__d(~a, function (__x, __r) {~%\"use strict\";~%~a~a~%});~%"
             (%jstr (bm-id m)) (get-output-stream-string pre) (get-output-stream-string body))))
 
-(defun bundle (entry &key (id-root nil) (minify nil))
+(defun %entry-export-names (rec)
+  "The names an importer of this module would see, in source order.
+
+`export * from` has no name of its own and cannot be forwarded by this shape, so it is refused
+rather than silently dropped -- a payload that quietly exported nothing is exactly the failure
+this function exists to prevent."
+  (let ((names '()))
+    (dolist (e (module-exports rec))
+      (let ((n (entry-export-name e)))
+        (cond ((null n)
+               (%bail "the entry uses `export * from`, which :FORMAT :MODULE cannot forward.~%  ~
+Name the exports explicitly."))
+              ((not (member n names :test #'string=)) (push n names)))))
+    (nreverse names)))
+
+(defun %ident-like-p (name)
+  (and (plusp (length name))
+       (or (alpha-char-p (char name 0)) (member (char name 0) '(#\_ #\$)))
+       (every (lambda (c) (or (alphanumericp c) (member c '(#\_ #\$)))) name)))
+
+(defun bundle (entry &key (id-root nil) (minify nil) (format :script))
   "ENTRY -> one script, as a string.
 
 With :MINIFY, comments and insignificant whitespace are stripped from the result.  It runs on the
@@ -513,15 +533,33 @@ becomes a plain function here, and `await` cannot appear in one." (bm-id m))))
       (dolist (m order)
         (let ((live (module-live-exports (bm-record m))))
           (when live (setf (gethash (bm-id m) live-of) live))))
-      (let ((out (with-output-to-string (o)
-                   (format o "(function () {~%~a~%" *runtime*)
-                   (dolist (m order) (write-string (emit-module m live-of) o))
-                   (format o "return __r(~a);~%})();~%" (%jstr (bm-id (car (last order))))))))
+      (let* ((entry-mod (car (last order)))
+             (out (with-output-to-string (o)
+                    ;; :SCRIPT is a bare IIFE whose value is discarded; :MODULE keeps the entry's
+                    ;; namespace and re-exports it, so `await import(url)` gets real named exports.
+                    ;; The difference is not cosmetic: a consumer that does
+                    ;;   const mod = await import(blobURL); mod.init(api)
+                    ;; sees NOTHING on a :SCRIPT bundle, because an IIFE has no exports.  That is
+                    ;; how glass-webrtc's phone client came to say "payload exports no init()".
+                    (when (eq format :module) (format o "var __ns = "))
+                    (format o "(function () {~%~a~%" *runtime*)
+                    (dolist (m order) (write-string (emit-module m live-of) o))
+                    (format o "return __r(~a);~%})();~%" (%jstr (bm-id entry-mod)))
+                    (when (eq format :module)
+                      (dolist (n (%entry-export-names (bm-record entry-mod)))
+                        (cond ((string= n "default")
+                               (format o "export default __ns.default;~%"))
+                              ((%ident-like-p n)
+                               (format o "export const ~a = __ns.~a;~%" n n))
+                              (t
+                               ;; A string export name ("a-b") is legal and cannot be a const.
+                               (format o "const __x$~a = __ns[~a];~%export { __x$~:*~a as ~a };~%"
+                                       (sxhash n) (%jstr n) (%jstr n)))))))))
         ;; THE OUTPUT IS PARSED BEFORE IT IS RETURNED.  Every rewrite above is textual, and the
         ;; failure mode of a bad one -- `{__n1["Debug"]: 1}`, a key turned into a property read --
         ;; is a SYNTAX error rather than a subtly wrong program.  Parsing here is what converts
         ;; that whole class from silent corruption into a refusal.
-        (handler-case (parse-program out)
+        (handler-case (if (eq format :module) (parse-module out) (parse-program out))
           (error (e) (%bail "the emitted bundle does not parse, so a rewrite above is wrong:~%  ~a" e)))
         (if minify
             (handler-case (minify-source out)
