@@ -36,7 +36,7 @@
 
 (in-package #:shuttle)
 
-(defparameter *value-flags* '("--into" "--lockfile" "--target-node" "-o")
+(defparameter *value-flags* '("--into" "--lockfile" "--target-node" "-o" "--global-name")
   "Flags that take a separate value.  The VALUE is not a positional argument, and treating it as
 one made `--target-node v20.20.2` try to install a package called v20.20.2 -- a flag's value does
 not start with a dash, so filtering on dashes alone cannot see it.")
@@ -147,11 +147,12 @@ declared dependencies.~%  Re-run without --frozen to update it.~%" lock)
   (let* ((pos (remove "bundle" (%positional args) :test #'string=))
          (entry (first pos))
          (out (%arg-after "-o" args))
-         (minify (not (%flagp "--no-minify" args))))
+         (minify (not (%flagp "--no-minify" args)))
+         (global-name (%arg-after "--global-name" args)))
     (unless entry
       (format *error-output* "~&usage: shuttle bundle <entry> [-o out] [--no-minify]~%")
       (sb-ext:exit :code 1))
-    (let ((text (handler-case (bundle entry :minify minify)
+    (let ((text (handler-case (bundle entry :minify minify :global-name global-name)
                   (bundle-error (e)
                     (format *error-output* "~&shuttle bundle: ~a~%" (bundle-error-text e))
                     (sb-ext:exit :code 1)))))
@@ -184,7 +185,7 @@ declared dependencies.~%  Re-run without --frozen to update it.~%" lock)
   (handler-case
       (cond ((null cmd) (format t "~&shuttle — install, bundle and minify JavaScript, without node.~%~%~
   shuttle install [name[@range] ...] [--frozen] [--production] [--target-node V]~%~
-  shuttle bundle <entry> [-o out] [--no-minify]~%~
+  shuttle bundle <entry> [-o out] [--no-minify] [--global-name NAME]~%~
   shuttle minify <file> [-o out]~%"))
             ((string= cmd "install") (cmd-install args))
             ((string= cmd "bundle") (cmd-bundle args))

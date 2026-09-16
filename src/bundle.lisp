@@ -509,8 +509,11 @@ Name the exports explicitly."))
        (or (alpha-char-p (char name 0)) (member (char name 0) '(#\_ #\$)))
        (every (lambda (c) (or (alphanumericp c) (member c '(#\_ #\$)))) name)))
 
-(defun bundle (entry &key (id-root nil) (minify nil) (format :script))
+(defun bundle (entry &key (id-root nil) (minify nil) (format :script) (global-name nil))
   "ENTRY -> one script, as a string.
+
+:FORMAT :MODULE re-exports the entry's names for a consumer that imports it; :GLOBAL-NAME assigns
+the entry's namespace to a global instead, for a page that loads the result as a classic script.
 
 With :MINIFY, comments and insignificant whitespace are stripped from the result.  It runs on the
 FINISHED bundle rather than on each module going in, which is both simpler and safer: the emitter
@@ -541,7 +544,12 @@ becomes a plain function here, and `await` cannot appear in one." (bm-id m))))
                     ;;   const mod = await import(blobURL); mod.init(api)
                     ;; sees NOTHING on a :SCRIPT bundle, because an IIFE has no exports.  That is
                     ;; how glass-webrtc's phone client came to say "payload exports no init()".
-                    (when (eq format :module) (format o "var __ns = "))
+                    ;; GLOBAL-NAME is the third thing a bundle can be.  :SCRIPT throws the value
+                    ;; away, :MODULE exports it, and a page that loads a CLASSIC script needs it on
+                    ;; a global -- which is what esbuild's --global-name is for, and what a NIP-07
+                    ;; signer shim needs so `window.NSIGNER' is there before a deferred module runs.
+                    (cond ((eq format :module) (format o "var __ns = "))
+                          (global-name (format o "var ~a = " global-name)))
                     (format o "(function () {~%~a~%" *runtime*)
                     (dolist (m order) (write-string (emit-module m live-of) o))
                     (format o "return __r(~a);~%})();~%" (%jstr (bm-id entry-mod)))
