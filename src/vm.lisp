@@ -839,14 +839,33 @@ returned a target, it keeps returning it for the rest of that job -- so the valu
 until the job queue empties, which is where a job ends.")
 
 (defun enqueue-microtask (thunk)
-  (let ((cell (cons thunk nil)))
+  "Queue THUNK, remembering WHICH REALM queued it.
+
+A microtask belongs to the realm that created it, and it may run long after the stack that queued
+it has gone -- a host drains the queue from its own event loop, where nothing has bound
+*CURRENT-REALM* at all.  Everything the reaction then asks the realm for comes back NIL: the one
+that surfaced was PROMISE-CONSTRUCTOR handing a NIL to NEW-PROMISE-CAPABILITY, reported as
+`Promise capability requires a constructor', on a page whose only sin was calling `.then' inside a
+timer callback.
+
+Captured here rather than bound by the drainer, because the drainer does not know: by then the
+answer is whatever realm the host happened to be in, and with several realms that is not merely
+absent but WRONG.  A thunk queued with no realm current keeps NIL and is run as before."
+  (let ((cell (cons (let ((realm *current-realm*))
+                      (if realm
+                          (lambda () (let ((*current-realm* realm)) (funcall thunk)))
+                          thunk))
+                    nil)))
     (if (car *mtq*)
         (setf (cdr (cdr *mtq*)) cell (cdr *mtq*) cell)
         (setf (car *mtq*) cell (cdr *mtq*) cell))))
 
 (defun drain-microtasks ()
   "Run queued microtasks to completion (each may enqueue more). Swallows JS
-   throws from reactions (unhandled rejections have no observer here)."
+   throws from reactions (unhandled rejections have no observer here).
+
+Each thunk restores the realm that queued it -- see ENQUEUE-MICROTASK -- so this is safe to call
+from a host event loop with no realm bound, which is exactly how a browser embedding calls it."
   ;; A job ends when the queue empties, and that is when a WeakRef's promise of consistency
   ;; within a job expires.
   (setf *weak-kept-alive* nil)
@@ -919,7 +938,20 @@ until the job queue empties, which is where a job ends.")
   "NewPromiseCapability(C): C must be a constructor. Runs C with a
    GetCapabilitiesExecutor and captures the resolve/reject it hands back."
   (unless (and (js-object-p c) (js-object-construct c))
-    (js-throw (make-native-error "TypeError" "Promise capability requires a constructor")))
+    ;; SAY WHAT ARRIVED.  This fires from `then', `catch', `finally', every Promise combinator and
+    ;; the machinery behind `await' -- so the bare sentence fits a dozen call sites and names none
+    ;; of them.  What the caller actually handed over is the one fact that separates them, and it
+    ;; costs a TO-STRING on a path that is already throwing.
+    (js-throw (make-native-error
+               "TypeError"
+               (format nil "Promise capability requires a constructor, got ~a"
+                       (cond ((js-undefined-p c) "undefined")
+                             ((eq c *null*) "null")
+                             ((not (js-object-p c))
+                              (format nil "~a ~a" (js-typeof c)
+                                      (or (ignore-errors (to-string c)) "")))
+                             (t (format nil "a non-constructor ~a"
+                                        (or (ignore-errors (js-object-class c)) "object"))))))))
   (let ((resolve *undefined*) (reject *undefined*))
     (let* ((executor
              (native-fn
@@ -1075,9 +1107,26 @@ until the job queue empties, which is where a job ends.")
 
 (defun promise-constructor ()
   (let ((cell (assoc *current-realm* *promise-ctor-cache*)))
-    (if cell (cdr cell)
-        (progn (ensure-promise-global)
-               (cdr (assoc *current-realm* *promise-ctor-cache*))))))
+    (or (and cell (cdr cell))
+        (progn
+          (ensure-promise-global)
+          (or (cdr (assoc *current-realm* *promise-ctor-cache*))
+              ;; THE CACHE IS AN OPTIMISATION; THE GLOBAL IS THE ANSWER.  Only
+              ;; INSTALL-PROMISE-GLOBAL fills the cache, and ENSURE-PROMISE-GLOBAL calls it only
+              ;; when the realm has no `Promise' yet -- so a realm that ARRIVED with one (an
+              ;; embedder that installed its own globals, which is the ordinary case for a host
+              ;; like weft) is marked installed, never cached, and answers NIL from here for the
+              ;; rest of its life.
+              ;;
+              ;; NIL then travels: `then' hands it to NEW-PROMISE-CAPABILITY as the species
+              ;; constructor and the page is told `Promise capability requires a constructor'
+              ;; about code that never mentioned Promise.  Reading the global closes that gap at
+              ;; the only place that can tell the difference.
+              (let* ((realm *current-realm*)
+                     (g (and realm (env-get (realm-global-env realm) "Promise"))))
+                (when (and (js-object-p g) (js-object-construct g))
+                  (push (cons realm g) *promise-ctor-cache*)
+                  g)))))))
 
 (defun promise-species-ctor (o default)
   "SpeciesConstructor(O, defaultConstructor): C = O.constructor; if undefined return
