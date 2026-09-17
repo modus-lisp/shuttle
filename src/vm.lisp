@@ -2188,6 +2188,18 @@ string threw a string, and `catch (e) { e.constructor.name }` said \"String\"."
                    (push! (js-call evalfn *undefined* args)))))
             (:call (let* ((args (loop repeat (first a) collect (pop!)))
                           (callee (pop!)) (thisv (pop!)))
+                     ;; The callee's SOURCE NAME, when the compiler knew it, so the message can say
+                     ;; which property was not a function rather than merely that something wasn't.
+                     (when (and (second a) (not (js-callable-p callee)))
+                       (js-throw (make-native-error
+                                  "TypeError"
+                                  (format nil "~a.~a is not a function"
+                                          (cond ((js-undefined-p thisv) "undefined")
+                                                ((eq thisv *null*) "null")
+                                                ((js-object-p thisv)
+                                                 (or (ignore-errors (js-object-class thisv)) "object"))
+                                                (t (js-typeof thisv)))
+                                          (second a)))))
                      (push! (js-call callee thisv (nreverse args)))))
             (:new (let* ((args (loop repeat (first a) collect (pop!))) (callee (pop!)))
                     (push! (js-construct callee (nreverse args)))))

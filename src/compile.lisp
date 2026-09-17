@@ -1533,7 +1533,17 @@ TDZ is what finally surfaced it."
                       (em :get-prop-c (second (third callee))))))
              ;; stack: [thisv fn]; if fn nullish, drop fn and SHORT (thisv is the 1 base popped)
              (em :nullish-short-2 short)
-             (mapc #'compile-expr (third node)) (em :call (length (third node))))
+             (mapc #'compile-expr (third node))
+             ;; CARRY THE NAME, for the error and nothing else.  A static property call knows what
+             ;; it is calling at compile time, and `undefined is not a function' throws that away
+             ;; -- it describes the value and not the call, so every such failure on a page reads
+             ;; identically and names nothing.  `x.foo is not a function' is the difference between
+             ;; a search and a read.
+             (em :call (length (third node))
+                 (and (not (fourth callee))
+                      (not (member (car callee) '(:private-member :oprivate-member)))
+                      (stringp (second (third callee)))
+                      (second (third callee)))))
            (progn
              (compile-chain-base callee short)            ; the fn -> stack
              (em :nullish-short short)                     ; fn nullish: SHORT pops the 1 fn
@@ -1555,7 +1565,13 @@ TDZ is what finally surfaced it."
                     ((:private-member :oprivate-member) (em :private-get (resolve-private-name (third callee))))
                     (t (if (fourth callee) (progn (compile-expr (third callee)) (em :get-prop))
                            (em :get-prop-c (second (third callee))))))
-                  (mapc #'compile-expr (third node)) (em :call (length (third node))))
+                  (mapc #'compile-expr (third node))
+                  ;; The callee's name, for the error only -- see the other :CALL below.
+                  (em :call (length (third node))
+                      (and (not (fourth callee))
+                           (not (member (car callee) '(:private-member :oprivate-member)))
+                           (stringp (second (third callee)))
+                           (second (third callee)))))
            (progn (compile-chain-base callee short) (em :const *undefined*) (em :swap)
                   (mapc #'compile-expr (third node)) (em :call (length (third node)))))))))
 
@@ -1635,7 +1651,17 @@ what the read path already does with :SUPER-GET.  Value is expected on the stack
   ;; stack now: thisv callee
   (if (some (lambda (a) (and (consp a) (eq (car a) :spread))) args)
       (progn (compile-arg-array args) (em :call-spread))       ; thisv callee argsArray -> result
-      (progn (mapc #'compile-expr args) (em :call (length args)))))
+      (progn (mapc #'compile-expr args)
+             ;; CARRY THE NAME, for the error and nothing else.  A static method call knows what it
+             ;; is calling at compile time, and "undefined is not a function" throws that away: it
+             ;; describes the value instead of the call, so every such failure on a page reads the
+             ;; same and names nothing.  jQuery's `ready' dying in a timer said exactly that, twice,
+             ;; about a function whose body calls four different things.
+             (em :call (length args)
+                 (and (eq (car callee) :member)
+                      (not (fourth callee))
+                      (stringp (second (third callee)))
+                      (second (third callee)))))))
 
 (defun compile-arg-array (args)
   "Build an array of argument values, flattening spreads. Leaves it on the stack."
