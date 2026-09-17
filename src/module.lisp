@@ -221,7 +221,9 @@ TOK-FROM TOK-TO); STARTS is the token-offset vector.  CHAR-END is the start of t
 span carries its item's trailing whitespace -- which is what makes deleting one leave no ragged
 hole.  The token indices are what let the emitter slice `export ` off the front of a declaration
 without touching a byte of the declaration itself: the payload begins at (aref starts (1+ from))."
-  (multiple-value-bind (toks escaped starts) (tokenize src)
+  ;; ANNEX B.1.3 IS SCRIPT-ONLY.  `<!--` is a comment in a script and a syntax error in a module,
+  ;; and that difference is the spec's, not an accident of this lexer.
+  (multiple-value-bind (toks escaped starts) (let ((*html-comments-allowed* nil)) (tokenize src))
     ;; The Module goal symbol is [+Await]: `await` is a keyword at the top level of a module and
     ;; is never an identifier there, whether or not the module actually uses top-level await.
     (let ((*toks* toks) (*escaped-idents* escaped) (*pos* 0) (*in-async* t)

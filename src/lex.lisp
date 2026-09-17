@@ -104,6 +104,22 @@ by accident -- failed to lex at all."
                                           :test #'string=)))))))))
       (decf i))))
 
+(defvar *html-comments-allowed* t
+  "Annex B.1.3: may `<!--` and `-->` open a single-line comment?
+
+T for a SCRIPT, NIL for a MODULE, and that is the whole of the rule -- B.1.3 is web-compatibility
+syntax that the Module goal deliberately does not have.
+
+IT IS NOT A CURIOSITY.  The wrapper is from the era when a script had to hide from a browser that
+did not know <script>, and pages still ship it: slashdot.org has `<!-- xandr !-->` and
+`<!-- 6sense -->` sitting inside ordinary inline scripts.  Without this the `<` is a syntax error,
+the whole script is dead, and everything it defined is missing -- which on that page meant jQuery
+never ran and twenty-six further errors followed from `$ is not defined`.
+
+The second form is the fiddly one: `-->` is a comment ONLY at the start of a line (nothing but
+whitespace and comments before it since a line terminator).  Anywhere else it stays `a-- > b`,
+which is why LINE-START below is tracked rather than assumed.")
+
 (defvar *legacy-brace-rule* nil
   "Bind to T to restore the pre-fix rule that called EVERY `)` before a `{` a statement body.
 
@@ -296,10 +312,17 @@ statement body."
         ;; No branch has to remember to record anything.
         (ends (make-array 0 :adjustable t :fill-pointer 0 :element-type 'fixnum))
         (tok-start 0)
+        ;; T while nothing but whitespace and comments has been seen since the last line
+        ;; terminator -- the condition Annex B's `-->` is allowed under.  Starts T: the first
+        ;; line of a file is a line like any other.
+        (line-start t)
         (*escaped-idents* (make-hash-table)))
     (labels ((peek (&optional (k 0)) (if (< (+ i k) n) (char src (+ i k)) #\Nul))
              (emit (type val) (vector-push-extend (cons type val) toks)
-                              (vector-push-extend tok-start starts)))
+                              (vector-push-extend tok-start starts)
+                              ;; A real token means the line has content now, so a later `-->`
+                              ;; on THIS line is an operator rather than a comment.
+                              (setf line-start nil)))
       (loop while (< i n) do
         (let ((c (char src i)))
           ;; Set at the top of every iteration, which is exactly where a token may begin: the
@@ -309,13 +332,31 @@ statement body."
             (vector-push-extend i ends))
           (setf tok-start i)
           (cond
-            ((js-whitespace-p c) (incf i))
+            ((js-whitespace-p c)
+             ;; A line terminator restores "nothing but space since the line began", which is the
+             ;; condition `-->` is allowed under.
+             (when (js-line-terminator-p c) (setf line-start t))
+             (incf i))
             ;; comments
             ((and (char= c #\/) (char= (peek 1) #\/))
              (loop while (and (< i n) (not (js-line-terminator-p (char src i)))) do (incf i)))
             ((and (char= c #\/) (char= (peek 1) #\*))
-             (incf i 2) (loop until (or (>= i n) (and (char= (char src i) #\*) (char= (peek 1) #\/))) do (incf i))
+             (incf i 2)
+             ;; A multi-line comment that CONTAINS a line terminator counts as one for `-->`,
+             ;; which is why this arm looks rather than merely skipping.
+             (loop until (or (>= i n) (and (char= (char src i) #\*) (char= (peek 1) #\/)))
+                   do (when (js-line-terminator-p (char src i)) (setf line-start t))
+                      (incf i))
              (incf i 2))
+            ;; ---- Annex B.1.3: HTML-like comments, in a SCRIPT only ------------------------
+            ((and *html-comments-allowed*
+                  (char= c #\<) (char= (peek 1) #\!) (char= (peek 2) #\-) (char= (peek 3) #\-))
+             (loop while (and (< i n) (not (js-line-terminator-p (char src i)))) do (incf i)))
+            ;; `-->` closes one, but ONLY at the start of a line: everywhere else it is `a-- > b`,
+            ;; and a decrement followed by a comparison must keep working.
+            ((and *html-comments-allowed* line-start
+                  (char= c #\-) (char= (peek 1) #\-) (char= (peek 2) #\>))
+             (loop while (and (< i n) (not (js-line-terminator-p (char src i)))) do (incf i)))
             ;; regex literal  /pattern/flags  (only where a value/expression is expected)
             ((and (char= c #\/) (regex-allowed-p toks))
              (multiple-value-bind (pat flags nj) (scan-regex src i n)
