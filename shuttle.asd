@@ -44,6 +44,7 @@ host-binding seam a consumer like weft hangs DOM objects + reflow on). Oracle: t
                                            (:file "sharedarraybuffer")
                                            (:file "atomics")
                                            (:file "temporal-core")
+                                           (:file "temporal-calendars")
                                            (:file "temporal-instant")
                                            (:file "temporal-plaintime")
                                            (:file "temporal-duration")
