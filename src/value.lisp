@@ -326,11 +326,81 @@
             (progn (setf (js-object-extensible o) nil) t)))
       nil))
 
+;;; ---- the mapped arguments object's parameter map ----
+;;; A sloppy function with a SIMPLE parameter list gets an `arguments' whose indices
+;;; ALIAS the parameter bindings: assigning to arguments[0] is assigning to the first
+;;; parameter, and assigning to the parameter is visible through arguments[0].  The
+;;; alias is not an accessor pair -- [[GetOwnProperty]] must still report a plain DATA
+;;; descriptor -- so it lives beside the property store as a map from index to binding
+;;; name, consulted by [[Get]], [[Set]], [[Delete]] and the two descriptor ops.
+;;;
+;;; The map is a SUBSET of the indices: only those below both the argument count and
+;;; the parameter count, and for a repeated parameter name only the LAST position
+;;; (`function f(a, a)` aliases index 1, never index 0).  Everything else on the
+;;; object is an ordinary property.
+;;;
+;;; ENV-GET / ENV-SET are defined in vm.lisp, which loads after this file; the calls
+;;; are resolved at runtime, as elsewhere in this file.
+(defun %arg-map (o)
+  (and (js-object-p o) (js-object-internal o) (getf (js-object-internal o) :param-map)))
+
+(defun %arg-map-name (o k)
+  "The binding name index K aliases on O, or NIL when K is not mapped."
+  (let ((pm (%arg-map o)))
+    (and pm (stringp k) (gethash k (cdr pm)))))
+
+(defun %arg-map-forget (o k)
+  "Drop K's alias: the property and the binding go their separate ways."
+  (let ((pm (%arg-map o)))
+    (when pm (remhash k (cdr pm)))))
+
+(defun %arg-map-read (o k)
+  (let ((pm (%arg-map o)) (name (%arg-map-name o k)))
+    (env-get (car pm) name)))
+
+(defun %arg-map-write (o k v)
+  (let ((pm (%arg-map o)) (name (%arg-map-name o k)))
+    (env-set (car pm) name v)
+    ;; keep the stored descriptor's value in step, so anything reading the property
+    ;; store directly (enumeration, a later un-mapping) sees the same value.
+    (let ((d (props-get o k)))
+      (when (and d (not (prop-accessor d))) (setf (prop-value d) v)))))
+
+(defun %mapped-args-get-own (o k)
+  "[[GetOwnProperty]] for a mapped arguments object: a DATA descriptor carrying the
+   binding's CURRENT value.  Reporting an accessor here would be observable and
+   wrong -- the spec's arguments object has no accessors on its indices."
+  (let ((d (props-get o k)))
+    (when (and d (not (prop-accessor d)) (%arg-map-name o k))
+      (setf (prop-value d) (%arg-map-read o k)))
+    d))
+
+(defun %mapped-args-define (o k desc)
+  "[[DefineOwnProperty]] for a mapped arguments object.  Spec order: the ordinary
+   definition happens FIRST and may reject; only then does the map react -- an
+   accessor descriptor ends the alias, a value writes through it, and writable:false
+   ends it (after the write, so the last value still lands)."
+  (let ((mapped (and (%arg-map-name o k) t)))
+    (let ((ok (ordinary-define-own-property o k desc)))
+      (when (and ok mapped)
+        (cond
+          ((or (present-p desc :get) (present-p desc :set) (getf desc :accessor))
+           (%arg-map-forget o k))
+          (t
+           (when (present-p desc :value) (%arg-map-write o k (getf desc :value)))
+           (when (and (present-p desc :writable) (not (getf desc :writable)))
+             (%arg-map-forget o k)))))
+      ok)))
+
 (defun ordinary-get (o key &optional receiver)
   (unless receiver (setf receiver o))
   (cond
     ((js-object-p o)
-     (let ((d (props-get o (prop-key key))))
+     (let* ((k0 (prop-key key))
+            (d (props-get o k0)))
+       ;; a mapped arguments index reads THROUGH to the parameter binding
+       (when (and d (not (prop-accessor d)) (%arg-map-name o k0))
+         (return-from ordinary-get (%arg-map-read o k0)))
        (cond (d (if (prop-accessor d)
                     (let ((g (prop-get d)))
                       (if (and g (not (js-undefined-p g))) (js-call g receiver '()) *undefined*))
@@ -490,6 +560,14 @@
                        (when (and (eq res *true*) ld (>= idx len))
                          (setf (prop-value ld) (float (1+ idx) 1d0)))
                        (return-from ordinary-set res))))))))))
+  ;; a mapped arguments index writes THROUGH to the parameter binding, so
+  ;; `arguments[0] = v` and `a = v` are the same store rather than two.
+  (let ((k0 (prop-key key)))
+    (when (and (eq o receiver) (%arg-map-name o k0))
+      (let ((d (props-get o k0)))
+        (when (and d (not (prop-accessor d)) (prop-writable d))
+          (%arg-map-write o k0 v)
+          (return-from ordinary-set *true*)))))
   (let* ((k (prop-key key)) (d (props-get o k)))
     (cond
       ((and d (prop-accessor d))
@@ -561,7 +639,11 @@ a TypeError rather than a silent no-op."
 (defun ordinary-delete (o key)
   (let* ((k (prop-key key)) (d (props-get o k)))
     (cond ((null d) *true*)
-          ((prop-configurable d) (props-remove o k) (%key-forget o k) *true*)
+          ((prop-configurable d)
+           ;; deleting a mapped index ends the alias too -- the parameter keeps its
+           ;; value, but arguments[i] no longer tracks it.
+           (%arg-map-forget o k)
+           (props-remove o k) (%key-forget o k) *true*)
           (t *false*))))
 (defun ordinary-own-keys (o)
   ;; Spec order: integer indices ascending, then string keys in insertion order,

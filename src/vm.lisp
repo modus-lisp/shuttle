@@ -467,8 +467,10 @@ module not a script."
           (unless (js-object-p r)
             (js-throw (make-native-error "TypeError" "iterator return result is not an object"))))))))
 
-(defun make-arguments-object (args &optional fn strict)
-  "An (unmapped) arguments object: indexed elements + length + @@iterator + callee.
+(defun make-arguments-object (args &optional fn strict env params)
+  "The arguments object: indexed elements + length + @@iterator + callee, and -- for
+   a SLOPPY function with a SIMPLE parameter list -- the parameter map that makes
+   arguments[i] an alias of the i-th parameter binding.
 
    CALLEE WAS MISSING IN BOTH MODES, and it is not the same property in each.  A
    sloppy arguments object carries the function itself as a data property, which
@@ -477,10 +479,12 @@ module not a script."
    undefined in sloppy code and quietly answered instead of throwing in strict
    code -- two different wrong answers from one omission.
 
-   Still UNMAPPED: in sloppy code with a simple parameter list the spec aliases
-   arguments[i] to the parameter, so assigning to one is visible through the other.
-   That needs the exotic-object behaviour (a parameter map, with [[GetOwnProperty]]
-   still reporting a DATA descriptor), not an accessor pair, and is not done here."
+   MAPPING IS NARROW, and every condition below is a real one: strict code is never
+   mapped, a parameter list with a default, rest or pattern is never mapped, only
+   indices that have BOTH an argument and a parameter are mapped, and a repeated
+   parameter name maps only its LAST position -- `function f(a, a)` aliases index 1
+   and leaves index 0 an ordinary property.  The aliasing itself lives in value.lisp
+   (%ARG-MAP-*), since [[Get]], [[Set]] and [[Delete]] all have to honour it."
   (let ((o (make-object :proto (%obj-proto) :class "Arguments")))
     (loop for a in args for i from 0 do (put o (princ-to-string i) a))
     (put o "length" (float (length args) 1d0) :enumerable nil)
@@ -495,6 +499,21 @@ module not a script."
              (put-accessor o "callee" :get thrower :set thrower
                            :enumerable nil :configurable nil)))
           (fn (put o "callee" fn :enumerable nil)))
+    ;; The parameter map: sloppy code, simple parameter list, and an environment to
+    ;; alias into.  Built back-to-front so a repeated name keeps its LAST index.
+    (when (and (not strict) env params (simple-parameter-list-p params))
+      (let ((map (make-hash-table :test 'equal))
+            (seen '())
+            (n (min (length args) (length params))))
+        (loop for i from (1- n) downto 0
+              for name = (nth i params)
+              do (unless (member name seen :test #'string=)
+                   (push name seen)
+                   (setf (gethash (princ-to-string i) map) name)))
+        (when (plusp (hash-table-count map))
+          (setf (getf (js-object-internal o) :param-map) (cons env map))
+          (setf (getf (js-object-internal o) :get-own-property) #'%mapped-args-get-own)
+          (setf (getf (js-object-internal o) :define-own-property) #'%mapped-args-define))))
     o))
 
 (defun fn-home (fn) (getf (js-object-internal fn) :home))
@@ -550,8 +569,16 @@ module not a script."
               (t (lambda (this args)
                    (let ((fenv (new-env env))
                          (*new-target* (if (eq (code-this-mode code) :lexical) lexical-nt *new-target*)))
-                     (env-declare fenv "arguments"
-                                  (make-arguments-object args fn (code-strict code)))
+                     ;; AN ARROW HAS NO `arguments' OF ITS OWN.  It closes over the
+                     ;; enclosing function's, exactly as it closes over `this' -- so
+                     ;; declaring one here SHADOWED the outer object and every arrow
+                     ;; that mentions `arguments' saw the wrong one: its own argument
+                     ;; count, its own (absent) values, and at top level an arguments
+                     ;; object where there should be none at all.
+                     (unless (eq (code-this-mode code) :lexical)
+                       (env-declare fenv "arguments"
+                                    (make-arguments-object args fn (code-strict code)
+                                                           fenv (code-params code))))
                      (run code fenv (bind this) args fn)))))))
     ;; class constructors: only callable via `new`; the [[Construct]] initializes
     ;; the instance (derived ctors require super() to run the base first).
@@ -561,7 +588,7 @@ module not a script."
        (setf (getf (js-object-internal fn) :ctor-run)
              (lambda (this args) (let ((fenv (new-env env)))
                                    (env-declare fenv "arguments"
-                                                (make-arguments-object args fn (code-strict code)))
+                                                (make-arguments-object args fn (code-strict code) fenv (code-params code)))
                                    (run code fenv this args fn))))
        (setf (js-object-construct fn)
              (lambda (args new-target)
@@ -713,8 +740,11 @@ module not a script."
   ;; made it, and the module's exports are read out of it -- so it must run there rather than in
   ;; a fresh child.  A module also has no `arguments`.
   (let ((fenv (or given-env (new-env env))))
-    (unless given-env
-      (env-declare fenv "arguments" (make-arguments-object args fn (code-strict code))))
+    ;; Same rule for an async arrow: no `arguments' of its own (and a module body,
+    ;; which arrives with GIVEN-ENV, has none either).
+    (unless (or given-env (eq (code-this-mode code) :lexical))
+      (env-declare fenv "arguments"
+                   (make-arguments-object args fn (code-strict code) fenv (code-params code))))
     (when (code-inst-instrs code)
       (%run (make-code :name (code-name code) :params (code-params code)
                        :instrs (code-inst-instrs code))
