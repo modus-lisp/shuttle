@@ -122,7 +122,7 @@
                (getf (js-object-internal v) :temporal-plainyearmonth)
                (getf (js-object-internal v) :temporal-zoneddatetime)))
       (let ((c (getf (js-object-internal v) :temporal-calendar "iso8601")))
-        (if (string-equal c "iso8601") "iso8601"
+        (if (find-calendar c) (cal-id (find-calendar c))
             (js-throw (make-native-error "RangeError" "unknown calendar"))))
       (canonicalize-calendar-id v)))
 
@@ -619,8 +619,7 @@
               (multiple-value-bind (tz-id offset) (constructor-time-zone tz-v)
                 (let ((calendar (if (js-undefined-p cal-v) "iso8601"
                                     (if (stringp cal-v)
-                                        (if (string-equal cal-v "iso8601") "iso8601"
-                                            (js-throw (make-native-error "RangeError" "calendar must be iso8601")))
+                                        (canonical-calendar-or-throw cal-v)
                                         (js-throw (make-native-error "TypeError" "calendar must be a string"))))))
                   (make-zoneddatetime realm ns tz-id offset calendar nt))))))
     (def-value ctor "prototype" proto :writable nil :configurable nil)

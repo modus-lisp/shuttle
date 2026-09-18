@@ -75,8 +75,9 @@
         (unless res
           (js-throw (make-native-error "RangeError"
                       (format nil "~a is not a valid calendar string" s))))
-        (let ((cal (first res)))
-          (if (string-equal cal "iso8601") "iso8601"
+        (let* ((cal (first res))
+               (known (find-calendar cal)))
+          (if known (cal-id known)
               (js-throw (make-native-error "RangeError"
                           (format nil "unknown calendar: ~a" cal)))))))))
 
@@ -123,19 +124,23 @@
             (shuttle-error () nil)))))))
 
 (defun canonicalize-calendar-id (v)
-  "ToTemporalCalendarIdentifier for the ISO calendar only. V must be a string (a
-   bare id \"iso8601\", or any Temporal ISO string carrying a [u-ca=...]
-   annotation) — else TypeError. A string that neither equals iso8601 nor parses
-   is a RangeError. Returns \"iso8601\"."
+  "ToTemporalCalendarIdentifier. V must be a string (a bare calendar id, or any
+   Temporal ISO string carrying a [u-ca=...] annotation) — else TypeError. A
+   string that names no calendar we speak and does not parse is a RangeError.
+   Returns the CANONICAL id, so an alias and its canonical spelling produce
+   objects that compare equal."
   (cond
     ;; A Temporal object with its own calendar slot supplies it directly.
     ((and (js-object-p v) (getf (js-object-internal v) :temporal-calendar))
-     (let ((c (getf (js-object-internal v) :temporal-calendar)))
-       (if (string-equal c "iso8601") "iso8601"
+     (let* ((c (getf (js-object-internal v) :temporal-calendar))
+            (known (find-calendar c)))
+       (if known (cal-id known)
            (js-throw (make-native-error "RangeError" "unknown calendar")))))
     ((not (stringp v))
      (js-throw (make-native-error "TypeError" "calendar must be a string")))
-    ((string-equal v "iso8601") "iso8601")
+    ;; A bare identifier for any calendar we speak, folded to its canonical
+    ;; spelling ("islamicc" -> "islamic-civil", "GREGORY" -> "gregory").
+    ((find-calendar v) (cal-id (find-calendar v)))
     (t (parse-calendar-annotation-from-string v))))
 
 ;;; ===========================================================================
@@ -368,9 +373,7 @@
   (declare (ignore s))
   (let ((cal (getf r :calendar)))
     (cond ((null cal) "iso8601")
-          ((string-equal cal "iso8601") "iso8601")
-          (t (js-throw (make-native-error "RangeError"
-                         (format nil "unknown calendar: ~a" cal)))))))
+          (t (canonical-calendar-or-throw cal)))))
 
 (defun to-temporal-date (realm v &optional (options *undefined*))
   "ToTemporalDate: a PlainDate instance -> copy (options.overflow still read); a
@@ -506,9 +509,7 @@
                   (cal-v (arg 3 args)))
               (let ((calendar (if (js-undefined-p cal-v) "iso8601"
                                   (if (stringp cal-v)
-                                      (if (string-equal cal-v "iso8601") "iso8601"
-                                          (js-throw (make-native-error "RangeError"
-                                                      "calendar must be iso8601")))
+                                      (canonical-calendar-or-throw cal-v)
                                       (js-throw (make-native-error "TypeError"
                                                   "calendar must be a string"))))))
                 (unless (valid-iso-date-fields-p y m d)
@@ -533,32 +534,56 @@
           (float (cond ((< da db) -1) ((> da db) 1) (t 0)) 1d0))))
 
     ;; ---- getters ----
+    ;; EVERY FIELD IS THE CALENDAR'S ANSWER, NOT THE ISO ONE.  The stored date is
+    ;; always ISO -- that is the invariant the rest of Temporal relies on -- so each
+    ;; getter converts to a day number and asks the object's own calendar what it
+    ;; calls that day.  For iso8601 the calendar answers with the ISO fields and
+    ;; nothing changes.
     (macrolet ((dgetter (name &body body)
                  `(def-getter realm proto ,name
                     (lambda (this args) (declare (ignore args))
-                      (let ((date (pd-iso-date this)))
-                        (declare (ignorable date))
-                        ,@body)))))
-      (dgetter "calendarId" (declare (ignore date)) (pd-calendar-id this))
-      (dgetter "year" (float (iso-date-year date) 1d0))
-      (dgetter "month" (float (iso-date-month date) 1d0))
-      (dgetter "monthCode" (format nil "M~2,'0d" (iso-date-month date)))
-      (dgetter "day" (float (iso-date-day date) 1d0))
+                      (let* ((date (pd-iso-date this))
+                             (cal (cal-of (pd-calendar-id this)))
+                             (days (iso-date->epoch-days date)))
+                        (declare (ignorable date cal days))
+                        ,@body))))
+               (with-ymd (&body body)
+                 `(multiple-value-bind (y m d) (cal-year-month-day cal days)
+                    (declare (ignorable y m d))
+                    ,@body)))
+      (dgetter "calendarId" (pd-calendar-id this))
+      (dgetter "year"  (with-ymd (float y 1d0)))
+      (dgetter "month" (with-ymd (float m 1d0)))
+      (dgetter "monthCode" (with-ymd (cal-month-code cal y m)))
+      (dgetter "day"   (with-ymd (float d 1d0)))
+      ;; The week is the one thing no calendar here renumbers: seven days, running
+      ;; continuously across every era and epoch, so it stays on the ISO reckoning.
       (dgetter "dayOfWeek" (float (iso-day-of-week date) 1d0))
-      (dgetter "dayOfYear" (float (iso-day-of-year date) 1d0))
-      (dgetter "weekOfYear"
-        (multiple-value-bind (w y) (iso-week-of-year date) (declare (ignore y))
-          (float w 1d0)))
-      (dgetter "yearOfWeek"
-        (multiple-value-bind (w y) (iso-week-of-year date) (declare (ignore w))
-          (float y 1d0)))
       (dgetter "daysInWeek" 7d0)
-      (dgetter "daysInMonth" (float (days-in-month (iso-date-year date) (iso-date-month date)) 1d0))
-      (dgetter "daysInYear" (float (iso-days-in-year (iso-date-year date)) 1d0))
-      (dgetter "monthsInYear" 12d0)
-      (dgetter "inLeapYear" (js-bool (leap-year-p (iso-date-year date))))
-      (dgetter "era" (declare (ignore date)) *undefined*)
-      (dgetter "eraYear" (declare (ignore date)) *undefined*))
+      (dgetter "dayOfYear" (with-ymd (float (cal-day-of-year cal y m d) 1d0)))
+      ;; ISO week numbering is defined only for iso8601 -- a week-numbering year is
+      ;; a property of that calendar's rules, not a fact about the day -- so every
+      ;; other calendar answers undefined rather than inventing one.
+      (dgetter "weekOfYear"
+        (if (string= (pd-calendar-id this) "iso8601")
+            (multiple-value-bind (w y) (iso-week-of-year date) (declare (ignore y))
+              (float w 1d0))
+            *undefined*))
+      (dgetter "yearOfWeek"
+        (if (string= (pd-calendar-id this) "iso8601")
+            (multiple-value-bind (w y) (iso-week-of-year date) (declare (ignore w))
+              (float y 1d0))
+            *undefined*))
+      (dgetter "daysInMonth"  (with-ymd (float (cal-days-in-month cal y m) 1d0)))
+      (dgetter "daysInYear"   (with-ymd (float (cal-days-in-year cal y) 1d0)))
+      (dgetter "monthsInYear" (with-ymd (float (cal-months-in-year cal y) 1d0)))
+      (dgetter "inLeapYear"   (with-ymd (js-bool (cal-leap-year-p cal y))))
+      (dgetter "era"
+        (multiple-value-bind (era ey) (cal-era-fields cal days) (declare (ignore ey))
+          (or era *undefined*)))
+      (dgetter "eraYear"
+        (multiple-value-bind (era ey) (cal-era-fields cal days) (declare (ignore era))
+          (if ey (float ey 1d0) *undefined*))))
 
     ;; ---- add / subtract ----
     (labels ((add-dur (this args negate)

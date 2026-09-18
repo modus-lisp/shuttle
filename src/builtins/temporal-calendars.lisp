@@ -518,3 +518,20 @@
   (values))
 
 (%register-arithmetic-calendars)
+
+(defun cal-of (id)
+  "The CALENDAR for a canonical id already validated on the way in.  Falls back to
+   iso8601 rather than signalling: by the time a stored object is being read its
+   calendar was checked at construction, and a getter is the wrong place to raise."
+  (or (find-calendar id) (find-calendar "iso8601")))
+
+(defun canonical-calendar-or-throw (cal)
+  "CAL as a canonical calendar id, or a RangeError naming it.  ONE GATE FOR EVERY
+   TEMPORAL TYPE: each of PlainDate, PlainDateTime, PlainYearMonth, PlainMonthDay
+   and ZonedDateTime had its own copy of `is it iso8601?', which is how a calendar
+   comes to be accepted by one constructor and refused by another."
+  (let ((known (find-calendar cal)))
+    (if known
+        (cal-id known)
+        (js-throw (make-native-error "RangeError"
+                                     (format nil "unknown calendar: ~a" cal))))))

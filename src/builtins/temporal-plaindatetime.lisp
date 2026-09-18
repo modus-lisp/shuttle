@@ -194,7 +194,7 @@
    bare identifier \"iso8601\" OR any ISO 8601 date/datetime string whose (u-ca)
    calendar is iso8601 (the calendar is parsed out of it). RangeError otherwise."
   (cond
-    ((string-equal s "iso8601"))
+    ((find-calendar s))
     (t
      ;; Try to parse it as an ISO date/datetime and read its calendar annotation.
      ;; A calendar string must contain a DATE and must NOT carry a UTC designator
@@ -211,8 +211,7 @@
          ;; now surfaces it in :calendar. (The :reduced branch already validated
          ;; its annotation to be null-or-iso8601 in pdt-reduced-date-string-p.)
          (let ((cal (getf r :calendar)))
-           (when (and cal (not (string-equal cal "iso8601")))
-             (js-throw (make-native-error "RangeError" "only the iso8601 calendar is supported")))))))))
+           (when cal (canonical-calendar-or-throw cal))))))))
 
 (defun pdt-reduced-date-string-p (s)
   "T if S is a reduced ISO calendar-date form (YYYY-MM, YYYY-MM-DD, MM-DD, or the
@@ -225,7 +224,7 @@
                  (handler-case
                      (let ((p (make-pstate :str rest :pos 0 :len (length rest))))
                        (let ((cal (parse-annotations p)))
-                         (and (p-eof p) (or (null cal) (string-equal cal "iso8601")))))
+                         (and (p-eof p) (or (null cal) (find-calendar cal)))))
                    (shuttle-error () nil))))
            (all-digits (a b) (loop for i from a below b always (and (< i (length core)) (digit-char-p (char core i))))))
       (and (ann-ok)
@@ -268,8 +267,7 @@
        ;; (a date-like string is NOT a valid annotation calendar, unlike a bag's
        ;; calendar property). The core parser surfaces it in :calendar.
        (let ((cal (getf r :calendar)))
-         (when (and cal (not (string-equal cal "iso8601")))
-           (js-throw (make-native-error "RangeError" "only the iso8601 calendar is supported"))))
+         (when cal (canonical-calendar-or-throw cal)))
        (let ((date (make-iso-date (getf r :year) (getf r :month) (getf r :day)))
              (time (make-iso-time (getf r :hour) (getf r :minute) (getf r :second)
                                   (getf r :ms) (getf r :us) (getf r :ns))))

@@ -6,27 +6,37 @@ set -u
 cd "$(dirname "$0")/.."
 : "${SHUTTLE_TEST262:=$PWD/test262-full}"; export SHUTTLE_TEST262
 SLICE="${1:-1000}"
-OUT="/tmp/slice-results.$$"; : > "$OUT"; export SHUTTLE_SLICE_OUT="$OUT"
-SBCL=(sbcl --control-stack-size 256 --dynamic-space-size 4096 --script inspect/test262-slice.lisp)
+# ONE SBCL PER SLICE, AND AS MANY AT ONCE AS THERE ARE CORES.  The isolation was
+# always per-slice -- a heap or stack death costs one slice, not the run -- so the
+# slices were already independent, and were being run one at a time on a 116-core
+# box.  Sharding them is a scheduling change, not a semantic one.
+JOBS="${SHUTTLE_JOBS:-$(nproc)}"
+# EACH SLICE GETS ITS OWN RESULT FILE.  Appending to one shared file from N
+# concurrent writers is only atomic for small writes on some filesystems, and a
+# torn line here would be miscounted silently rather than noticed.
+OUTDIR="/tmp/slices.$$"; mkdir -p "$OUTDIR"
+OUT="/tmp/slice-results.$$"; : > "$OUT"
 
-# total runnable file count (fixtures excluded)
 TOTAL=$(find "$SHUTTLE_TEST262/test" -name '*.js' ! -name '*_FIXTURE*' | wc -l)
-echo "corpus: $TOTAL files, slice size $SLICE"
-start=0; crashed=0
-while [ "$start" -lt "$TOTAL" ]; do
-  # `grep -c` already prints 0 when nothing matches -- but it EXITS 1, so a `|| echo 0` appended a
-  # SECOND line and the count became "0\n0".  `[` then failed with "integer expression expected"
-  # and the comparison below evaluated false, so a slice that died on the first iteration was
-  # never counted as crashed and the headline silently became a floor instead of a measurement.
-  # That is the exact failure this script exists to prevent.
-  before=$(grep -c '^SLICE' "$OUT" 2>/dev/null); before=${before:-0}
-  SHUTTLE_SLICE="$start:$SLICE" "${SBCL[@]}" >/dev/null 2>>"/tmp/run262.err.$$"
-  after=$(grep -c '^SLICE' "$OUT" 2>/dev/null); after=${after:-0}
-  if [ "$after" -le "$before" ]; then
-    echo "  slice $start:$SLICE CRASHED at $(cat /tmp/cur262 2>/dev/null) — recording 0, continuing"
+echo "corpus: $TOTAL files, slice size $SLICE, $JOBS parallel"
+export SHUTTLE_TEST262 SLICE OUTDIR
+seq 0 "$SLICE" $((TOTAL-1)) | \
+  xargs -P "$JOBS" -I{} bash -c '
+    SHUTTLE_SLICE="{}:$SLICE" SHUTTLE_SLICE_OUT="$OUTDIR/{}.tsv" \
+      sbcl --control-stack-size 256 --dynamic-space-size 4096 \
+           --script inspect/test262-slice.lisp >/dev/null 2>>"$OUTDIR/{}.err"'
+
+# A slice that produced no SLICE line died: count it and SAY so, rather than
+# letting a missing slice quietly turn the headline into a floor.
+crashed=0
+for start in $(seq 0 "$SLICE" $((TOTAL-1))); do
+  f="$OUTDIR/$start.tsv"
+  if [ -s "$f" ] && grep -q '^SLICE' "$f"; then
+    cat "$f" >> "$OUT"
+  else
+    echo "  slice $start:$SLICE CRASHED - recording 0, continuing"
     crashed=$((crashed+1))
   fi
-  start=$((start+SLICE))
 done
 
 echo "=== test262 (batched) ==="

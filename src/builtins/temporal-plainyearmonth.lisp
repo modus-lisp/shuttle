@@ -53,8 +53,7 @@
    TypeError; any other string -> RangeError."
   (cond
     ((not (stringp v)) (js-throw (make-native-error "TypeError" "calendar must be a string")))
-    ((string-equal v "iso8601") "iso8601")
-    (t (js-throw (make-native-error "RangeError" (format nil "unknown calendar: ~a" v))))))
+    (t (canonical-calendar-or-throw v))))
 
 (defun make-plain-year-month (iso-date calendar-id realm &optional new-target)
   "CreateTemporalYearMonth: ISO-DATE is a valid in-range iso-date whose DAY is the
