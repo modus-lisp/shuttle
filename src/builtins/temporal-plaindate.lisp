@@ -288,16 +288,30 @@
 
 ;;; PrepareCalendarFields read order = ALPHABETICAL: day, month, monthCode, year.
 ;;; (calendar is read first, before these, by the caller.)
-(defun read-date-fields (bag)
+(defun read-date-fields (bag &optional (cal (find-calendar "iso8601")))
   "Read day/month/monthCode/year off BAG in alphabetical order, each coerced
    (day/year via ToIntegerWithTruncation, month via ToPositiveIntegerWithTruncation,
    monthCode via ToString + well-formedness). Returns a plist
    (:day :month :month-code-num :month-code-leap :year), NIL where absent.
    Coercion happens during the read (observable); presence/validity checks are
    done by RESOLVE-DATE-FIELDS afterward."
-  (let ((day nil) (month nil) (mc-num nil) (mc-leap nil) (mc-present nil) (year nil))
+  (let ((day nil) (month nil) (mc-num nil) (mc-leap nil) (mc-present nil) (year nil)
+        (era nil) (era-year nil))
     (let ((v (js-get bag "day")))
       (unless (js-undefined-p v) (setf day (to-positive-integer-with-truncation v "day"))))
+    ;; era/eraYear sit between day and month in the alphabetical read order, and
+    ;; are read ONLY for a calendar that has eras -- the read is observable (it can
+    ;; run a getter), so reading them for iso8601 would be a visible difference.
+    (when (cal-eras-of cal)
+      (let ((v (js-get bag "era")))
+        (unless (js-undefined-p v)
+          (let ((prim (if (js-object-p v) (to-primitive v :string) v)))
+            (unless (stringp prim)
+              (js-throw (make-native-error "TypeError" "era must be a string")))
+            (setf era prim))))
+      (let ((v (js-get bag "eraYear")))
+        (unless (js-undefined-p v)
+          (setf era-year (to-integer-with-truncation v)))))
     (let ((v (js-get bag "month")))
       (unless (js-undefined-p v) (setf month (to-positive-integer-with-truncation v "month"))))
     (let ((v (js-get bag "monthCode")))
@@ -319,7 +333,74 @@
     (let ((v (js-get bag "year")))
       (unless (js-undefined-p v) (setf year (to-integer-with-truncation v))))
     (list :day day :month month :month-code-num mc-num
-          :month-code-leap mc-leap :month-code-present mc-present :year year)))
+          :month-code-leap mc-leap :month-code-present mc-present :year year
+          :era era :era-year era-year)))
+
+;;; THE ISO PATH BELOW IS LEFT EXACTLY AS IT WAS.  Its error TYPES AND ORDERING are
+;;; observable and pinned by some 4500 passing built-ins/Temporal tests -- which
+;;; field is missing is reported before which value is out of range, and both before
+;;; regulation.  Folding it into the general path would put those at risk to save a
+;;; branch.  The general path below is the one that has to earn the same pinning
+;;; before the two can become one.
+(defun resolve-calendar-date-fields (cal fields overflow)
+  "CalendarResolveFields for a calendar that is not iso8601: resolve the year from
+   era/eraYear, the month from monthCode (which may name a leap month), regulate
+   against THIS calendar's month and day counts, and hand back the ISO date naming
+   the same day."
+  (let ((year (getf fields :year))
+        (era (getf fields :era))
+        (era-year (getf fields :era-year))
+        (day (getf fields :day))
+        (month (getf fields :month))
+        (mc-num (getf fields :month-code-num))
+        (mc-leap (getf fields :month-code-leap))
+        (mc-present (getf fields :month-code-present)))
+    ;; era and eraYear are a PAIR: one without the other cannot name a year.
+    (when (and era (null era-year))
+      (js-throw (make-native-error "TypeError" "eraYear is required when era is given")))
+    (when (and era-year (null era))
+      (js-throw (make-native-error "TypeError" "era is required when eraYear is given")))
+    (let ((from-era (when era
+                      (or (cal-year-from-era cal era era-year)
+                          (js-throw (make-native-error "RangeError"
+                                      (format nil "unknown era: ~a" era)))))))
+      (when (and year from-era (/= year from-era))
+        (js-throw (make-native-error "RangeError" "year and era/eraYear conflict")))
+      (setf year (or year from-era)))
+    (when (null year)
+      (js-throw (make-native-error "TypeError" "year is required")))
+    (when (and (null month) (not mc-present))
+      (js-throw (make-native-error "TypeError" "one of month or monthCode is required")))
+    (when (null day)
+      (js-throw (make-native-error "TypeError" "day is required")))
+    ;; The month code is the authority when present: it names a month, which in a
+    ;; lunisolar year is not the same thing as an ordinal.
+    (let ((resolved
+            (if mc-present
+                (let* ((code (format nil "M~2,'0d~:[~;L~]" mc-num mc-leap))
+                       (n (cal-month-from-code cal year code)))
+                  (unless n
+                    (js-throw (make-native-error "RangeError"
+                                (format nil "monthCode ~a is not valid in ~a ~a"
+                                        code (cal-id cal) year))))
+                  (when (and month (/= month n))
+                    (js-throw (make-native-error "RangeError" "month and monthCode conflict")))
+                  n)
+                month)))
+      (let ((months (cal-months-in-year cal year)))
+        (when (> resolved months)
+          (if (eq overflow :constrain)
+              (setf resolved months)
+              (js-throw (make-native-error "RangeError" "month out of range")))))
+      (let ((dim (cal-days-in-month cal year resolved)))
+        (when (> day dim)
+          (if (eq overflow :constrain)
+              (setf day dim)
+              (js-throw (make-native-error "RangeError" "day out of range")))))
+      (let ((date (epoch-days->iso-date (cal-days-from-ymd cal year resolved day))))
+        (unless (iso-date-within-limits date)
+          (js-throw (make-native-error "RangeError" "date out of range")))
+        date))))
 
 (defun resolve-date-fields (fields overflow)
   "CalendarResolveFields (iso8601) + RegulateISODate. FIELDS is from
@@ -403,9 +484,13 @@
      ;; Property bag: read calendar first, then the date fields, then overflow.
      (let* ((cal-v (js-get v "calendar"))
             (calendar (if (js-undefined-p cal-v) "iso8601" (canonicalize-calendar-id cal-v)))
-            (fields (read-date-fields v))
+            (cal (cal-of calendar))
+            (fields (read-date-fields v cal))
             (overflow (get-temporal-overflow (get-options-object options))))
-       (values (resolve-date-fields fields overflow) calendar)))
+       (values (if (string= calendar "iso8601")
+                   (resolve-date-fields fields overflow)
+                   (resolve-calendar-date-fields cal fields overflow))
+               calendar)))
     ((stringp v)
      (let* ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) v))
             (r (parse-iso-datetime trimmed :datetime)))
@@ -618,24 +703,35 @@
         (reject-calendar-or-timezone bag)
         ;; Read partial fields (alpha order), fill from THIS, then resolve via
         ;; the same validator as from() so monthCode range / conflicts throw.
-        (let* ((partial (read-date-fields bag))
+        (let* ((cal (cal-of calendar))
+               (partial (read-date-fields bag cal))
                (overflow (get-temporal-overflow (get-options-object (arg 1 args))))
                (any (or (getf partial :day) (getf partial :month)
-                        (getf partial :month-code-present) (getf partial :year))))
+                        (getf partial :month-code-present) (getf partial :year)
+                        (getf partial :era) (getf partial :era-year))))
           (unless any
             (js-throw (make-native-error "TypeError" "with() needs at least one recognized field")))
-          ;; Merge: supply this date's fields for anything absent. If neither
-          ;; month nor monthCode is given, inherit the current month.
-          (let ((merged
-                  (list :year (or (getf partial :year) (iso-date-year date))
-                        :day  (or (getf partial :day) (iso-date-day date))
-                        :month (getf partial :month)
-                        :month-code-num (getf partial :month-code-num)
-                        :month-code-leap (getf partial :month-code-leap)
-                        :month-code-present (getf partial :month-code-present))))
-            (unless (or (getf merged :month) (getf merged :month-code-present))
-              (setf (getf merged :month) (iso-date-month date)))
-            (make-plain-date (resolve-date-fields merged overflow) calendar realm)))))
+          ;; WHAT IS INHERITED IS THE CALENDAR'S FIELDS, NOT THE ISO ONES.  Changing
+          ;; the day of a Coptic date has to keep the Coptic year and month -- taking
+          ;; them off the stored ISO date would silently reinterpret the date as a
+          ;; different day the moment any field was replaced.
+          (multiple-value-bind (cy cm cd)
+              (cal-year-month-day cal (iso-date->epoch-days date))
+            (let ((merged
+                    (list :year (or (getf partial :year) (unless (getf partial :era) cy))
+                          :day  (or (getf partial :day) cd)
+                          :month (getf partial :month)
+                          :month-code-num (getf partial :month-code-num)
+                          :month-code-leap (getf partial :month-code-leap)
+                          :month-code-present (getf partial :month-code-present)
+                          :era (getf partial :era)
+                          :era-year (getf partial :era-year))))
+              (unless (or (getf merged :month) (getf merged :month-code-present))
+                (setf (getf merged :month) cm))
+              (make-plain-date (if (string= calendar "iso8601")
+                                   (resolve-date-fields merged overflow)
+                                   (resolve-calendar-date-fields cal merged overflow))
+                               calendar realm))))))
 
     ;; ---- withCalendar ----
     (def-method realm proto "withCalendar" 1 (this args)
