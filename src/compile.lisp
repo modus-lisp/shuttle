@@ -516,9 +516,20 @@ exactly what an early error is for.  ECASE turned that into an uncatchable Lisp 
          (annexb-labeled-collect (car (last node)) acc (append head-lex shadowed))))
       ((:try)                               ; (:try blk param catch fin) — blk/catch/fin are :block nodes
        (destructuring-bind (blk param catch fin) (cdr node)
-         (declare (ignore param))
          (when (consp blk) (setf acc (annexb-fn-names-in blk acc shadowed)))
-         (when (consp catch) (setf acc (annexb-fn-names-in catch acc shadowed)))
+         (when (consp catch)
+           ;; B.3.3 IS SKIPPED WHERE THE VAR BINDING IT WOULD CREATE IS AN EARLY ERROR:
+           ;; "if replacing the FunctionDeclaration f with a VariableStatement that has
+           ;; F as a BindingIdentifier would not produce any Early Errors".  B.3.5
+           ;; permits `var f` inside a catch block only when the catch parameter is a
+           ;; simple BindingIdentifier -- with a DESTRUCTURING parameter that names f,
+           ;; `var f` is a Syntax Error, so the block function gets no var binding and
+           ;; f stays invisible outside the catch.  A plain `catch (e)` does NOT shadow:
+           ;; `var e` is legal there, and the extension applies as usual.
+           (let ((catch-shadow (if (or (null param) (stringp param))
+                                   shadowed
+                                   (append (target-names param '()) shadowed))))
+             (setf acc (annexb-fn-names-in catch acc catch-shadow))))
          (when (consp fin) (setf acc (annexb-fn-names-in fin acc shadowed)))
          acc))
       ((:switch)                            ; (:switch disc clauses) — clause = (TEST-or-:default . body)
@@ -778,11 +789,29 @@ cases -- a switch's CaseBlock is ONE scope, which is what those tests are about.
             (loop for (tgt . init) in (third node)
                   ;; a simple name never reaches BIND-TARGET, so the strict-name check goes here
                   do (when (stringp tgt) (check-strict-binding-name tgt))
-                     (if init (compile-named-init init (and (stringp tgt) tgt)) (em :const *undefined*))
                      (cond
-                       ((string= kind "const") (bind-lexical tgt :const))
-                       ((string= kind "let")   (bind-lexical tgt :let))
-                       (t (if (stringp tgt) (em :declare-var tgt) (bind-target tgt)))))))
+                       ;; `var x;` WITH NO INITIALISER IS A RUNTIME NO-OP.  The binding was
+                       ;; already created by declaration instantiation, before the body ran;
+                       ;; VariableDeclaration : BindingIdentifier (no Initializer) evaluates
+                       ;; to nothing at all.  Assigning undefined here instead DESTROYED
+                       ;; whatever the binding already held, which is not a corner case:
+                       ;;
+                       ;;   function f(a) { var a; return a; }   f(5)  gave undefined, not 5
+                       ;;   function g() { var m; function m() {} return typeof m; }
+                       ;;                                        gave "undefined", not "function"
+                       ;;
+                       ;; Both are ordinary sloppy-mode code -- redeclaring a parameter with
+                       ;; `var` is a common old-style idiom -- and both silently lost a value
+                       ;; rather than failing loudly.  `let x;` DOES initialise to undefined,
+                       ;; and a destructuring `var` without an initialiser is a SyntaxError,
+                       ;; so this skip is exactly the plain-name `var` case.
+                       ((and (string= kind "var") (null init) (stringp tgt)))
+                       (t
+                        (if init (compile-named-init init (and (stringp tgt) tgt)) (em :const *undefined*))
+                        (cond
+                          ((string= kind "const") (bind-lexical tgt :const))
+                          ((string= kind "let")   (bind-lexical tgt :let))
+                          (t (if (stringp tgt) (em :declare-var tgt) (bind-target tgt)))))))))
     (:func (compile-fn-decl-closure node) (em :declare-var (second node)))
     (:genfunc (compile-fn-decl-closure node) (em :declare-var (second node)))
     (:asyncfunc (compile-fn-decl-closure node) (em :declare-var (second node)))
