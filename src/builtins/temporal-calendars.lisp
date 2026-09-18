@@ -535,3 +535,123 @@
         (cal-id known)
         (js-throw (make-native-error "RangeError"
                                      (format nil "unknown calendar: ~a" cal))))))
+
+;;; ===========================================================================
+;;; Hebrew: lunisolar, and the first calendar here whose MONTHS MOVE
+;;; ===========================================================================
+;;; Twelve months in a common year, thirteen in a leap year, and the extra one is
+;;; not appended -- Adar I is INSERTED before Adar, so every month after it keeps
+;;; its identity while its ordinal shifts by one.  That is exactly what month codes
+;;; are for, and why CAL-MONTH-CODE takes the year: in 5779 (a leap year) ordinal 6
+;;; is "M05L" and ordinal 7 is "M06", while in a common year ordinal 6 is "M06".
+;;; A calendar that numbered months alone could not say which Adar it meant.
+;;;
+;;; The year length is not a formula but a search: the year begins on the molad of
+;;; Tishri, POSTPONED by the dehiyot (it may not fall on Sunday, Wednesday or
+;;; Friday, plus two rules that keep the following year legal), so a year runs 353,
+;;; 354 or 355 days -- 383, 384 or 385 when it leaps.  Heshvan and Kislev are the
+;;; two months that absorb the difference.
+(define-rd-epoch +hebrew-epoch+ -1373427 "1 Tishri AM 1, the epoch of the era.")
+
+(defclass hebrew-calendar (calendar) ())
+
+(defun hebrew-leap-year-p (year)
+  "Seven leap years in each nineteen-year Metonic cycle."
+  (< (mod (+ (* 7 year) 1) 19) 7))
+
+(defmethod cal-months-in-year ((cal hebrew-calendar) year)
+  (if (hebrew-leap-year-p year) 13 12))
+
+(defmethod cal-leap-year-p ((cal hebrew-calendar) year) (hebrew-leap-year-p year))
+
+(defun %hebrew-elapsed-days (year)
+  "Days from the epoch to the molad of Tishri of YEAR, with the postponements."
+  (let* ((months-elapsed (floor (- (* 235 year) 234) 19))
+         (parts-elapsed (+ 12084 (* 13753 months-elapsed)))
+         (day (+ (* 29 months-elapsed) (floor parts-elapsed 25920))))
+    ;; The molad may not begin the year on a Sunday, Wednesday or Friday.
+    (if (< (mod (* 3 (+ day 1)) 7) 3) (+ day 1) day)))
+
+(defun %hebrew-year-correction (year)
+  "The two dehiyot that exist to keep the NEIGHBOURING year a legal length: a year
+   that would run 356 days, and one whose predecessor would run 382."
+  (let ((prev (%hebrew-elapsed-days (- year 1)))
+        (this (%hebrew-elapsed-days year))
+        (next (%hebrew-elapsed-days (+ year 1))))
+    (cond ((= (- next this) 356) 2)
+          ((= (- this prev) 382) 1)
+          (t 0))))
+
+(defun %hebrew-new-year (year)
+  "Epoch day number of 1 Tishri of YEAR."
+  (+ +hebrew-epoch+ (%hebrew-elapsed-days year) (%hebrew-year-correction year)))
+
+(defun %hebrew-year-days (year)
+  (- (%hebrew-new-year (+ year 1)) (%hebrew-new-year year)))
+
+(defmethod cal-days-in-month ((cal hebrew-calendar) year month)
+  (let* ((len (%hebrew-year-days year))
+         (leap (hebrew-leap-year-p year))
+         ;; Heshvan gains a day in a "complete" year, Kislev loses one in a
+         ;; "deficient" year -- the two months that absorb the year's variation.
+         (long-heshvan (= (mod len 10) 5))
+         (short-kislev (= (mod len 10) 3)))
+    (cond ((= month 1) 30)                                  ; Tishri
+          ((= month 2) (if long-heshvan 30 29))             ; Heshvan
+          ((= month 3) (if short-kislev 29 30))             ; Kislev
+          ((= month 4) 29)                                  ; Tevet
+          ((= month 5) 30)                                  ; Shevat
+          ((and leap (= month 6)) 30)                       ; Adar I
+          ((and leap (= month 7)) 29)                       ; Adar II
+          ((and (not leap) (= month 6)) 29)                 ; Adar
+          (t ;; Nisan 30, Iyar 29, Sivan 30, Tammuz 29, Av 30, Elul 29
+           (let ((n (if leap (- month 7) (- month 6))))     ; 1 = Nisan
+             (if (oddp n) 30 29))))))
+
+(defmethod cal-days-from-ymd ((cal hebrew-calendar) year month day)
+  (+ (%hebrew-new-year year)
+     (loop for m from 1 below month sum (cal-days-in-month cal year m))
+     (- day 1)))
+
+(defmethod cal-year-month-day ((cal hebrew-calendar) days)
+  (let ((y (+ 1 (floor (- days +hebrew-epoch+) 366))))
+    (loop while (< days (%hebrew-new-year y)) do (decf y))
+    (loop while (>= days (%hebrew-new-year (1+ y))) do (incf y))
+    (let ((doy (- days (%hebrew-new-year y)))
+          (month 1))
+      (loop for dim = (cal-days-in-month cal y month)
+            while (>= doy dim) do (decf doy dim) (incf month))
+      (values y month (1+ doy)))))
+
+;;; The codes: ordinals 1-5 are M01-M05 in any year.  In a leap year ordinal 6 is
+;;; the leap month M05L and ordinals 7-13 are M06-M12; in a common year ordinals
+;;; 6-12 are M06-M12 directly.
+(defmethod cal-month-code ((cal hebrew-calendar) year month)
+  (let ((leap (hebrew-leap-year-p year)))
+    (cond ((<= month 5) (format nil "M~2,'0d" month))
+          ((and leap (= month 6)) "M05L")
+          (leap (format nil "M~2,'0d" (- month 1)))
+          (t (format nil "M~2,'0d" month)))))
+
+(defmethod cal-month-from-code ((cal hebrew-calendar) year code)
+  (let ((leap (hebrew-leap-year-p year)))
+    (cond ((not (stringp code)) nil)
+          ((string= code "M05L") (when leap 6))
+          ((and (= (length code) 3) (char-equal (char code 0) #\M)
+                (digit-char-p (char code 1)) (digit-char-p (char code 2)))
+           (let ((n (parse-integer code :start 1 :junk-allowed t)))
+             (when (and n (<= 1 n 12))
+               (cond ((<= n 5) n)
+                     (leap (+ n 1))
+                     (t n)))))
+          (t nil))))
+
+(defmethod cal-era-fields ((cal hebrew-calendar) days)
+  (values "am" (nth-value 0 (cal-year-month-day cal days))))
+
+(defmethod cal-year-from-era ((cal hebrew-calendar) era era-year)
+  (when (and (stringp era) (string-equal era "am")) era-year))
+
+(defmethod cal-eras-of ((cal hebrew-calendar)) '("am"))
+
+(register-calendar (make-instance 'hebrew-calendar :id "hebrew"))
