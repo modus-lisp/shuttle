@@ -492,10 +492,13 @@ module not a script."
       (let ((av (realm-array-proto *current-realm*)))
         (put o *symbol-iterator* (js-get av *symbol-iterator*) :enumerable nil)))
     (cond (strict
-           (let ((thrower (native-fn (lambda (this a) (declare (ignore this a))
-                                       (js-throw (make-native-error
-                                                  "TypeError"
-                                                  "arguments.callee is not available in strict mode"))))))
+           ;; %ThrowTypeError% IS ONE OBJECT PER REALM, shared with the restricted
+           ;; caller/arguments accessors on Function.prototype -- the spec names it
+           ;; as an intrinsic and test262 compares identities across every place it
+           ;; appears.  Minting a fresh thrower here was observably wrong: it made
+           ;; Function.prototype.arguments' setter and this one different functions,
+           ;; which the corpus caught the moment a thrower became reachable at all.
+           (let ((thrower (%function-extra-thrower *current-realm*)))
              (put-accessor o "callee" :get thrower :set thrower
                            :enumerable nil :configurable nil)))
           (fn (put o "callee" fn :enumerable nil)))
