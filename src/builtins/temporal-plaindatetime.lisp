@@ -224,7 +224,15 @@
                  (handler-case
                      (let ((p (make-pstate :str rest :pos 0 :len (length rest))))
                        (let ((cal (parse-annotations p)))
-                         (and (p-eof p) (or (null cal) (find-calendar cal)))))
+                         ;; A REDUCED FORM MAY ONLY CARRY iso8601, and that is the
+                         ;; spec's rule rather than a limitation of ours: for any
+                         ;; other calendar an ISO year and month do not determine a
+                         ;; year-month, so the spec demands a full date instead.
+                         ;; "1976-11[u-ca=gregory]" and "1976-11[u-ca=hebrew]" are
+                         ;; both RangeErrors, and temporalHelpers lists them as such.
+                         ;; Generalising this to every known calendar is the one
+                         ;; place where accepting MORE is wrong.
+                         (and (p-eof p) (or (null cal) (string-equal cal "iso8601")))))
                    (shuttle-error () nil))))
            (all-digits (a b) (loop for i from a below b always (and (< i (length core)) (digit-char-p (char core i))))))
       (and (ann-ok)

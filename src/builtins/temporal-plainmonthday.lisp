@@ -261,7 +261,7 @@
             (let* ((month (to-integer-with-truncation (arg 0 args)))
                    (day (to-integer-with-truncation (arg 1 args)))
                    (cal-v (arg 2 args))
-                   (calendar (if (js-undefined-p cal-v) "iso8601" (canonicalize-calendar-id-strict cal-v)))
+                   (calendar (if (js-undefined-p cal-v) "iso8601" (canonicalize-bag-calendar-id cal-v)))
                    (ref-v (arg 3 args))
                    (ref-year (if (js-undefined-p ref-v) +monthday-ref-year+ (to-integer-with-truncation ref-v))))
               ;; IsValidISODate on (ref-year, month, day) — strict, no constrain.

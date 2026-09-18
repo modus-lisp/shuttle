@@ -47,10 +47,24 @@
   v)
 
 (defun canonicalize-calendar-id-strict (v)
-  "The CONSTRUCTOR's calendar coercion: V must be a string that equals
-   \"iso8601\" (case-insensitive). Unlike ToTemporalCalendarIdentifier this does
-   NOT accept an ISO date string carrying a [u-ca=...] annotation. Non-string ->
-   TypeError; any other string -> RangeError."
+  "The calendar of a REDUCED year-month / month-day STRING, which may only ever be
+   iso8601.  That is the spec's rule and not a limitation here: for any other
+   calendar an ISO year and month do not determine a year-month, so a non-ISO
+   calendar has to arrive with a full date or in a property bag.  temporalHelpers
+   lists \"1976-11[u-ca=gregory]\" and \"1976-11[u-ca=hebrew]\" among the strings
+   that MUST be RangeErrors -- this is the one place where accepting more calendars
+   is wrong.  Does NOT accept a date string carrying an annotation.  Non-string ->
+   TypeError; anything else -> RangeError."
+  (cond
+    ((not (stringp v)) (js-throw (make-native-error "TypeError" "calendar must be a string")))
+    ((string-equal v "iso8601") "iso8601")
+    (t (js-throw (make-native-error "RangeError" (format nil "unknown calendar: ~a" v))))))
+
+(defun canonicalize-bag-calendar-id (v)
+  "The `calendar' PROPERTY of a year-month / month-day property bag, which may name
+   any calendar we speak -- a bag carries its fields explicitly, so a Hebrew or
+   Coptic year-month is perfectly well defined there even though the reduced STRING
+   form of one is not.  A bare identifier only: not a date string."
   (cond
     ((not (stringp v)) (js-throw (make-native-error "TypeError" "calendar must be a string")))
     (t (canonical-calendar-or-throw v))))
@@ -448,7 +462,7 @@
             (let* ((year (to-integer-with-truncation (arg 0 args)))
                    (month (to-integer-with-truncation (arg 1 args)))
                    (cal-v (arg 2 args))
-                   (calendar (if (js-undefined-p cal-v) "iso8601" (canonicalize-calendar-id-strict cal-v)))
+                   (calendar (if (js-undefined-p cal-v) "iso8601" (canonicalize-bag-calendar-id cal-v)))
                    (ref-v (arg 3 args))
                    (ref-day (if (js-undefined-p ref-v) 1 (to-integer-with-truncation ref-v))))
               ;; IsValidISODate on (year, month, ref-day) then year-month range.
