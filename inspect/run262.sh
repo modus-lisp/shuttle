@@ -5,7 +5,12 @@
 set -u
 cd "$(dirname "$0")/.."
 : "${SHUTTLE_TEST262:=$PWD/test262-full}"; export SHUTTLE_TEST262
-SLICE="${1:-1000}"
+# SLICE SIZE IS NOW A SHARDING DECISION, NOT A MEMORY ONE.  At 1000 files a slice
+# the run is bounded by its SLOWEST slice, and one slice is pathological: the
+# RegExp property-escapes generated tests build enormous character sets, and that
+# single slice ran 26 minutes while every other slice finished in about 6.  Smaller
+# slices spread that cost over several cores instead of serialising it behind one.
+SLICE="${1:-250}"
 # ONE SBCL PER SLICE, AND AS MANY AT ONCE AS THERE ARE CORES.  The isolation was
 # always per-slice -- a heap or stack death costs one slice, not the run -- so the
 # slices were already independent, and were being run one at a time on a 116-core
