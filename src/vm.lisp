@@ -95,6 +95,18 @@ recurse forever.")
    CREATE a binding: see GLOBAL-OWN-BINDING-P."
   (and (js-object-p obj) (js-get-own-property obj name) t))
 
+(defun global-resolves-p (obj name)
+  "Does the global object RESOLVE NAME -- an own property, or one it INHERITS?
+
+   A global environment record's HasBinding is [[HasProperty]], not HasOwnProperty:
+   the global object's prototype chain is part of the global scope.  That is not a
+   technicality, it is the mechanism HTML relies on -- named access (§7.3.3) lives
+   on a WindowProperties object in Window's PROTOTYPE CHAIN, so an ordinary `var`
+   shadows an element id by lookup order rather than by every declaration site
+   remembering to ask a different question.  It is also why `Object.prototype.x = 1`
+   famously makes a bare `x` resolve."
+  (and (js-object-p obj) (js-truthy* (js-has obj name))))
+
 (defun global-own-binding-p (obj name)
   "Does the global object have a REAL own property NAME?
 
@@ -169,8 +181,9 @@ recurse forever.")
            (multiple-value-bind (v p) (gethash name (env-vars e))
              (when p (return-from env-get
                        (values (if (indirect-binding-p v) (deref-indirect v 0) v) t))))
-           ;; global env: fall back to the global object (var/fn + host globals)
-           (when (and (env-global-obj e) (global-var-defined-p (env-global-obj e) name))
+           ;; global env: fall back to the global object (var/fn + host globals),
+           ;; INCLUDING what it inherits -- see GLOBAL-RESOLVES-P.
+           (when (and (env-global-obj e) (global-resolves-p (env-global-obj e) name))
              (return-from env-get (values (js-get (env-global-obj e) name) t))))
   (values *undefined* nil))
 (defun env-get-checked (env name)
@@ -227,8 +240,9 @@ an unresolvable name answers true."
              (when (and (env-consts e) (member name (env-consts e) :test #'string=))
                (js-throw (make-native-error "TypeError" (format nil "Assignment to constant variable."))))
              (setf (gethash name (env-vars e)) val) (return-from env-set val))
-           ;; global env: an own property of the global object is a resolvable binding
-           (when (and (env-global-obj e) (global-var-defined-p (env-global-obj e) name))
+           ;; global env: a property of the global object -- own or INHERITED -- is a
+           ;; resolvable binding (see GLOBAL-RESOLVES-P)
+           (when (and (env-global-obj e) (global-resolves-p (env-global-obj e) name))
              (let ((ok (js-set (env-global-obj e) name val (env-global-obj e))))
                (when (and strict (not (js-truthy* ok)))       ; strict: failed [[Set]] -> TypeError
                  (js-throw (make-native-error "TypeError"
