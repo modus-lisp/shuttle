@@ -32,7 +32,12 @@ skipped, and `try { return 'a' } finally { return 'b' }` answered 'a'.")
 ;; try must run the finallys entered since -- the same rule `return` follows, measured against a
 ;; nearer boundary.
 (defvar *break-finallys* nil) (defvar *continue-finallys* nil)
-(defun em (op &rest args) (push (cons op args) *out*))
+(defun em (op &rest args)
+  ;; Every string the compiler emits is interned, so identical property names and
+  ;; identical literals are one object across the whole program -- see
+  ;; INTERN-JSTRING.  Doing it HERE rather than at each of the emit sites means a
+  ;; new opcode cannot forget to.
+  (push (cons op (mapcar #'intern-jstring args)) *out*))
 (defun lbl () (gensym "L"))
 (defun pop-envs (count) (dotimes (_ count) (em :pop-env)))
 

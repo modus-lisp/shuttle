@@ -197,12 +197,41 @@
 ;;; (+props-small-limit+ is defined above, shared with the KEY-ORDER helpers.)
 
 (declaim (inline props-get props-present-p map-props))
+(defvar *interned-strings* (make-hash-table :test 'equal :synchronized t)
+  "Canonical string objects for the literals the compiler emits.")
+
+(defun intern-jstring (s)
+  "The canonical object for string S.  IDENTICAL LITERALS BECOME THE SAME OBJECT,
+   which is what makes property lookup cheap: a property name reaching PROPS-GET is
+   then EQ to the key it was stored under, so the alist scan is a pointer
+   comparison instead of a character-by-character STRING=.  Profiling a real page
+   put STRING=* at 11.8% of all time and string hashing at another 4% -- almost all
+   of it comparing property names that were already the same text.
+
+   Safe because a JS string is an immutable VALUE: two literals spelling the same
+   name are indistinguishable to a program, so sharing one object changes nothing
+   it can observe."
+  (if (stringp s)
+      (or (gethash s *interned-strings*)
+          (setf (gethash s *interned-strings*) s))
+      s))
+
+(declaim (inline %props-assoc))
+(defun %props-assoc (k s)
+  "K's cell in the small-object alist S.  EQ FIRST -- an interned property name is
+   the same object as the key it was stored under, so the common case never looks
+   at a character; EQUAL remains the fallback for a key built at runtime."
+  (declare (list s))
+  (loop for cell of-type cons in s
+        do (let ((ck (car cell)))
+             (when (or (eq ck k) (equal ck k)) (return cell)))))
+
 (defun props-get (o k)
   "Own PROP for already-coerced key K on O, as (values prop present-p)."
   (let ((s (js-object-props o)))
     (cond ((null s) (values nil nil))
           ((hash-table-p s) (gethash k s))
-          (t (let ((cell (assoc k (the list s) :test #'equal)))
+          (t (let ((cell (%props-assoc k s)))
                (if cell (values (cdr cell) t) (values nil nil)))))))
 
 (defun props-present-p (o k)
@@ -210,7 +239,7 @@
   (let ((s (js-object-props o)))
     (cond ((null s) nil)
           ((hash-table-p s) (nth-value 1 (gethash k s)))
-          (t (and (assoc k (the list s) :test #'equal) t)))))
+          (t (and (%props-assoc k s) t)))))
 
 (defun props-set (o k p)
   "Store descriptor P under key K on O (insert or replace), migrating the alist
