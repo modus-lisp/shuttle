@@ -3,7 +3,7 @@
   (:use #:cl)
   (:export
    ;; consumer API (the seam weft builds DOM bindings on)
-   #:make-realm #:eval-script #:define-global #:make-host-object
+   #:make-realm #:eval-script #:define-global #:make-host-object #:*clock-fn*
    #:native-function #:invoke #:js-call #:drain-microtasks
    ;; value model + internal methods (host objects override these)
    #:*undefined* #:*null* #:*true* #:*false* #:js-undefined-p

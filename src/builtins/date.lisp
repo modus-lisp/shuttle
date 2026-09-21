@@ -368,8 +368,23 @@ builtins load after vm.lisp, it silently REDEFINED the operator's own JS-MOD for
   (setf (js-object-primitive this) v)
   v)
 
+(defvar *clock-fn* nil
+  "When bound to a function of no arguments returning Unix-epoch milliseconds, that
+   is the engine's notion of NOW.
+
+   AN EMBEDDER WHOSE TIMERS RUN ON A VIRTUAL CLOCK MUST SET THIS.  weft advances a
+   virtual clock to fire setTimeout callbacks immediately rather than sleeping, so
+   with a real-time Date a page's timers complete while no measurable time passes --
+   and any page that measures a duration ACROSS a timer gets nonsense back.  Acid3
+   prints the symptom: it subtracts the delays it asked for from wall-clock and
+   reported \"Total elapsed time: -0.66s\", a negative duration.  Animation pacing,
+   retry backoff and timing analytics all read durations the same way; acid3 is
+   merely the one that shows its working.")
+
 (defun current-time-ms ()
-  "Milliseconds since Unix epoch. Uses the CL clock if available."
+  "Milliseconds since Unix epoch -- the embedder's clock when it has installed one
+   (*CLOCK-FN*), else the CL clock."
+  (when *clock-fn* (return-from current-time-ms (funcall *clock-fn*)))
   (with-js-floats
     (multiple-value-bind (sec usec) (ignore-errors (sb-ext:get-time-of-day))
       (if sec
