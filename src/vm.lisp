@@ -89,14 +89,31 @@ recurse forever.")
 (defun new-global-env (obj) (make-env :vars (make-hash-table :test 'equal) :parent nil :global-obj obj))
 ;; --- global-object var-binding helpers (spec CreateGlobalVarBinding etc.) ---
 (defun global-var-defined-p (obj name)
-  "Does the global object have an own property NAME (a global var/fn binding, or a
-   host-defined global property)?"
+  "Does the global object RESOLVE NAME -- an own property, or anything its
+   [[GetOwnProperty]] reports?  This is the right question when deciding whether a
+   bare identifier names something, and the WRONG one when deciding whether to
+   CREATE a binding: see GLOBAL-OWN-BINDING-P."
   (and (js-object-p obj) (js-get-own-property obj name) t))
+
+(defun global-own-binding-p (obj name)
+  "Does the global object have a REAL own property NAME?
+
+   DISTINCT FROM GLOBAL-VAR-DEFINED-P, which goes through [[GetOwnProperty]] and so
+   sees a host's exotic fallbacks.  HTML's named access (§7.3.3) surfaces every
+   element id as a property of the window, and a declaration must not be blocked by
+   one: on a page with <div id=score>, `var score = 7` was finding the DIV, deciding
+   the binding already existed, and never creating it -- so the variable silently
+   did not exist, reads returned the element, and writes went nowhere.  Acid3 does
+   exactly this (it has both a #score element and a `score` counter), which is why
+   its gate reported `[object Object] / 100`.
+
+   A declaration asks about storage, not about resolution."
+  (and (js-object-p obj) (nth-value 1 (props-get obj name))))
 (defun create-global-var-binding (obj name val &optional (overwrite t))
   "Define/set NAME as an own property of the global object. New bindings are
    configurable:false (global var/fn semantics); if the property already exists we
    only overwrite its value (var re-decl / fn re-decl over a var)."
-  (let ((d (js-get-own-property obj name)))
+  (let ((d (and (nth-value 1 (props-get obj name)) (props-get obj name))))
     (cond ((null d)
            (put obj name val :enumerable t :writable t :configurable nil))
           (overwrite
@@ -279,7 +296,8 @@ module not a script."
   "CreateGlobalFunctionBinding: define NAME as a data property of the global object.
    If it already exists and is configurable, redefine fully (writable/enumerable,
    configurable:false); else just set its value."
-  (let* ((obj (env-global-obj genv)) (d (js-get-own-property obj name)))
+  (let* ((obj (env-global-obj genv))
+         (d (and (nth-value 1 (props-get obj name)) (props-get obj name))))
     (if (or (null d) (prop-configurable d))
         (ordinary-define-own-property obj name
           (list :value val :writable t :enumerable t :configurable nil))
@@ -302,7 +320,7 @@ module not a script."
   (let ((vscope (env-var-scope env)))
     (if (env-global-obj vscope)
         (let ((obj (env-global-obj vscope)))
-          (unless (global-var-defined-p obj name)
+          (unless (global-own-binding-p obj name)
             (put obj name *undefined* :enumerable t :writable t :configurable t)))
         (unless (env-var-scope-has env name)
           (env-declare vscope name *undefined*)))))
@@ -343,7 +361,7 @@ module not a script."
         (create-global-function-binding genv n *undefined*))
       (dolist (n var-names)
         (unless (member n fn-names :test #'string=)
-          (unless (global-var-defined-p (env-global-obj genv) n)
+          (unless (global-own-binding-p (env-global-obj genv) n)
             (create-global-var-binding (env-global-obj genv) n *undefined*))
           (setf (gethash n (env-var-names genv)) t))))))
 
