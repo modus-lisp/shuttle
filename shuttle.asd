@@ -59,7 +59,9 @@ host-binding seam a consumer like weft hangs DOM objects + reflow on). Oracle: t
                                            (:file "intl-numberformat")
                                            (:file "intl-datetimeformat")
                                            (:file "intl-plural-list-relative")
-                                           (:file "intl-collator-segmenter-displaynames")))))))
+                                           (:file "intl-collator-segmenter-displaynames")))
+                             ;; after every global it names
+                             (:file "threads")))))
 
 ;;; The bundler is a separate system: the engine has no business depending on a file resolver,
 ;;; and a consumer embedding shuttle for scripting should not get one.
